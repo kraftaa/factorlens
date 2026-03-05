@@ -1,0 +1,9 @@
+/target
+/models
+/artifacts/*
+!/artifacts/.gitkeep
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+.venv/

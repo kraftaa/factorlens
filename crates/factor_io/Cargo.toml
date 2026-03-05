@@ -1,0 +1,13 @@
+[package]
+name = "factor_io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+factor_core = { path = "../factor_core" }

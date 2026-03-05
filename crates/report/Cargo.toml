@@ -1,0 +1,9 @@
+[package]
+name = "report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+factor_io = { path = "../factor_io" }

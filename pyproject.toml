@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "factorlens"
+version = "0.1.0"
+description = "Python wrapper for the FactorLens Rust CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "FactorLens" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/factorlens"
+Repository = "https://github.com/your-org/factorlens"
+
+[project.scripts]
+factorlens-py = "factorlens.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["factorlens"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/factorlens",
+  "/crates",
+  "/Cargo.toml",
+  "/README.md",
+  "/data",
+  "/.gitignore"
+]

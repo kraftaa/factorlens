@@ -1,0 +1,20 @@
+[package]
+name = "factor_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "factorlens"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+csv.workspace = true
+serde_json.workspace = true
+factor_core = { path = "../factor_core" }
+factor_io = { path = "../factor_io" }
+llm_local = { path = "../llm_local" }
+report = { path = "../report" }
