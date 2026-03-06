@@ -12,7 +12,9 @@ use factor_io::{
 };
 use llm_local::{build_client, Backend};
 use nalgebra::{DMatrix, DVector};
+use native_tls::TlsConnector;
 use postgres::{Client, NoTls};
+use postgres_native_tls::MakeTlsConnector;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -446,8 +448,10 @@ fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<Path
 }
 
 fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf> {
-    let mut client = Client::connect(postgres_url, NoTls)
-        .map_err(|e| anyhow!("failed to connect to postgres: {}", e))?;
+    let mut client = match connect_postgres(postgres_url) {
+        Ok(c) => c,
+        Err(e) => return Err(anyhow!("failed to connect to postgres: {}", e)),
+    };
     let copy_sql = format!(
         "COPY ({}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)",
         query.trim()
@@ -472,6 +476,24 @@ fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf
         .map_err(|e| anyhow!("failed writing postgres result csv: {}", e))?;
     file.flush()?;
     Ok(tmp_path)
+}
+
+fn connect_postgres(postgres_url: &str) -> Result<Client> {
+    let tls = TlsConnector::builder()
+        .build()
+        .map_err(|e| anyhow!("failed to initialize TLS connector: {}", e))?;
+    let tls_connector = MakeTlsConnector::new(tls);
+
+    match Client::connect(postgres_url, tls_connector) {
+        Ok(c) => Ok(c),
+        Err(tls_err) => Client::connect(postgres_url, NoTls).map_err(|no_tls_err| {
+            anyhow!(
+                "tls connect error: {}; non-tls connect error: {}",
+                tls_err,
+                no_tls_err
+            )
+        }),
+    }
 }
 
 fn apply_analyze_profile(mut args: AnalyzeArgs) -> Result<AnalyzeArgs> {
