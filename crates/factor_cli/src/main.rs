@@ -13,13 +13,14 @@ use factor_io::{
 use llm_local::{build_client, Backend};
 use nalgebra::{DMatrix, DVector};
 use postgres::{Client, NoTls};
-use postgres_rustls::MakeRustlsConnect;
+use postgres_rustls::MakeTlsConnector;
 use rustls::ClientConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -560,7 +561,8 @@ fn connect_postgres(postgres_url: &str) -> Result<Client> {
     let tls_config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    let tls_connector = MakeRustlsConnect::new(tls_config);
+    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let tls_connector = MakeTlsConnector::new(tls_connector);
 
     match Client::connect(postgres_url, tls_connector) {
         Ok(c) => Ok(c),
