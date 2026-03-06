@@ -208,6 +208,7 @@ dependencies = [
  "factor_core",
  "factor_io",
  "llm_local",
+ "nalgebra",
  "report",
  "serde_json",
 ]

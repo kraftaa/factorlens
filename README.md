@@ -78,12 +78,24 @@ gh workflow run release.yml -f publish_to_pypi=true -f ref=main
 - `ticker`
 - either `market_value` or both `shares` and `price`
 
+`factors.csv` (for known-factor regression mode)
+
+- `date` (YYYY-MM-DD)
+- one or more numeric factor columns (for example: `MKT`, `SMB`, `HML`)
+
 ## Quick Start
 
 ```bash
 cargo run -p factor_cli -- factors fit \
   --prices data/prices.csv \
   --k 3 \
+  --out artifacts/ \
+  --portfolio data/portfolio.csv
+
+# safer residual analysis: auto-pick k (< number of assets)
+cargo run -p factor_cli -- factors fit \
+  --prices data/prices.csv \
+  --k-auto \
   --out artifacts/ \
   --portfolio data/portfolio.csv
 
@@ -98,6 +110,13 @@ cargo run -p factor_cli -- report \
   --artifacts artifacts/ \
   --format markdown \
   --out artifacts/report.md
+
+# known-factor regression mode (MKT/SMB/HML-style)
+cargo run -p factor_cli -- factors regress \
+  --prices data/prices.csv \
+  --factors data/factors.csv \
+  --out artifacts/ \
+  --portfolio data/portfolio.csv
 
 cargo run -p factor_cli -- explain \
   --backend local \
@@ -223,6 +242,7 @@ Notes:
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
 - `--top` controls how many groups are listed in the report.
+- For cleaner executive analytics on this dataset, start with `--group-by discipline,advantage_plan`.
 
 ## PyPI Publishing (Rustream-Style)
 

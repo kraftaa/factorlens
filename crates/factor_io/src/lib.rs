@@ -20,6 +20,14 @@ struct WeightRow {
     weight: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct HoldingsRow {
+    ticker: String,
+    shares: Option<f64>,
+    price: Option<f64>,
+    market_value: Option<f64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArtifactSummary {
     pub model: FactorModel,
@@ -62,6 +70,45 @@ pub fn read_portfolio_csv(path: &Path) -> Result<Vec<PortfolioWeight>> {
         return Err(anyhow!("portfolio file is empty"));
     }
     Ok(out)
+}
+
+pub fn read_holdings_as_weights_csv(path: &Path) -> Result<Vec<PortfolioWeight>> {
+    let mut rdr = ReaderBuilder::new().trim(csv::Trim::All).from_path(path)?;
+    let mut raw = Vec::new();
+
+    for row in rdr.deserialize::<HoldingsRow>() {
+        let row = row?;
+        let mv = if let Some(v) = row.market_value {
+            v
+        } else {
+            let shares = row.shares.unwrap_or(0.0);
+            let price = row.price.unwrap_or(0.0);
+            shares * price
+        };
+
+        if mv > 0.0 {
+            raw.push((row.ticker, mv));
+        }
+    }
+
+    if raw.is_empty() {
+        return Err(anyhow!(
+            "holdings file has no positive positions; expected ticker + market_value or shares*price"
+        ));
+    }
+
+    let total = raw.iter().map(|(_, v)| *v).sum::<f64>();
+    if total <= 0.0 {
+        return Err(anyhow!("holdings total market value is non-positive"));
+    }
+
+    Ok(raw
+        .into_iter()
+        .map(|(ticker, mv)| PortfolioWeight {
+            ticker,
+            weight: mv / total,
+        })
+        .collect())
 }
 
 pub fn write_factor_artifacts(

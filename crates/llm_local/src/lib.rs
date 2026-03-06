@@ -45,11 +45,58 @@ pub struct BedrockClient {
 }
 
 impl LlmClient for BedrockClient {
-    fn answer(&self, _system_prompt: &str, _user_prompt: &str) -> Result<String> {
-        Err(anyhow!(
-            "Bedrock backend placeholder is wired into CLI, but runtime calls are not implemented yet for model '{}'.",
-            self.model
-        ))
+    fn answer(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        // Use AWS CLI Bedrock runtime so we avoid extra SDK plumbing in MVP.
+        let prompt = format!("System:\n{}\n\nUser:\n{}", system_prompt, user_prompt);
+        let messages = serde_json::json!([
+            {
+                "role": "user",
+                "content": [
+                    { "text": prompt }
+                ]
+            }
+        ]);
+        let inference = serde_json::json!({
+            "maxTokens": 700,
+            "temperature": 0.2
+        });
+
+        let mut cmd = Command::new("aws");
+        cmd.arg("bedrock-runtime")
+            .arg("converse")
+            .arg("--model-id")
+            .arg(&self.model)
+            .arg("--messages")
+            .arg(messages.to_string())
+            .arg("--inference-config")
+            .arg(inference.to_string())
+            .arg("--output")
+            .arg("json");
+
+        if let Ok(region) = std::env::var("AWS_REGION") {
+            if !region.trim().is_empty() {
+                cmd.arg("--region").arg(region);
+            }
+        }
+
+        let output = cmd.output().context(
+            "failed to invoke AWS CLI for Bedrock; install aws cli and configure credentials",
+        )?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "bedrock converse failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("failed to parse bedrock JSON response")?;
+        let text = value
+            .pointer("/output/message/content/0/text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("bedrock response missing output.message.content[0].text"))?;
+        Ok(text.trim().to_string())
     }
 }
 
