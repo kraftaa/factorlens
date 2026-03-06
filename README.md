@@ -24,40 +24,13 @@ It computes statistical factors (PCA) from price history, writes artifacts, and 
 
 ## Build Instructions
 
-### Build Rust CLI (local)
+For advanced build/release details, see `BUILD_INSTRUCTIONS.md`.
+
+Quick local build:
 
 ```bash
 cargo build -p factor_cli
-```
-
-Release binary:
-
-```bash
 cargo build -p factor_cli --release
-```
-
-### Build Python wheel (local)
-
-```bash
-python -m pip install --upgrade maturin
-maturin build --release --manifest-path crates/factor_cli/Cargo.toml
-```
-
-Install built wheel:
-
-```bash
-python -m pip install target/wheels/factorlens-*.whl
-```
-
-### Build + publish wheels via GitHub Actions (recommended for cross-platform)
-
-```bash
-# tag-based release build/publish
-git tag v0.1.3
-git push origin v0.1.3
-
-# or manual workflow trigger
-gh workflow run release.yml -f publish_to_pypi=true -f ref=main
 ```
 
 ## Input Formats
@@ -130,24 +103,6 @@ cargo run -p factor_cli -- explain \
 - `explain --backend local` expects `llama-cli` on your PATH.
 - `explain --backend bedrock` uses AWS Bedrock via AWS CLI (`aws bedrock-runtime converse`).
 - This project is designed for explainability of computed analytics, not market prediction.
-
-## Python (pip) Package
-
-FactorLens is published as a platform-specific binary wheel via `maturin`.
-
-Build/install locally:
-
-```bash
-python -m pip install --upgrade maturin
-maturin build --release --manifest-path crates/factor_cli/Cargo.toml
-python -m pip install target/wheels/factorlens-*.whl
-```
-
-Run:
-
-```bash
-factorlens factors fit --prices data/prices.csv --k 3 --out artifacts/
-```
 
 ## Explainability Notes
 
@@ -325,38 +280,11 @@ min_records = 20
 auto_group_k = 3
 ```
 
-## PyPI Publishing (Rustream-Style)
-
-FactorLens uses the same publishing pattern as `rustream`: `maturin` + GitHub Actions
-to build platform wheels (Linux/macOS/Windows) and publish to PyPI.
-
-### Release from macOS via CLI
-
-1. Bump version in `pyproject.toml`.
-2. Commit and push to `main`.
-3. Create and push a release tag:
-
-```bash
-git tag v0.1.3
-git push origin v0.1.3
-```
-
-This triggers `.github/workflows/release.yml`, which:
-- builds platform-specific wheels via `maturin`
-- publishes to PyPI using `PYPI_API_TOKEN`
-- attaches wheels to GitHub Release
-
-To manually trigger from CLI without a tag:
-
-```bash
-gh workflow run release.yml -f publish_to_pypi=true -f ref=main
-gh run list --workflow release.yml
-gh run view <run-id> --log
-```
-
 ### pip Package Usage
 
 Install from PyPI:
+
+For packaging/build/publish details, see `BUILD_INSTRUCTIONS.md`.
 
 ```bash
 pip install --upgrade factorlens==0.1.3
