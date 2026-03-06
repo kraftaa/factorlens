@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::{Datelike, Weekday};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use csv::StringRecord;
 use factor_core::{
     compute_outliers, fit_pca, portfolio_factor_contributions, portfolio_returns_from_weights,
@@ -12,9 +12,13 @@ use factor_io::{
 };
 use llm_local::{build_client, Backend};
 use nalgebra::{DMatrix, DVector};
+use postgres::{Client, NoTls};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "factorlens")]
@@ -52,10 +56,7 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
-    Marketplace {
-        #[command(subcommand)]
-        command: MarketplaceCommand,
-    },
+    Analyze(AnalyzeArgs),
 }
 
 #[derive(Subcommand)]
@@ -92,26 +93,39 @@ enum FactorsCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum MarketplaceCommand {
-    Analyze {
-        #[arg(long)]
-        input: PathBuf,
-        #[arg(long, value_delimiter = ',')]
-        group_by: Vec<String>,
-        #[arg(long, default_value_t = 5)]
-        auto_group_k: usize,
-        #[arg(long, value_delimiter = ',')]
-        metrics: Vec<String>,
-        #[arg(long, value_delimiter = ',')]
-        r#where: Vec<String>,
-        #[arg(long)]
-        rank_by: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        top: usize,
-        #[arg(long)]
-        out: PathBuf,
-    },
+#[derive(Args, Clone)]
+struct AnalyzeArgs {
+    #[arg(
+        long,
+        conflicts_with_all = ["postgres_url", "query", "query_file"]
+    )]
+    input: Option<PathBuf>,
+    #[arg(long)]
+    postgres_url: Option<String>,
+    #[arg(long, conflicts_with = "query_file")]
+    query: Option<String>,
+    #[arg(long, conflicts_with = "query")]
+    query_file: Option<PathBuf>,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    profile_config: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',')]
+    group_by: Vec<String>,
+    #[arg(long, default_value_t = 5)]
+    auto_group_k: usize,
+    #[arg(long, value_delimiter = ',')]
+    metrics: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    r#where: Vec<String>,
+    #[arg(long)]
+    rank_by: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+    #[arg(long, default_value_t = 1)]
+    min_records: u64,
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -290,43 +304,8 @@ fn main() -> Result<()> {
             fs::write(&out, md)?;
             println!("Report written to {}", out.display());
         }
-        Commands::Marketplace {
-            command:
-                MarketplaceCommand::Analyze {
-                    input,
-                    group_by,
-                    auto_group_k,
-                    metrics,
-                    r#where,
-                    rank_by,
-                    top,
-                    out,
-                },
-        } => {
-            let report = analyze_marketplace_csv(
-                &input,
-                &group_by,
-                auto_group_k,
-                &metrics,
-                &r#where,
-                rank_by.as_deref(),
-                top,
-            )?;
-            fs::write(&out, report.markdown)?;
-            fs::write(
-                out.with_extension("json"),
-                serde_json::to_string_pretty(&report.json)?,
-            )?;
-            println!("Marketplace analysis written to {}", out.display());
-            println!(
-                "Detected/used groups: {}",
-                report
-                    .used_groups
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+        Commands::Analyze(args) => {
+            run_analyze(args)?;
         }
     }
 
@@ -388,6 +367,236 @@ fn deterministic_answer(
             others
         }
     ))
+}
+
+fn run_analyze(args: AnalyzeArgs) -> Result<()> {
+    let args = apply_analyze_profile(args)?;
+    let (input_path, _temp_path) = materialize_analyze_input(&args)?;
+    let report = analyze_table_csv(
+        &input_path,
+        args.profile.as_deref(),
+        &args.group_by,
+        args.auto_group_k,
+        &args.metrics,
+        &args.r#where,
+        args.rank_by.as_deref(),
+        args.top,
+        args.min_records,
+    )?;
+    fs::write(&args.out, report.markdown)?;
+    fs::write(
+        args.out.with_extension("json"),
+        serde_json::to_string_pretty(&report.json)?,
+    )?;
+    println!("Analysis written to {}", args.out.display());
+    println!(
+        "Detected/used groups: {}",
+        report
+            .used_groups
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<PathBuf>)> {
+    if let Some(path) = &args.input {
+        if args.postgres_url.is_some() || args.query.is_some() || args.query_file.is_some() {
+            return Err(anyhow!(
+                "choose exactly one input source: --input <csv> OR --postgres-url + (--query | --query-file)"
+            ));
+        }
+        return Ok((path.clone(), None));
+    }
+
+    let effective_pg_url = args
+        .postgres_url
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok());
+    match (&args.input, effective_pg_url.as_deref(), &args.query, &args.query_file) {
+        (None, Some(url), Some(q), None) => {
+            let path = postgres_query_to_temp_csv(url, q)?;
+            Ok((path.clone(), Some(path)))
+        }
+        (None, Some(url), None, Some(query_file)) => {
+            let q = fs::read_to_string(query_file).map_err(|e| {
+                anyhow!(
+                    "failed to read query file '{}': {}",
+                    query_file.display(),
+                    e
+                )
+            })?;
+            let path = postgres_query_to_temp_csv(url, &q)?;
+            Ok((path.clone(), Some(path)))
+        }
+        (None, Some(_), None, None) => Err(anyhow!(
+            "postgres analyze requires one of --query or --query-file"
+        )),
+        (None, None, Some(_), _) | (None, None, _, Some(_)) => {
+            Err(anyhow!(
+                "--query/--query-file require --postgres-url (or DATABASE_URL env var)"
+            ))
+        }
+        _ => Err(anyhow!(
+            "choose exactly one input source: --input <csv> OR --postgres-url + (--query | --query-file)"
+        )),
+    }
+}
+
+fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf> {
+    let mut client = Client::connect(postgres_url, NoTls)
+        .map_err(|e| anyhow!("failed to connect to postgres: {}", e))?;
+    let copy_sql = format!(
+        "COPY ({}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)",
+        query.trim()
+    );
+    let mut reader = client
+        .copy_out(copy_sql.as_str())
+        .map_err(|e| anyhow!("failed to run COPY export for query: {}", e))?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmp_path = std::env::temp_dir().join(format!("factorlens_analyze_{}.csv", ts));
+    let mut file = fs::File::create(&tmp_path).map_err(|e| {
+        anyhow!(
+            "failed to create temporary csv '{}': {}",
+            tmp_path.display(),
+            e
+        )
+    })?;
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| anyhow!("failed writing postgres result csv: {}", e))?;
+    file.flush()?;
+    Ok(tmp_path)
+}
+
+fn apply_analyze_profile(mut args: AnalyzeArgs) -> Result<AnalyzeArgs> {
+    let Some(profile_raw) = args.profile.clone() else {
+        return Ok(args);
+    };
+    let profile = profile_raw.trim().to_string();
+
+    if let Some(cfg_path) = args.profile_config.clone() {
+        let text = fs::read_to_string(&cfg_path).map_err(|e| {
+            anyhow!(
+                "failed to read profile config '{}': {}",
+                cfg_path.display(),
+                e
+            )
+        })?;
+        let cfg: ProfileConfigFile = toml::from_str(&text).map_err(|e| {
+            anyhow!(
+                "failed to parse profile config '{}': {}",
+                cfg_path.display(),
+                e
+            )
+        })?;
+        let entry = cfg
+            .profiles
+            .get(&profile)
+            .or_else(|| {
+                cfg.profiles
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&profile))
+                    .map(|(_, v)| v)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "profile '{}' not found in {}",
+                    profile_raw,
+                    cfg_path.display()
+                )
+            })?;
+        apply_profile_entry(&mut args, entry);
+        return Ok(args);
+    }
+
+    // Built-in profiles are generic only (no dataset-specific column names).
+    match profile.to_lowercase().as_str() {
+        "exec" => {
+            if args.auto_group_k == 5 {
+                args.auto_group_k = 3;
+            }
+            if args.top == 20 {
+                args.top = 12;
+            }
+            if args.min_records == 1 {
+                args.min_records = 20;
+            }
+        }
+        "segment" => {
+            if args.auto_group_k == 5 {
+                args.auto_group_k = 5;
+            }
+            if args.top == 20 {
+                args.top = 20;
+            }
+            if args.min_records == 1 {
+                args.min_records = 20;
+            }
+        }
+        "supplier" => {
+            if args.auto_group_k == 5 {
+                args.auto_group_k = 3;
+            }
+            if args.top == 20 {
+                args.top = 20;
+            }
+            if args.min_records == 1 {
+                args.min_records = 10;
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "unknown profile '{}'. Built-ins: exec, segment, supplier. Or pass --profile-config <path.toml>.",
+                profile_raw
+            ));
+        }
+    }
+
+    Ok(args)
+}
+
+fn apply_profile_entry(args: &mut AnalyzeArgs, entry: &AnalyzeProfile) {
+    if args.group_by.is_empty() {
+        if let Some(v) = &entry.group_by {
+            args.group_by = v.clone();
+        }
+    }
+    if args.metrics.is_empty() {
+        if let Some(v) = &entry.metrics {
+            args.metrics = v.clone();
+        }
+    }
+    if args.r#where.is_empty() {
+        if let Some(v) = &entry.where_clauses {
+            args.r#where = v.clone();
+        }
+    }
+    if args.rank_by.is_none() {
+        if let Some(v) = &entry.rank_by {
+            args.rank_by = Some(v.clone());
+        }
+    }
+    if args.top == 20 {
+        if let Some(v) = entry.top {
+            args.top = v;
+        }
+    }
+    if args.min_records == 1 {
+        if let Some(v) = entry.min_records {
+            args.min_records = v;
+        }
+    }
+    if args.auto_group_k == 5 {
+        if let Some(v) = entry.auto_group_k {
+            args.auto_group_k = v;
+        }
+    }
 }
 
 fn build_prompt_context(
@@ -893,7 +1102,7 @@ fn write_regression_artifacts(out_dir: &PathBuf, reg: &RegressionResult) -> Resu
     Ok(())
 }
 
-struct MarketplaceReport {
+struct AnalysisReport {
     markdown: String,
     json: serde_json::Value,
     used_groups: Vec<String>,
@@ -926,19 +1135,35 @@ struct RegressionResult {
     y: Vec<f64>,
 }
 
-fn analyze_marketplace_csv(
+#[derive(Debug, Deserialize)]
+struct ProfileConfigFile {
+    profiles: HashMap<String, AnalyzeProfile>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AnalyzeProfile {
+    group_by: Option<Vec<String>>,
+    metrics: Option<Vec<String>>,
+    where_clauses: Option<Vec<String>>,
+    rank_by: Option<String>,
+    top: Option<usize>,
+    min_records: Option<u64>,
+    auto_group_k: Option<usize>,
+}
+
+fn analyze_table_csv(
     input: &PathBuf,
+    profile: Option<&str>,
     group_by: &[String],
     auto_group_k: usize,
     metrics: &[String],
     where_clauses: &[String],
     rank_by: Option<&str>,
     top_n: usize,
-) -> Result<MarketplaceReport> {
+    min_records: u64,
+) -> Result<AnalysisReport> {
     let mut rdr = csv::Reader::from_path(input)?;
     let headers = rdr.headers()?.clone();
-    let discipline_idx = headers.iter().position(|h| h == "discipline");
-    let advantage_idx = headers.iter().position(|h| h == "advantage_plan");
 
     let resolved_groups = if group_by.is_empty() {
         auto_detect_groups(&headers, input, auto_group_k)?
@@ -952,24 +1177,21 @@ fn analyze_marketplace_csv(
         return Err(anyhow!("no grouping columns selected or detected"));
     }
 
-    let metric_candidates = if metrics.is_empty() {
-        vec![
-            "net_gmv".to_string(),
-            "customer_purchase_order_retail_total_price_usd".to_string(),
-            "provider_purchase_order_wholesale_total_price_usd".to_string(),
-        ]
+    let metric_cols = if metrics.is_empty() {
+        auto_detect_numeric_metrics(input, &headers, &resolved_groups, 3)?
     } else {
-        metrics.to_vec()
+        let cols = metrics
+            .iter()
+            .map(|m| {
+                headers
+                    .iter()
+                    .position(|h| h == m)
+                    .map(|idx| (m.to_string(), idx))
+                    .ok_or_else(|| anyhow!("metric column '{}' not found", m))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cols
     };
-    let metric_cols = metric_candidates
-        .iter()
-        .filter_map(|m| {
-            headers
-                .iter()
-                .position(|h| h == m)
-                .map(|idx| (m.to_string(), idx))
-        })
-        .collect::<Vec<_>>();
     let rank_metric = rank_by.and_then(|rb| {
         metric_cols
             .iter()
@@ -1002,8 +1224,6 @@ fn analyze_marketplace_csv(
     let where_filters = parse_where_filters(where_clauses, &headers)?;
 
     let mut by_group: BTreeMap<String, (u64, HashMap<String, f64>)> = BTreeMap::new();
-    let mut by_discipline: HashMap<String, (u64, HashMap<String, f64>)> = HashMap::new();
-    let mut by_advantage: HashMap<String, (u64, HashMap<String, f64>)> = HashMap::new();
     let mut row_count = 0_u64;
 
     for rec in rdr.records() {
@@ -1033,54 +1253,26 @@ fn analyze_marketplace_csv(
             *entry.1.entry(name.clone()).or_insert(0.0) += v;
         }
 
-        if let Some(idx) = discipline_idx {
-            let key = rec.get(idx).unwrap_or("").trim();
-            let key = if key.is_empty() {
-                "(blank)".to_string()
-            } else {
-                key.to_string()
-            };
-            let d = by_discipline
-                .entry(key)
-                .or_insert_with(|| (0, HashMap::<String, f64>::new()));
-            d.0 += 1;
-            for (name, idx) in &metric_cols {
-                let v = rec
-                    .get(*idx)
-                    .unwrap_or("")
-                    .replace(',', "")
-                    .parse::<f64>()
-                    .unwrap_or(0.0);
-                *d.1.entry(name.clone()).or_insert(0.0) += v;
-            }
-        }
-
-        if let Some(idx) = advantage_idx {
-            let key = rec.get(idx).unwrap_or("").trim();
-            let key = if key.is_empty() {
-                "(blank)".to_string()
-            } else {
-                key.to_string()
-            };
-            let a = by_advantage
-                .entry(key)
-                .or_insert_with(|| (0, HashMap::<String, f64>::new()));
-            a.0 += 1;
-            for (name, idx) in &metric_cols {
-                let v = rec
-                    .get(*idx)
-                    .unwrap_or("")
-                    .replace(',', "")
-                    .parse::<f64>()
-                    .unwrap_or(0.0);
-                *a.1.entry(name.clone()).or_insert(0.0) += v;
-            }
-        }
     }
+
+    let primary_metric = metric_cols
+        .first()
+        .map(|(m, _)| m.clone())
+        .or_else(|| metric_cols.first().map(|(m, _)| m.clone()));
+    let total_count_all = by_group.values().map(|(c, _)| *c).sum::<u64>();
+    let total_primary_all = if let Some(pm) = &primary_metric {
+        by_group
+            .values()
+            .map(|(_, sums)| sums.get(pm).copied().unwrap_or(0.0))
+            .sum::<f64>()
+    } else {
+        0.0
+    };
 
     let mut rows = by_group
         .into_iter()
         .map(|(group, (count, sums))| (group, count, sums))
+        .filter(|(_, count, _)| *count >= min_records)
         .collect::<Vec<_>>();
     if let Some(rm) = &rank_metric {
         rows.sort_by(|a, b| {
@@ -1094,7 +1286,7 @@ fn analyze_marketplace_csv(
     let segment_count = rows.len();
 
     let mut md = String::new();
-    md.push_str("# Marketplace Intelligence Brief\n\n");
+    md.push_str("# Analysis Brief\n\n");
     md.push_str(&format!("- Input: {}\n", input.display()));
     md.push_str(&format!("- Records (after filters): {}\n", row_count));
     md.push_str(&format!(
@@ -1102,6 +1294,9 @@ fn analyze_marketplace_csv(
         segment_count
     ));
     md.push_str(&format!("- Grouped by: {}\n", resolved_groups.join(", ")));
+    if let Some(p) = profile {
+        md.push_str(&format!("- Profile: {}\n", p));
+    }
     if where_filters.is_empty() {
         md.push_str("- Filters: none\n");
     } else {
@@ -1119,6 +1314,7 @@ fn analyze_marketplace_csv(
         rank_metric.clone().unwrap_or_else(|| "count".to_string())
     ));
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
+    md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
     if metric_cols.is_empty() {
         md.push_str("- Metrics: none detected (count-only analysis)\n\n");
     } else {
@@ -1131,19 +1327,8 @@ fn analyze_marketplace_csv(
                 .join(", ")
         ));
     }
-    let primary_metric = metric_cols
-        .iter()
-        .find(|(m, _)| m == "net_gmv")
-        .map(|(m, _)| m.clone())
-        .or_else(|| metric_cols.first().map(|(m, _)| m.clone()));
-    let total_primary = if let Some(pm) = &primary_metric {
-        rows.iter()
-            .map(|(_, _, sums)| sums.get(pm).copied().unwrap_or(0.0))
-            .sum::<f64>()
-    } else {
-        0.0
-    };
-    let total_count = rows.iter().map(|(_, c, _)| *c).sum::<u64>();
+    let total_primary = total_primary_all;
+    let total_count = total_count_all;
     let top1 = rows.first();
     let top5_count = rows.iter().take(5).map(|(_, c, _)| *c).sum::<u64>();
     let top5_primary = if let Some(pm) = &primary_metric {
@@ -1197,28 +1382,6 @@ fn analyze_marketplace_csv(
     } else {
         md.push_str(".\n");
     }
-    if !by_advantage.is_empty() {
-        let mut plans = by_advantage.iter().collect::<Vec<_>>();
-        plans.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-        if plans.len() >= 2 {
-            let (p1_name, (p1_count, _)) = plans[0];
-            let (p2_name, (p2_count, _)) = plans[1];
-            let p1_pct = if total_count > 0 {
-                (*p1_count as f64 / total_count as f64) * 100.0
-            } else {
-                0.0
-            };
-            let p2_pct = if total_count > 0 {
-                (*p2_count as f64 / total_count as f64) * 100.0
-            } else {
-                0.0
-            };
-            md.push_str(&format!(
-                "- Advantage plan distribution is concentrated in `{}` ({:.1}%) vs `{}` ({:.1}%).\n",
-                p1_name, p1_pct, p2_name, p2_pct
-            ));
-        }
-    }
     md.push('\n');
 
     md.push_str("## Insights\n\n");
@@ -1240,8 +1403,11 @@ fn analyze_marketplace_csv(
                 0.0
             };
             md.push_str(&format!(
-                "- Top segment contributes {:.2} `{}` ({:.1}% of total `{}`).\n",
-                top_val, pm, pm_pct, pm
+                "- Top segment contributes {} `{}` ({:.1}% of total `{}`).\n",
+                fmt_num(top_val, 2),
+                pm,
+                pm_pct,
+                pm
             ));
         }
     }
@@ -1256,58 +1422,21 @@ fn analyze_marketplace_csv(
             0.0
         };
         md.push_str(&format!(
-            "- Concentration by `{}`: top 5 segments represent {:.2} ({:.1}% of total).\n",
-            pm, top5_primary, pct
+            "- Concentration by `{}`: top 5 segments represent {} ({:.1}% of total).\n",
+            pm,
+            fmt_num(top5_primary, 2),
+            pct
         ));
     }
 
-    if !by_discipline.is_empty() {
-        let mut disciplines = by_discipline.into_iter().collect::<Vec<_>>();
-        disciplines.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-        let (name, (count, sums)) = &disciplines[0];
-        let pct = if total_count > 0 {
-            (*count as f64 / total_count as f64) * 100.0
-        } else {
-            0.0
-        };
-        if let Some(pm) = &primary_metric {
-            let v = sums.get(pm).copied().unwrap_or(0.0);
-            md.push_str(&format!(
-                "- Dominant discipline: `{}` with {} records ({:.1}%) and {:.2} `{}`.\n",
-                name, count, pct, v, pm
-            ));
-        } else {
-            md.push_str(&format!(
-                "- Dominant discipline: `{}` with {} records ({:.1}%).\n",
-                name, count, pct
-            ));
-        }
-    }
-
-    if !by_advantage.is_empty() {
-        let mut plans = by_advantage.into_iter().collect::<Vec<_>>();
-        plans.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-        let mut plan_line = String::new();
-        for (name, (count, sums)) in plans.iter().take(3) {
-            if !plan_line.is_empty() {
-                plan_line.push_str("; ");
-            }
-            if let Some(pm) = &primary_metric {
-                let v = sums.get(pm).copied().unwrap_or(0.0);
-                plan_line.push_str(&format!("{}: {} records, {}={:.2}", name, count, pm, v));
-            } else {
-                plan_line.push_str(&format!("{}: {} records", name, count));
-            }
-        }
-        md.push_str(&format!(
-            "- Advantage plan split (top values): {}.\n",
-            plan_line
-        ));
-    }
     md.push('\n');
 
     md.push_str("## Top Groups\n\n");
-    md.push_str("| Segment | Records | Record Share |");
+    md.push_str("|");
+    for g in &resolved_groups {
+        md.push_str(&format!(" {} |", g));
+    }
+    md.push_str(" Records | Record Share |");
     for (m, _) in &metric_cols {
         if m == primary_metric.as_deref().unwrap_or("") {
             md.push_str(&format!(" {} | {} Share |", m, m));
@@ -1316,7 +1445,11 @@ fn analyze_marketplace_csv(
         }
     }
     md.push('\n');
-    md.push_str("|---|---:|---:|");
+    md.push_str("|");
+    for _ in &resolved_groups {
+        md.push_str("---|");
+    }
+    md.push_str("---:|---:|");
     for (m, _) in &metric_cols {
         if m == primary_metric.as_deref().unwrap_or("") {
             md.push_str("---:|---:|");
@@ -1332,8 +1465,16 @@ fn analyze_marketplace_csv(
         } else {
             0.0
         };
-        let group_cell = group.replace('|', "\\|");
-        let mut line = format!("| {} | {} | {:.1}% |", group_cell, count, count_share);
+        let parts = group
+            .split(" | ")
+            .map(|x| x.trim().replace('|', "\\|"))
+            .collect::<Vec<_>>();
+        let mut line = String::from("|");
+        for i in 0..resolved_groups.len() {
+            let v = parts.get(i).cloned().unwrap_or_default();
+            line.push_str(&format!(" {} |", v));
+        }
+        line.push_str(&format!(" {} | {:.1}% |", count, count_share));
         for (m, _) in &metric_cols {
             let v = sums.get(m).copied().unwrap_or(0.0);
             let share =
@@ -1343,9 +1484,9 @@ fn analyze_marketplace_csv(
                     0.0
                 };
             if m == primary_metric.as_deref().unwrap_or("") {
-                line.push_str(&format!(" {:.2} | {:.1}% |", v, share));
+                line.push_str(&format!(" {} | {:.1}% |", fmt_num(v, 2), share));
             } else {
-                line.push_str(&format!(" {:.2} |", v));
+                line.push_str(&format!(" {} |", fmt_num(v, 2)));
             }
         }
         md.push_str(&line);
@@ -1387,6 +1528,7 @@ fn analyze_marketplace_csv(
         "metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
+        "min_records": min_records,
         "primary_metric": primary_metric,
         "top5_count": top5_count,
         "top5_primary_metric_sum": top5_primary,
@@ -1402,7 +1544,7 @@ fn analyze_marketplace_csv(
         })
         .unwrap_or_default();
 
-    Ok(MarketplaceReport {
+    Ok(AnalysisReport {
         markdown: md,
         json,
         used_groups,
@@ -1410,24 +1552,7 @@ fn analyze_marketplace_csv(
 }
 
 fn auto_detect_groups(headers: &StringRecord, input: &PathBuf, k: usize) -> Result<Vec<String>> {
-    let preferred = [
-        "discipline",
-        "category",
-        "subcategory",
-        "quote_group_ware_name",
-        "advantage_plan",
-    ];
-
-    let mut selected = preferred
-        .iter()
-        .filter(|name| headers.iter().any(|h| h == **name))
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    if selected.len() >= k {
-        selected.truncate(k);
-        return Ok(selected);
-    }
+    let mut selected = Vec::new();
 
     let mut rdr = csv::Reader::from_path(input)?;
     let mut distinct: HashMap<String, HashSet<String>> = HashMap::new();
@@ -1481,24 +1606,114 @@ fn auto_detect_groups(headers: &StringRecord, input: &PathBuf, k: usize) -> Resu
 
 fn resolve_group_name(name: &str, headers: &StringRecord) -> Result<String> {
     let n = name.trim();
-    let aliases = [
-        ("ware_name", "quote_group_ware_name"),
-        ("ware", "quote_group_ware_name"),
-        ("plan", "advantage_plan"),
-    ];
 
     if headers.iter().any(|h| h == n) {
         return Ok(n.to_string());
     }
-    for (a, real) in aliases {
-        if n.eq_ignore_ascii_case(a) && headers.iter().any(|h| h == real) {
-            return Ok(real.to_string());
+    if let Some(real) = headers.iter().find(|h| h.eq_ignore_ascii_case(n)) {
+        return Ok(real.to_string());
+    }
+    Err(anyhow!("group column '{}' not found", n))
+}
+
+fn auto_detect_numeric_metrics(
+    input: &PathBuf,
+    headers: &StringRecord,
+    group_cols: &[String],
+    max_metrics: usize,
+) -> Result<Vec<(String, usize)>> {
+    let mut out = Vec::new();
+    let group_set = group_cols.iter().cloned().collect::<HashSet<_>>();
+
+    let mut rdr = csv::Reader::from_path(input)?;
+    let mut seen = 0usize;
+    let mut numeric_ok = vec![0usize; headers.len()];
+    let mut non_empty = vec![0usize; headers.len()];
+    for rec in rdr.records().take(1500) {
+        let rec = rec?;
+        seen += 1;
+        for i in 0..headers.len() {
+            let v = rec.get(i).unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            non_empty[i] += 1;
+            if parse_numeric(v).is_some() {
+                numeric_ok[i] += 1;
+            }
         }
     }
-    Err(anyhow!(
-        "group column '{}' not found (alias not resolved)",
-        n
-    ))
+
+    let mut candidates = headers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            if group_set.contains(name) {
+                return None;
+            }
+            if name.eq_ignore_ascii_case("date")
+                || name.ends_with("_id")
+                || name.ends_with("_uuid")
+                || name.ends_with("_url")
+            {
+                return None;
+            }
+            let ne = non_empty[i];
+            if ne == 0 {
+                return None;
+            }
+            let ratio = numeric_ok[i] as f64 / ne as f64;
+            if ratio >= 0.8 {
+                Some((name.to_string(), i, ne))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.2.cmp(&a.2));
+
+    for (name, idx, _) in candidates {
+        if out.iter().any(|(n, _)| n == &name) {
+            continue;
+        }
+        out.push((name, idx));
+        if out.len() >= max_metrics {
+            break;
+        }
+    }
+
+    if out.is_empty() && seen > 0 {
+        return Err(anyhow!(
+            "no numeric metric columns auto-detected; pass --metrics explicitly"
+        ));
+    }
+    Ok(out)
+}
+
+fn parse_numeric(v: &str) -> Option<f64> {
+    let s = v.replace(',', "").replace('$', "");
+    s.parse::<f64>().ok()
+}
+
+fn fmt_num(value: f64, decimals: usize) -> String {
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let s = format!("{:.*}", decimals, value.abs());
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((&s, ""));
+
+    let mut grouped_rev = String::with_capacity(int_part.len() + int_part.len() / 3);
+    for (i, ch) in int_part.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            grouped_rev.push('_');
+        }
+        grouped_rev.push(ch);
+    }
+    let grouped_int = grouped_rev.chars().rev().collect::<String>();
+
+    if decimals == 0 {
+        format!("{}{}", sign, grouped_int)
+    } else {
+        format!("{}{}.{}", sign, grouped_int, frac_part)
+    }
 }
 
 fn parse_where_filters(

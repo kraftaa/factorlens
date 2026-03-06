@@ -208,41 +208,101 @@ Notes:
 - Which assets are most aligned with `factor_1` loadings?
 - Which assets increased my exposure to downside factors most?
 
-## Marketplace Analysis
+## Generic Table Analysis
 
-Analyze generic marketplace CSVs by group columns you choose:
+Analyze any CSV table by grouping columns and numeric metrics you choose:
 
 ```bash
-cargo run -p factor_cli -- marketplace analyze \
-  --input data/analytics.sales5000.csv \
-  --group-by discipline,category,subcategory,ware_name,advantage_plan \
-  --out artifacts/market_report.md
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --group-by region,product_line,channel \
+  --out artifacts/analysis.md
+
+# profile-based quick starts
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --profile exec \
+  --out artifacts/analysis_exec.md
+
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --profile segment \
+  --out artifacts/analysis_segment.md
+
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --profile supplier \
+  --out artifacts/analysis_supplier.md
+
+# custom profile config (recommended for private/domain fields)
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --profile exec_custom \
+  --profile-config profiles/profiles.example.toml \
+  --out artifacts/analysis.md
 
 # filtered + ranked view
-cargo run -p factor_cli -- marketplace analyze \
-  --input data/analytics.sales5000.csv \
-  --where advantage_plan=1 \
-  --rank-by net_gmv \
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --where region=US \
+  --rank-by revenue_usd \
   --top 10 \
-  --out artifacts/market_filtered_ranked.md
+  --min-records 20 \
+  --out artifacts/analysis_filtered_ranked.md
 ```
 
 Auto-detect useful grouping columns (if `--group-by` is omitted):
 
 ```bash
-cargo run -p factor_cli -- marketplace analyze \
-  --input data/analytics.sales5000.csv \
-  --out artifacts/market_auto.md
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --out artifacts/analysis_auto.md
+```
+
+Or analyze directly from Postgres:
+
+```bash
+# option 1: inline query
+factorlens analyze \
+  --postgres-url "$DATABASE_URL" \
+  --query "SELECT region, channel, revenue_usd, cost_usd FROM analytics.sales" \
+  --profile exec_custom \
+  --profile-config profiles/profiles.example.toml \
+  --out artifacts/analysis.md
+
+# option 2: query file
+factorlens analyze \
+  --postgres-url "$DATABASE_URL" \
+  --query-file sql/sales_analysis.sql \
+  --profile exec_custom \
+  --profile-config profiles/profiles.example.toml \
+  --out artifacts/analysis.md
 ```
 
 Notes:
-- `ware_name` alias maps to `quote_group_ware_name`.
 - Outputs both markdown and JSON (`<out>.json`).
-- Default metrics: `net_gmv`, `customer_purchase_order_retail_total_price_usd`, `provider_purchase_order_wholesale_total_price_usd`.
+- If `--metrics` is omitted, numeric metrics are auto-detected from the input file.
+- `--profile` built-ins (`exec`, `segment`, `supplier`) are generic (no hardcoded domain columns).
+- Use `--profile-config <path.toml>` for your own private, file-specific profile mappings.
+- Input source is exclusive: use either `--input <csv>` or `--postgres-url` + (`--query` or `--query-file`).
+- `--postgres-url` can be omitted if `DATABASE_URL` env var is set.
+- Recommended layout: commit `profiles/profiles.example.toml`, keep private variants as `profiles/*.local.toml` or `profiles/*.private.toml` (gitignored).
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
 - `--top` controls how many groups are listed in the report.
-- For cleaner executive analytics on this dataset, start with `--group-by discipline,advantage_plan`.
+- `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
+
+Example `--profile-config` file:
+
+```toml
+[profiles.exec_custom]
+group_by = ["region", "channel"]
+metrics = ["revenue_usd"]
+rank_by = "revenue_usd"
+top = 12
+min_records = 20
+auto_group_k = 3
+```
 
 ## PyPI Publishing (Rustream-Style)
 
