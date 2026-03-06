@@ -1572,6 +1572,11 @@ fn analyze_table_csv(
         .max_by_key(|(_, count, _)| *count)
         .or_else(|| rows.first());
     let top5_count = rows.iter().take(5).map(|(_, c, _)| *c).sum::<u64>();
+    let top5_names = rows
+        .iter()
+        .take(5)
+        .map(|(g, _, _)| format!("`{}`", g))
+        .collect::<Vec<_>>();
     let top5_primary = if let Some(pm) = &primary_metric {
         rows.iter()
             .take(5)
@@ -1641,6 +1646,12 @@ fn analyze_table_csv(
         }
     } else {
         md.push_str(".\n");
+    }
+    if !top5_names.is_empty() {
+        md.push_str(&format!(
+            "- Top 5 segment names: {}.\n",
+            top5_names.join(", ")
+        ));
     }
     md.push('\n');
 

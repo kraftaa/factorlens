@@ -246,6 +246,19 @@ factorlens analyze \
   --profile exec_custom \
   --profile-config profiles/profiles.example.toml \
   --out artifacts/analysis.md
+
+# option 3: AWS RDS/Aurora TLS with explicit CA bundle (recommended in pods)
+mkdir -p /path/to/certs
+curl -fL "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" \
+  -o /path/to/rds-global-bundle.pem
+
+factorlens analyze \
+  --query "SELECT * FROM transform.analytics.sales LIMIT 5000" \
+  --postgres-ssl-mode require \
+  --postgres-ca-file /path/to/rds-global-bundle.pem \
+  --profile exec_custom \
+  --profile-config profiles/profiles.example.toml \
+  --out artifacts/analysis.md
 ```
 
 Notes:
@@ -257,6 +270,7 @@ Notes:
 - `--postgres-url` can be omitted if `DATABASE_URL` env var is set.
 - `--postgres-ssl-mode` supports `prefer` (default), `require`, or `disable`.
 - `--postgres-ca-file` optionally adds PEM CA certificates for DB TLS verification.
+- For AWS RDS/Aurora in containers/pods, pass explicit RDS CA bundle via `--postgres-ca-file` if TLS handshake fails with system certs.
 - Recommended layout: commit `profiles/profiles.example.toml`, keep private variants as `profiles/*.local.toml` or `profiles/*.private.toml` (gitignored).
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
