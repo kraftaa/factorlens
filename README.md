@@ -354,9 +354,9 @@ gh run list --workflow release.yml
 gh run view <run-id> --log
 ```
 
-### Jupyter Usage
+### pip Package Usage
 
-Install from PyPI in Jupyter:
+Install from PyPI:
 
 ```bash
 pip install --upgrade factorlens==0.1.3
