@@ -87,34 +87,34 @@ jobs:
           name: wheel-${{ matrix.target }}
           path: target/wheels/*.whl
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build wheel
-        run: maturin build --release --manifest-path crates/factor_cli/Cargo.toml --target x86_64-pc-windows-msvc
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-x86_64-pc-windows-msvc
-          path: target/wheels/*.whl
+#  build-windows:
+#    runs-on: windows-latest
+#    steps:
+#      - uses: actions/checkout@v4
+#        with:
+#          ref: ${{ inputs.ref || github.ref }}
+#
+#      - uses: actions/setup-python@v5
+#        with:
+#          python-version: "3.12"
+#
+#      - name: Install Rust
+#        uses: dtolnay/rust-toolchain@stable
+#
+#      - name: Install maturin
+#        run: pip install maturin
+#
+#      - name: Build wheel
+#        run: maturin build --release --manifest-path crates/factor_cli/Cargo.toml --target x86_64-pc-windows-msvc
+#
+#      - name: Upload wheel artifact
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: wheel-x86_64-pc-windows-msvc
+#          path: target/wheels/*.whl
 
   publish-pypi:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == 'true')
     environment: release
@@ -132,7 +132,8 @@ jobs:
           password: ${{ secrets.PYPI_API_TOKEN }}
 
   github-release:
-    needs: [build-linux, build-macos, build-windows]
+#    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
