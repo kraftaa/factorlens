@@ -1,40 +1,32 @@
 [build-system]
-requires = ["hatchling>=1.25.0"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "factorlens"
-version = "0.1.0"
-description = "Python wrapper for the FactorLens Rust CLI"
+version = "0.1.3"
+description = "Factor attribution and marketplace analytics CLI"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = { text = "MIT" }
 authors = [
   { name = "FactorLens" }
 ]
 classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent"
+  "Topic :: Office/Business :: Financial",
+  "Topic :: Scientific/Engineering :: Information Analysis"
 ]
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/factor_cli/Cargo.toml"
+strip = true
 
 [project.urls]
 Homepage = "https://github.com/your-org/factorlens"
 Repository = "https://github.com/your-org/factorlens"
-
-[project.scripts]
-factorlens-py = "factorlens.cli:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["factorlens"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-  "/factorlens",
-  "/crates",
-  "/Cargo.toml",
-  "/README.md",
-  "/data",
-  "/.gitignore"
-]

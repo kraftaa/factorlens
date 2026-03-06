@@ -22,6 +22,44 @@ It computes statistical factors (PCA) from price history, writes artifacts, and 
 - `crates/llm_local`: `LLMClient` trait + local/bedrock backends
 - `crates/report`: Markdown report generation
 
+## Build Instructions
+
+### Build Rust CLI (local)
+
+```bash
+cargo build -p factor_cli
+```
+
+Release binary:
+
+```bash
+cargo build -p factor_cli --release
+```
+
+### Build Python wheel (local)
+
+```bash
+python -m pip install --upgrade maturin
+maturin build --release --manifest-path crates/factor_cli/Cargo.toml
+```
+
+Install built wheel:
+
+```bash
+python -m pip install target/wheels/factorlens-*.whl
+```
+
+### Build + publish wheels via GitHub Actions (recommended for cross-platform)
+
+```bash
+# tag-based release build/publish
+git tag v0.1.3
+git push origin v0.1.3
+
+# or manual workflow trigger
+gh workflow run release.yml -f publish_to_pypi=true -f ref=main
+```
+
 ## Input Formats
 
 `prices.csv`
@@ -35,6 +73,11 @@ It computes statistical factors (PCA) from price history, writes artifacts, and 
 - `ticker`
 - `weight`
 
+`holdings.csv` (optional alternative to `portfolio.csv`)
+
+- `ticker`
+- either `market_value` or both `shares` and `price`
+
 ## Quick Start
 
 ```bash
@@ -43,6 +86,13 @@ cargo run -p factor_cli -- factors fit \
   --k 3 \
   --out artifacts/ \
   --portfolio data/portfolio.csv
+
+# alternative: derive weights automatically from holdings
+cargo run -p factor_cli -- factors fit \
+  --prices data/prices.csv \
+  --k 3 \
+  --out artifacts/ \
+  --holdings data/holdings.csv
 
 cargo run -p factor_cli -- report \
   --artifacts artifacts/ \
@@ -59,38 +109,25 @@ cargo run -p factor_cli -- explain \
 ## Notes
 
 - `explain --backend local` expects `llama-cli` on your PATH.
-- `explain --backend bedrock` is scaffolded through the shared interface, but runtime invocation is intentionally left as the next implementation step.
+- `explain --backend bedrock` uses AWS Bedrock via AWS CLI (`aws bedrock-runtime converse`).
 - This project is designed for explainability of computed analytics, not market prediction.
 
 ## Python (pip) Package
 
-A Python wrapper is included so you can distribute a `pip` package and run FactorLens via `factorlens-py`.
+FactorLens is published as a platform-specific binary wheel via `maturin`.
 
 Build/install locally:
 
 ```bash
-python -m pip install --upgrade build
-python -m build
-python -m pip install dist/factorlens-0.1.0-py3-none-any.whl
+python -m pip install --upgrade maturin
+maturin build --release --manifest-path crates/factor_cli/Cargo.toml
+python -m pip install target/wheels/factorlens-*.whl
 ```
 
 Run:
 
 ```bash
-factorlens-py factors fit --prices data/prices.csv --k 3 --out artifacts/
-```
-
-Binary resolution order used by `factorlens-py`:
-
-1. `FACTORLENS_BIN` env var
-2. `factorlens` on `PATH`
-3. `cargo run -p factor_cli --` (dev fallback)
-
-If you want to publish to PyPI, run:
-
-```bash
-python -m pip install --upgrade twine
-python -m twine upload dist/*
+factorlens factors fit --prices data/prices.csv --k 3 --out artifacts/
 ```
 
 ## Explainability Notes
@@ -110,7 +147,10 @@ cargo run -p factor_cli -- explain --backend local --model models/llama_instruct
 
 ### Custom Factor Names
 
-You can pass custom labels in a CSV or TSV file via `--factor-labels`.
+By default, FactorLens auto-generates factor names from your dataset loadings
+(top positive and negative loading tickers per factor), so it works on any dataset.
+
+You can still override labels with a CSV or TSV file via `--factor-labels`.
 
 Example `data/factor_labels.csv`:
 
@@ -148,3 +188,97 @@ Notes:
 - Using only `factor_1,factor_2`, what drove the drawdown?
 - Which assets are most aligned with `factor_1` loadings?
 - Which assets increased my exposure to downside factors most?
+
+## Marketplace Analysis
+
+Analyze generic marketplace CSVs by group columns you choose:
+
+```bash
+cargo run -p factor_cli -- marketplace analyze \
+  --input data/analytics.sales5000.csv \
+  --group-by discipline,category,subcategory,ware_name,advantage_plan \
+  --out artifacts/market_report.md
+
+# filtered + ranked view
+cargo run -p factor_cli -- marketplace analyze \
+  --input data/analytics.sales5000.csv \
+  --where advantage_plan=1 \
+  --rank-by net_gmv \
+  --top 10 \
+  --out artifacts/market_filtered_ranked.md
+```
+
+Auto-detect useful grouping columns (if `--group-by` is omitted):
+
+```bash
+cargo run -p factor_cli -- marketplace analyze \
+  --input data/analytics.sales5000.csv \
+  --out artifacts/market_auto.md
+```
+
+Notes:
+- `ware_name` alias maps to `quote_group_ware_name`.
+- Outputs both markdown and JSON (`<out>.json`).
+- Default metrics: `net_gmv`, `customer_purchase_order_retail_total_price_usd`, `provider_purchase_order_wholesale_total_price_usd`.
+- `--where` accepts comma-separated `column=value` filters (AND semantics).
+- `--rank-by` ranks groups by a chosen metric (default ranking is by count).
+- `--top` controls how many groups are listed in the report.
+
+## PyPI Publishing (Rustream-Style)
+
+FactorLens uses the same publishing pattern as `rustream`: `maturin` + GitHub Actions
+to build platform wheels (Linux/macOS/Windows) and publish to PyPI.
+
+### Release from macOS via CLI
+
+1. Bump version in `pyproject.toml`.
+2. Commit and push to `main`.
+3. Create and push a release tag:
+
+```bash
+git tag v0.1.3
+git push origin v0.1.3
+```
+
+This triggers `.github/workflows/release.yml`, which:
+- builds platform-specific wheels via `maturin`
+- publishes to PyPI using `PYPI_API_TOKEN`
+- attaches wheels to GitHub Release
+
+To manually trigger from CLI without a tag:
+
+```bash
+gh workflow run release.yml -f publish_to_pypi=true -f ref=main
+gh run list --workflow release.yml
+gh run view <run-id> --log
+```
+
+### Jupyter Usage
+
+Install from PyPI in Jupyter:
+
+```bash
+pip install --upgrade factorlens==0.1.3
+factorlens --help
+```
+
+Local model:
+
+```bash
+factorlens explain \
+  --backend local \
+  --model /path/to/model.gguf \
+  --artifacts /path/to/artifacts \
+  --question "What drove the largest drawdown?"
+```
+
+Bedrock:
+
+```bash
+export AWS_REGION=us-east-1
+factorlens explain \
+  --backend bedrock \
+  --model anthropic.claude-3-5-sonnet-20240620-v1:0 \
+  --artifacts /path/to/artifacts \
+  --question "What drove the largest drawdown?"
+```
