@@ -9,5 +9,7 @@ dist/
 .venv/
 data/gold*
 data/silver*
+data/bronze*
 profiles/*.local.toml
 profiles/*.private.toml
+other

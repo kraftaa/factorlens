@@ -118,6 +118,8 @@ struct AnalyzeArgs {
     auto_group_k: usize,
     #[arg(long, value_delimiter = ',')]
     metrics: Vec<String>,
+    #[arg(long, value_enum, default_value = "sum")]
+    agg: AggKind,
     #[arg(long, value_delimiter = ',')]
     r#where: Vec<String>,
     #[arg(long)]
@@ -134,6 +136,23 @@ struct AnalyzeArgs {
 enum BackendArg {
     Local,
     Bedrock,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum AggKind {
+    Sum,
+    Mean,
+    Median,
+}
+
+impl AggKind {
+    fn label(self) -> &'static str {
+        match self {
+            AggKind::Sum => "Sum",
+            AggKind::Mean => "Mean",
+            AggKind::Median => "Median",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +399,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         &args.group_by,
         args.auto_group_k,
         &args.metrics,
+        args.agg,
         &args.r#where,
         args.rank_by.as_deref(),
         args.top,
@@ -1179,6 +1199,7 @@ fn analyze_table_csv(
     group_by: &[String],
     auto_group_k: usize,
     metrics: &[String],
+    agg: AggKind,
     where_clauses: &[String],
     rank_by: Option<&str>,
     top_n: usize,
@@ -1245,7 +1266,7 @@ fn analyze_table_csv(
         .collect::<Result<Vec<_>>>()?;
     let where_filters = parse_where_filters(where_clauses, &headers)?;
 
-    let mut by_group: BTreeMap<String, (u64, HashMap<String, f64>)> = BTreeMap::new();
+    let mut by_group: BTreeMap<String, (u64, HashMap<String, Vec<f64>>)> = BTreeMap::new();
     let mut row_count = 0_u64;
 
     for rec in rdr.records() {
@@ -1262,17 +1283,14 @@ fn analyze_table_csv(
 
         let entry = by_group
             .entry(gk)
-            .or_insert_with(|| (0, HashMap::<String, f64>::new()));
+            .or_insert_with(|| (0, HashMap::<String, Vec<f64>>::new()));
         entry.0 += 1;
 
         for (name, idx) in &metric_cols {
-            let v = rec
-                .get(*idx)
-                .unwrap_or("")
-                .replace(',', "")
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            *entry.1.entry(name.clone()).or_insert(0.0) += v;
+            let raw = rec.get(*idx).unwrap_or("").trim();
+            if let Some(v) = parse_numeric(raw) {
+                entry.1.entry(name.clone()).or_default().push(v);
+            }
         }
 
     }
@@ -1285,7 +1303,11 @@ fn analyze_table_csv(
     let total_primary_all = if let Some(pm) = &primary_metric {
         by_group
             .values()
-            .map(|(_, sums)| sums.get(pm).copied().unwrap_or(0.0))
+            .map(|(_, vals)| {
+                vals.get(pm)
+                    .map(|xs| aggregate_values(xs, agg))
+                    .unwrap_or(0.0)
+            })
             .sum::<f64>()
     } else {
         0.0
@@ -1293,7 +1315,13 @@ fn analyze_table_csv(
 
     let mut rows = by_group
         .into_iter()
-        .map(|(group, (count, sums))| (group, count, sums))
+        .map(|(group, (count, values))| {
+            let aggregates = values
+                .into_iter()
+                .map(|(name, xs)| (name, aggregate_values(&xs, agg)))
+                .collect::<HashMap<_, _>>();
+            (group, count, aggregates)
+        })
         .filter(|(_, count, _)| *count >= min_records)
         .collect::<Vec<_>>();
     if let Some(rm) = &rank_metric {
@@ -1337,6 +1365,7 @@ fn analyze_table_csv(
     ));
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
+    md.push_str(&format!("- Metric aggregation: {}\n", agg.label()));
     if metric_cols.is_empty() {
         md.push_str("- Metrics: none detected (count-only analysis)\n\n");
     } else {
@@ -1376,12 +1405,16 @@ fn analyze_table_csv(
         };
         let primary_line = if let Some(pm) = &primary_metric {
             let v = sums.get(pm).copied().unwrap_or(0.0);
-            let share = if total_primary.abs() > 1e-12 {
+            let share = if agg == AggKind::Sum && total_primary.abs() > 1e-12 {
                 (v / total_primary) * 100.0
             } else {
                 0.0
             };
-            format!(" and {:.1}% of total {}", share, pm)
+            if agg == AggKind::Sum {
+                format!(" and {:.1}% of total {}", share, pm)
+            } else {
+                format!(" and {} {} ({})", fmt_num(v, 2), pm, agg.label())
+            }
         } else {
             String::new()
         };
@@ -1400,7 +1433,16 @@ fn analyze_table_csv(
         } else {
             0.0
         };
-        md.push_str(&format!(" and {:.1}% of {}.\n", pct, pm));
+        if agg == AggKind::Sum {
+            md.push_str(&format!(" and {:.1}% of {}.\n", pct, pm));
+        } else {
+            md.push_str(&format!(
+                " and total {} {} ({}) across top 5.\n",
+                fmt_num(top5_primary, 2),
+                pm,
+                agg.label()
+            ));
+        }
     } else {
         md.push_str(".\n");
     }
@@ -1419,18 +1461,27 @@ fn analyze_table_csv(
         ));
         if let Some(pm) = &primary_metric {
             let top_val = sums.get(pm).copied().unwrap_or(0.0);
-            let pm_pct = if total_primary.abs() > 1e-12 {
+            let pm_pct = if agg == AggKind::Sum && total_primary.abs() > 1e-12 {
                 (top_val / total_primary) * 100.0
             } else {
                 0.0
             };
-            md.push_str(&format!(
-                "- Top segment contributes {} `{}` ({:.1}% of total `{}`).\n",
-                fmt_num(top_val, 2),
-                pm,
-                pm_pct,
-                pm
-            ));
+            if agg == AggKind::Sum {
+                md.push_str(&format!(
+                    "- Top segment contributes {} `{}` ({:.1}% of total `{}`).\n",
+                    fmt_num(top_val, 2),
+                    pm,
+                    pm_pct,
+                    pm
+                ));
+            } else {
+                md.push_str(&format!(
+                    "- Top segment {} `{}` is {}.\n",
+                    agg.label().to_lowercase(),
+                    pm,
+                    fmt_num(top_val, 2)
+                ));
+            }
         }
     }
     md.push_str(&format!(
@@ -1438,17 +1489,26 @@ fn analyze_table_csv(
         top5_count, top5_count_pct
     ));
     if let Some(pm) = &primary_metric {
-        let pct = if total_primary.abs() > 1e-12 {
-            (top5_primary / total_primary) * 100.0
+        if agg == AggKind::Sum {
+            let pct = if total_primary.abs() > 1e-12 {
+                (top5_primary / total_primary) * 100.0
+            } else {
+                0.0
+            };
+            md.push_str(&format!(
+                "- Concentration by `{}`: top 5 segments represent {} ({:.1}% of total).\n",
+                pm,
+                fmt_num(top5_primary, 2),
+                pct
+            ));
         } else {
-            0.0
-        };
-        md.push_str(&format!(
-            "- Concentration by `{}`: top 5 segments represent {} ({:.1}% of total).\n",
-            pm,
-            fmt_num(top5_primary, 2),
-            pct
-        ));
+            md.push_str(&format!(
+                "- Top 5 segments total {} `{}` as {}.\n",
+                pm,
+                agg.label().to_lowercase(),
+                fmt_num(top5_primary, 2)
+            ));
+        }
     }
 
     md.push('\n');
@@ -1460,7 +1520,7 @@ fn analyze_table_csv(
     }
     md.push_str(" Records | Record Share |");
     for (m, _) in &metric_cols {
-        if m == primary_metric.as_deref().unwrap_or("") {
+        if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
             md.push_str(&format!(" {} | {} Share |", m, m));
         } else {
             md.push_str(&format!(" {} |", m));
@@ -1473,7 +1533,7 @@ fn analyze_table_csv(
     }
     md.push_str("---:|---:|");
     for (m, _) in &metric_cols {
-        if m == primary_metric.as_deref().unwrap_or("") {
+        if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
             md.push_str("---:|---:|");
         } else {
             md.push_str("---:|");
@@ -1499,13 +1559,15 @@ fn analyze_table_csv(
         line.push_str(&format!(" {} | {:.1}% |", count, count_share));
         for (m, _) in &metric_cols {
             let v = sums.get(m).copied().unwrap_or(0.0);
-            let share =
-                if m == primary_metric.as_deref().unwrap_or("") && total_primary.abs() > 1e-12 {
+            let share = if agg == AggKind::Sum
+                && m == primary_metric.as_deref().unwrap_or("")
+                && total_primary.abs() > 1e-12
+            {
                     (v / total_primary) * 100.0
                 } else {
                     0.0
                 };
-            if m == primary_metric.as_deref().unwrap_or("") {
+            if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
                 line.push_str(&format!(" {} | {:.1}% |", fmt_num(v, 2), share));
             } else {
                 line.push_str(&format!(" {} |", fmt_num(v, 2)));
@@ -1548,12 +1610,13 @@ fn analyze_table_csv(
             .map(|(name, _, val)| format!("{}={}", name, val))
             .collect::<Vec<_>>(),
         "metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "metric_aggregation": agg.label().to_lowercase(),
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
         "min_records": min_records,
         "primary_metric": primary_metric,
         "top5_count": top5_count,
-        "top5_primary_metric_sum": top5_primary,
+        "top5_primary_metric_value": top5_primary,
         "groups": json_rows,
     });
 
@@ -1715,6 +1778,26 @@ fn auto_detect_numeric_metrics(
 fn parse_numeric(v: &str) -> Option<f64> {
     let s = v.replace(',', "").replace('$', "");
     s.parse::<f64>().ok()
+}
+
+fn aggregate_values(values: &[f64], agg: AggKind) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    match agg {
+        AggKind::Sum => values.iter().sum::<f64>(),
+        AggKind::Mean => values.iter().sum::<f64>() / values.len() as f64,
+        AggKind::Median => {
+            let mut xs = values.to_vec();
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = xs.len();
+            if n % 2 == 1 {
+                xs[n / 2]
+            } else {
+                (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+            }
+        }
+    }
 }
 
 fn fmt_num(value: f64, decimals: usize) -> String {

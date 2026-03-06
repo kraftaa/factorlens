@@ -246,6 +246,7 @@ cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
   --where region=US \
   --rank-by revenue_usd \
+  --agg median \
   --top 10 \
   --min-records 20 \
   --out artifacts/analysis_filtered_ranked.md
@@ -289,6 +290,7 @@ Notes:
 - Recommended layout: commit `profiles/profiles.example.toml`, keep private variants as `profiles/*.local.toml` or `profiles/*.private.toml` (gitignored).
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
+- `--agg` controls metric aggregation: `sum` (default), `mean`, or `median`.
 - `--top` controls how many groups are listed in the report.
 - `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
 
