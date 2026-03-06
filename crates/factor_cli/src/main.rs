@@ -121,6 +121,12 @@ struct AnalyzeArgs {
     #[arg(long, value_enum, default_value = "sum")]
     agg: AggKind,
     #[arg(long, value_delimiter = ',')]
+    percentiles: Vec<PercentileKind>,
+    #[arg(long, default_value_t = false)]
+    normalize_text_groups: bool,
+    #[arg(long, default_value_t = false)]
+    word_freq: bool,
+    #[arg(long, value_delimiter = ',')]
     r#where: Vec<String>,
     #[arg(long)]
     rank_by: Option<String>,
@@ -130,6 +136,8 @@ struct AnalyzeArgs {
     min_records: u64,
     #[arg(long)]
     out: PathBuf,
+    #[arg(long, value_enum, default_value = "both")]
+    output_format: OutputFormat,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -153,6 +161,35 @@ impl AggKind {
             AggKind::Median => "Median",
         }
     }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum PercentileKind {
+    P50,
+    P90,
+}
+
+impl PercentileKind {
+    fn label(self) -> &'static str {
+        match self {
+            PercentileKind::P50 => "p50",
+            PercentileKind::P90 => "p90",
+        }
+    }
+
+    fn quantile(self) -> f64 {
+        match self {
+            PercentileKind::P50 => 0.50,
+            PercentileKind::P90 => 0.90,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Md,
+    Json,
+    Both,
 }
 
 #[derive(Debug, Clone)]
@@ -400,17 +437,31 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.auto_group_k,
         &args.metrics,
         args.agg,
+        &args.percentiles,
+        args.normalize_text_groups,
+        args.word_freq,
         &args.r#where,
         args.rank_by.as_deref(),
         args.top,
         args.min_records,
     )?;
-    fs::write(&args.out, report.markdown)?;
-    fs::write(
-        args.out.with_extension("json"),
-        serde_json::to_string_pretty(&report.json)?,
-    )?;
-    println!("Analysis written to {}", args.out.display());
+    match args.output_format {
+        OutputFormat::Md => {
+            fs::write(&args.out, report.markdown)?;
+            println!("Analysis (markdown) written to {}", args.out.display());
+        }
+        OutputFormat::Json => {
+            fs::write(&args.out, serde_json::to_string_pretty(&report.json)?)?;
+            println!("Analysis (json) written to {}", args.out.display());
+        }
+        OutputFormat::Both => {
+            fs::write(&args.out, report.markdown)?;
+            let json_path = args.out.with_extension("json");
+            fs::write(&json_path, serde_json::to_string_pretty(&report.json)?)?;
+            println!("Analysis written to {}", args.out.display());
+            println!("Analysis JSON written to {}", json_path.display());
+        }
+    }
     println!(
         "Detected/used groups: {}",
         report
@@ -1200,6 +1251,9 @@ fn analyze_table_csv(
     auto_group_k: usize,
     metrics: &[String],
     agg: AggKind,
+    percentiles: &[PercentileKind],
+    normalize_text_groups: bool,
+    word_freq: bool,
     where_clauses: &[String],
     rank_by: Option<&str>,
     top_n: usize,
@@ -1265,8 +1319,20 @@ fn analyze_table_csv(
         })
         .collect::<Result<Vec<_>>>()?;
     let where_filters = parse_where_filters(where_clauses, &headers)?;
+    let word_group_cols = resolved_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            if should_normalize_group_column(name) {
+                Some((i, name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     let mut by_group: BTreeMap<String, (u64, HashMap<String, Vec<f64>>)> = BTreeMap::new();
+    let mut word_counts: HashMap<String, u64> = HashMap::new();
     let mut row_count = 0_u64;
 
     for rec in rdr.records() {
@@ -1277,9 +1343,32 @@ fn analyze_table_csv(
         row_count += 1;
         let gk = group_idxs
             .iter()
-            .map(|idx| rec.get(*idx).unwrap_or("").trim())
+            .enumerate()
+            .map(|(i, idx)| {
+                let raw = rec.get(*idx).unwrap_or("").trim();
+                let mut v = if normalize_text_groups
+                    && should_normalize_group_column(&resolved_groups[i])
+                {
+                    normalize_group_value(raw)
+                } else {
+                    raw.to_string()
+                };
+                if is_effectively_blank(&v) {
+                    v = "(blank)".to_string();
+                }
+                v
+            })
             .collect::<Vec<_>>()
             .join(" | ");
+
+        if word_freq {
+            for (i, _) in &word_group_cols {
+                let raw = rec.get(group_idxs[*i]).unwrap_or("").trim();
+                for w in tokenize_words(raw) {
+                    *word_counts.entry(w).or_insert(0) += 1;
+                }
+            }
+        }
 
         let entry = by_group
             .entry(gk)
@@ -1316,10 +1405,16 @@ fn analyze_table_csv(
     let mut rows = by_group
         .into_iter()
         .map(|(group, (count, values))| {
-            let aggregates = values
-                .into_iter()
-                .map(|(name, xs)| (name, aggregate_values(&xs, agg)))
-                .collect::<HashMap<_, _>>();
+            let mut aggregates = HashMap::new();
+            for (name, xs) in values {
+                aggregates.insert(name.clone(), aggregate_values(&xs, agg));
+                for pct in percentiles {
+                    aggregates.insert(
+                        format!("{}_{}", name, pct.label()),
+                        percentile_value(&xs, pct.quantile()),
+                    );
+                }
+            }
             (group, count, aggregates)
         })
         .filter(|(_, count, _)| *count >= min_records)
@@ -1366,6 +1461,19 @@ fn analyze_table_csv(
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
     md.push_str(&format!("- Metric aggregation: {}\n", agg.label()));
+    if !percentiles.is_empty() {
+        md.push_str(&format!(
+            "- Extra percentile columns: {}\n",
+            percentiles
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if normalize_text_groups {
+        md.push_str("- Text normalization for name/title groups: enabled\n");
+    }
     if metric_cols.is_empty() {
         md.push_str("- Metrics: none detected (count-only analysis)\n\n");
     } else {
@@ -1380,13 +1488,23 @@ fn analyze_table_csv(
     }
     let total_primary = total_primary_all;
     let total_count = total_count_all;
-    let top1 = rows.first();
+    let top1 = rows
+        .iter()
+        .filter(|(group, _, _)| !is_blank_group_key(group))
+        .max_by_key(|(_, count, _)| *count)
+        .or_else(|| rows.first());
     let top5_count = rows.iter().take(5).map(|(_, c, _)| *c).sum::<u64>();
     let top5_primary = if let Some(pm) = &primary_metric {
         rows.iter()
             .take(5)
             .map(|(_, _, sums)| sums.get(pm).copied().unwrap_or(0.0))
             .sum::<f64>()
+    } else {
+        0.0
+    };
+    let top5_n = rows.iter().take(5).count() as f64;
+    let top5_primary_avg = if top5_n > 0.0 {
+        top5_primary / top5_n
     } else {
         0.0
     };
@@ -1437,8 +1555,8 @@ fn analyze_table_csv(
             md.push_str(&format!(" and {:.1}% of {}.\n", pct, pm));
         } else {
             md.push_str(&format!(
-                " and total {} {} ({}) across top 5.\n",
-                fmt_num(top5_primary, 2),
+                " and average {} {} across top 5 segments ({}).\n",
+                fmt_num(top5_primary_avg, 2),
                 pm,
                 agg.label()
             ));
@@ -1447,6 +1565,19 @@ fn analyze_table_csv(
         md.push_str(".\n");
     }
     md.push('\n');
+
+    let top_words = if word_freq {
+        top_word_counts(&word_counts, 12)
+    } else {
+        Vec::new()
+    };
+    if !top_words.is_empty() {
+        md.push_str("## Top Words\n\n");
+        for (w, c) in &top_words {
+            md.push_str(&format!("- `{}`: {}\n", w, c));
+        }
+        md.push('\n');
+    }
 
     md.push_str("## Insights\n\n");
     if let Some((group, count, sums)) = top1 {
@@ -1503,15 +1634,25 @@ fn analyze_table_csv(
             ));
         } else {
             md.push_str(&format!(
-                "- Top 5 segments total {} `{}` as {}.\n",
+                "- Top 5 segments average `{}` as {} ({}).\n",
                 pm,
-                agg.label().to_lowercase(),
-                fmt_num(top5_primary, 2)
+                fmt_num(top5_primary_avg, 2),
+                agg.label()
             ));
         }
     }
 
     md.push('\n');
+
+    let mut display_metrics = metric_cols
+        .iter()
+        .map(|(m, _)| m.clone())
+        .collect::<Vec<_>>();
+    for (m, _) in &metric_cols {
+        for pct in percentiles {
+            display_metrics.push(format!("{}_{}", m, pct.label()));
+        }
+    }
 
     md.push_str("## Top Groups\n\n");
     md.push_str("|");
@@ -1519,7 +1660,7 @@ fn analyze_table_csv(
         md.push_str(&format!(" {} |", g));
     }
     md.push_str(" Records | Record Share |");
-    for (m, _) in &metric_cols {
+    for m in &display_metrics {
         if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
             md.push_str(&format!(" {} | {} Share |", m, m));
         } else {
@@ -1532,7 +1673,7 @@ fn analyze_table_csv(
         md.push_str("---|");
     }
     md.push_str("---:|---:|");
-    for (m, _) in &metric_cols {
+    for m in &display_metrics {
         if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
             md.push_str("---:|---:|");
         } else {
@@ -1557,7 +1698,7 @@ fn analyze_table_csv(
             line.push_str(&format!(" {} |", v));
         }
         line.push_str(&format!(" {} | {:.1}% |", count, count_share));
-        for (m, _) in &metric_cols {
+        for m in &display_metrics {
             let v = sums.get(m).copied().unwrap_or(0.0);
             let share = if agg == AggKind::Sum
                 && m == primary_metric.as_deref().unwrap_or("")
@@ -1609,8 +1750,15 @@ fn analyze_table_csv(
             .iter()
             .map(|(name, _, val)| format!("{}={}", name, val))
             .collect::<Vec<_>>(),
-        "metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "metrics": display_metrics,
+        "base_metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "metric_aggregation": agg.label().to_lowercase(),
+        "percentiles": percentiles.iter().map(|p| p.label()).collect::<Vec<_>>(),
+        "normalize_text_groups": normalize_text_groups,
+        "word_frequency": top_words
+            .iter()
+            .map(|(w, c)| serde_json::json!({"word": w, "count": c}))
+            .collect::<Vec<_>>(),
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
         "min_records": min_records,
@@ -1780,6 +1928,73 @@ fn parse_numeric(v: &str) -> Option<f64> {
     s.parse::<f64>().ok()
 }
 
+fn should_normalize_group_column(col: &str) -> bool {
+    let c = col.to_lowercase();
+    c.contains("name") || c.contains("title")
+}
+
+fn normalize_group_value(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut prev_space = false;
+    for ch in lower.chars() {
+        let keep = ch.is_alphanumeric() || ch.is_whitespace();
+        if !keep {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn tokenize_words(s: &str) -> Vec<String> {
+    let normalized = normalize_group_value(s);
+    const STOP: &[&str] = &[
+        "the", "and", "for", "of", "to", "in", "on", "with", "a", "an", "or", "by", "from",
+        "per", "will", "assumes", "assume", "data",
+    ];
+    normalized
+        .split_whitespace()
+        .filter_map(|w| {
+            if w.len() < 3 || STOP.contains(&w) || w.chars().all(|c| c.is_ascii_digit()) {
+                None
+            } else {
+                Some(w.to_string())
+            }
+        })
+        .collect()
+}
+
+fn is_blank_group_key(group: &str) -> bool {
+    group.split(" | ").all(|part| part.trim() == "(blank)")
+}
+
+fn is_effectively_blank(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    t.chars().all(|c| !c.is_alphanumeric())
+}
+
+fn top_word_counts(counts: &HashMap<String, u64>, top_n: usize) -> Vec<(String, u64)> {
+    let mut v = counts
+        .iter()
+        .map(|(w, c)| (w.clone(), *c))
+        .collect::<Vec<_>>();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(top_n);
+    v
+}
+
 fn aggregate_values(values: &[f64], agg: AggKind) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -1797,6 +2012,27 @@ fn aggregate_values(values: &[f64], agg: AggKind) -> f64 {
                 (xs[n / 2 - 1] + xs[n / 2]) / 2.0
             }
         }
+    }
+}
+
+fn percentile_value(values: &[f64], q: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    if values.len() == 1 {
+        return values[0];
+    }
+    let mut xs = values.to_vec();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q = q.clamp(0.0, 1.0);
+    let rank = q * (xs.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        xs[lo]
+    } else {
+        let w = rank - lo as f64;
+        xs[lo] * (1.0 - w) + xs[hi] * w
     }
 }
 

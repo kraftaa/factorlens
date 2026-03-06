@@ -247,9 +247,20 @@ cargo run -p factor_cli -- analyze \
   --where region=US \
   --rank-by revenue_usd \
   --agg median \
+  --percentiles p50,p90 \
   --top 10 \
   --min-records 20 \
   --out artifacts/analysis_filtered_ranked.md
+
+# text normalization for name/title grouping + JSON-only output
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --group-by title \
+  --metrics revenue_usd \
+  --normalize-text-groups \
+  --word-freq \
+  --output-format json \
+  --out artifacts/analysis_title.json
 ```
 
 Auto-detect useful grouping columns (if `--group-by` is omitted):
@@ -291,7 +302,11 @@ Notes:
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
 - `--agg` controls metric aggregation: `sum` (default), `mean`, or `median`.
+- `--percentiles` adds optional metric columns (`p50`, `p90`) per metric.
 - `--top` controls how many groups are listed in the report.
+- `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
+- `--word-freq` adds a Top Words section/counts for `name`/`title`-style grouping columns.
+- `--output-format` supports `md`, `json`, or `both` (default).
 - `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
 
 Example `--profile-config` file:

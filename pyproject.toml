@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "factorlens"
-version = "0.1.5"
-description = "Factor attribution and marketplace analytics CLI"
+version = "0.1.6"
+description = "Factor attribution and analytics CLI"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
