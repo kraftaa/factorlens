@@ -12,9 +12,9 @@ use factor_io::{
 };
 use llm_local::{build_client, Backend};
 use nalgebra::{DMatrix, DVector};
-use native_tls::TlsConnector;
 use postgres::{Client, NoTls};
-use postgres_native_tls::MakeTlsConnector;
+use postgres_rustls::MakeRustlsConnect;
+use rustls::ClientConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -550,10 +550,17 @@ fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf
 }
 
 fn connect_postgres(postgres_url: &str) -> Result<Client> {
-    let tls = TlsConnector::builder()
-        .build()
-        .map_err(|e| anyhow!("failed to initialize TLS connector: {}", e))?;
-    let tls_connector = MakeTlsConnector::new(tls);
+    let mut root_store = rustls::RootCertStore::empty();
+    let certs = rustls_native_certs::load_native_certs();
+    for cert in certs.certs {
+        if root_store.add(cert).is_err() {
+            // Skip invalid certs and continue with remaining roots.
+        }
+    }
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let tls_connector = MakeRustlsConnect::new(tls_config);
 
     match Client::connect(postgres_url, tls_connector) {
         Ok(c) => Ok(c),

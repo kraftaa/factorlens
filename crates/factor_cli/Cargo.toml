@@ -18,8 +18,9 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 postgres.workspace = true
-native-tls.workspace = true
-postgres-native-tls.workspace = true
+postgres-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 factor_core = { path = "../factor_core" }
 factor_io = { path = "../factor_io" }
 llm_local = { path = "../llm_local" }
