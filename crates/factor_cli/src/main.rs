@@ -18,6 +18,7 @@ use rustls::ClientConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::BufReader;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,6 +106,10 @@ struct AnalyzeArgs {
     input: Option<PathBuf>,
     #[arg(long)]
     postgres_url: Option<String>,
+    #[arg(long, value_enum, default_value = "prefer")]
+    postgres_ssl_mode: PostgresSslMode,
+    #[arg(long)]
+    postgres_ca_file: Option<PathBuf>,
     #[arg(long, conflicts_with = "query_file")]
     query: Option<String>,
     #[arg(long, conflicts_with = "query")]
@@ -191,6 +196,13 @@ enum OutputFormat {
     Md,
     Json,
     Both,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum PostgresSslMode {
+    Disable,
+    Prefer,
+    Require,
 }
 
 #[derive(Debug, Clone)]
@@ -477,7 +489,12 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
 
 fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<PathBuf>)> {
     if let Some(path) = &args.input {
-        if args.postgres_url.is_some() || args.query.is_some() || args.query_file.is_some() {
+        if args.postgres_url.is_some()
+            || args.query.is_some()
+            || args.query_file.is_some()
+            || args.postgres_ca_file.is_some()
+            || args.postgres_ssl_mode != PostgresSslMode::Prefer
+        {
             return Err(anyhow!(
                 "choose exactly one input source: --input <csv> OR --postgres-url + (--query | --query-file)"
             ));
@@ -491,7 +508,12 @@ fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<Path
         .or_else(|| std::env::var("DATABASE_URL").ok());
     match (&args.input, effective_pg_url.as_deref(), &args.query, &args.query_file) {
         (None, Some(url), Some(q), None) => {
-            let path = postgres_query_to_temp_csv(url, q)?;
+            let path = postgres_query_to_temp_csv(
+                url,
+                q,
+                args.postgres_ssl_mode,
+                args.postgres_ca_file.as_ref(),
+            )?;
             Ok((path.clone(), Some(path)))
         }
         (None, Some(url), None, Some(query_file)) => {
@@ -502,7 +524,12 @@ fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<Path
                     e
                 )
             })?;
-            let path = postgres_query_to_temp_csv(url, &q)?;
+            let path = postgres_query_to_temp_csv(
+                url,
+                &q,
+                args.postgres_ssl_mode,
+                args.postgres_ca_file.as_ref(),
+            )?;
             Ok((path.clone(), Some(path)))
         }
         (None, Some(_), None, None) => Err(anyhow!(
@@ -519,8 +546,13 @@ fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<Path
     }
 }
 
-fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf> {
-    let mut client = match connect_postgres(postgres_url) {
+fn postgres_query_to_temp_csv(
+    postgres_url: &str,
+    query: &str,
+    ssl_mode: PostgresSslMode,
+    ca_file: Option<&PathBuf>,
+) -> Result<PathBuf> {
+    let mut client = match connect_postgres(postgres_url, ssl_mode, ca_file) {
         Ok(c) => c,
         Err(e) => return Err(anyhow!("failed to connect to postgres: {}", e)),
     };
@@ -550,12 +582,43 @@ fn postgres_query_to_temp_csv(postgres_url: &str, query: &str) -> Result<PathBuf
     Ok(tmp_path)
 }
 
-fn connect_postgres(postgres_url: &str) -> Result<Client> {
+fn connect_postgres(
+    postgres_url: &str,
+    ssl_mode: PostgresSslMode,
+    ca_file: Option<&PathBuf>,
+) -> Result<Client> {
+    if ssl_mode == PostgresSslMode::Disable {
+        return Client::connect(postgres_url, NoTls)
+            .map_err(|e| anyhow!("non-tls connect error: {}", e));
+    }
+
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs();
     for cert in certs.certs {
         if root_store.add(cert).is_err() {
             // Skip invalid certs and continue with remaining roots.
+        }
+    }
+    if let Some(path) = ca_file {
+        let file = fs::File::open(path).map_err(|e| {
+            anyhow!(
+                "failed to open --postgres-ca-file '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+        let mut reader = BufReader::new(file);
+        for cert in rustls_pemfile::certs(&mut reader) {
+            let cert = cert.map_err(|e| {
+                anyhow!(
+                    "failed to parse PEM cert in '{}': {}",
+                    path.display(),
+                    e
+                )
+            })?;
+            if root_store.add(cert).is_err() {
+                // Ignore invalid certs; continue loading others.
+            }
         }
     }
     let tls_config = ClientConfig::builder()
@@ -566,13 +629,19 @@ fn connect_postgres(postgres_url: &str) -> Result<Client> {
 
     match Client::connect(postgres_url, tls_connector) {
         Ok(c) => Ok(c),
-        Err(tls_err) => Client::connect(postgres_url, NoTls).map_err(|no_tls_err| {
-            anyhow!(
-                "tls connect error: {}; non-tls connect error: {}",
-                tls_err,
-                no_tls_err
-            )
-        }),
+        Err(tls_err) => {
+            if ssl_mode == PostgresSslMode::Require {
+                Err(anyhow!("tls connect error: {}", tls_err))
+            } else {
+                Client::connect(postgres_url, NoTls).map_err(|no_tls_err| {
+                    anyhow!(
+                        "tls connect error: {}; non-tls connect error: {}",
+                        tls_err,
+                        no_tls_err
+                    )
+                })
+            }
+        }
     }
 }
 

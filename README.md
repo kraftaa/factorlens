@@ -278,6 +278,8 @@ Or analyze directly from Postgres:
 factorlens analyze \
   --postgres-url "$DATABASE_URL" \
   --query "SELECT region, channel, revenue_usd, cost_usd FROM analytics.sales" \
+  --postgres-ssl-mode require \
+  --postgres-ca-file /path/to/rds-ca-bundle.pem \
   --profile exec_custom \
   --profile-config profiles/profiles.example.toml \
   --out artifacts/analysis.md
@@ -298,6 +300,8 @@ Notes:
 - Use `--profile-config <path.toml>` for your own private, file-specific profile mappings.
 - Input source is exclusive: use either `--input <csv>` or `--postgres-url` + (`--query` or `--query-file`).
 - `--postgres-url` can be omitted if `DATABASE_URL` env var is set.
+- `--postgres-ssl-mode` supports `prefer` (default), `require`, or `disable`.
+- `--postgres-ca-file` optionally adds PEM CA certificates for DB TLS verification.
 - Recommended layout: commit `profiles/profiles.example.toml`, keep private variants as `profiles/*.local.toml` or `profiles/*.private.toml` (gitignored).
 - `--where` accepts comma-separated `column=value` filters (AND semantics).
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
@@ -379,3 +383,21 @@ factorlens explain \
   --artifacts /path/to/artifacts \
   --question "What drove the largest drawdown?"
 ```
+
+### What Bedrock Step Is Doing
+
+`factorlens explain --backend bedrock` does **not** compute analytics. It only explains
+already-computed artifacts.
+
+Step-by-step:
+
+1. You run analytics first (`factors fit` or `analyze`) to produce artifacts.
+2. `explain` loads artifact context (for factor mode: `factors.json`, `attribution.csv`, `outliers.csv`).
+3. FactorLens builds a constrained prompt from that context.
+4. FactorLens calls AWS Bedrock through AWS CLI (`aws bedrock-runtime converse`).
+5. Bedrock returns plain-text explanation grounded in the provided artifact context.
+
+Important:
+- `analyze` command = pure Rust analytics, no LLM used.
+- `explain` command = LLM narrative layer over artifacts.
+- For table-analysis markdown (`analysis.md`), you can optionally call Bedrock directly with AWS CLI by passing report text as prompt.
