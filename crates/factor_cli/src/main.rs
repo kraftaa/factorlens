@@ -14,6 +14,7 @@ use llm_local::{build_client, Backend};
 use nalgebra::{DMatrix, DVector};
 use postgres::{Client, NoTls};
 use postgres_rustls::MakeTlsConnector;
+use pulldown_cmark::{html, Options, Parser as MdParser};
 use rustls::ClientConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -52,6 +53,16 @@ enum Commands {
         #[arg(long)]
         factor_labels: Option<PathBuf>,
     },
+    ExplainAnalyze {
+        #[arg(long, value_enum, default_value = "local")]
+        backend: BackendArg,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        analysis_json: PathBuf,
+        #[arg(long)]
+        question: String,
+    },
     Report {
         #[arg(long)]
         artifacts: PathBuf,
@@ -61,6 +72,7 @@ enum Commands {
         out: PathBuf,
     },
     Analyze(AnalyzeArgs),
+    AnalyzeCompare(AnalyzeCompareArgs),
 }
 
 #[derive(Subcommand)]
@@ -141,9 +153,33 @@ struct AnalyzeArgs {
     #[arg(long, default_value_t = 1)]
     min_records: u64,
     #[arg(long)]
+    alert_top5_share: Option<f64>,
+    #[arg(long)]
+    alert_blank_share: Option<f64>,
+    #[arg(long)]
     out: PathBuf,
     #[arg(long, value_enum, default_value = "both")]
     output_format: OutputFormat,
+}
+
+#[derive(Args, Clone)]
+struct AnalyzeCompareArgs {
+    #[arg(long)]
+    base: PathBuf,
+    #[arg(long)]
+    new: PathBuf,
+    #[arg(long, default_value_t = 10)]
+    top_movers: usize,
+    #[arg(long, value_enum, default_value = "md")]
+    output_format: CompareOutputFormat,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum CompareOutputFormat {
+    Md,
+    Html,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -196,6 +232,7 @@ enum OutputFormat {
     Md,
     Json,
     Both,
+    Html,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -362,6 +399,38 @@ fn main() -> Result<()> {
 
             println!("{}", answer);
         }
+        Commands::ExplainAnalyze {
+            backend,
+            model,
+            analysis_json,
+            question,
+        } => {
+            let analysis = fs::read_to_string(&analysis_json).map_err(|e| {
+                anyhow!(
+                    "failed to read analysis json '{}': {}",
+                    analysis_json.display(),
+                    e
+                )
+            })?;
+            let v: serde_json::Value = serde_json::from_str(&analysis).map_err(|e| {
+                anyhow!(
+                    "failed to parse analysis json '{}': {}",
+                    analysis_json.display(),
+                    e
+                )
+            })?;
+
+            let backend = match backend {
+                BackendArg::Local => Backend::Local,
+                BackendArg::Bedrock => Backend::Bedrock,
+            };
+            let client = build_client(backend, model);
+            let context = build_analysis_prompt_context(&v);
+            let system = "You are an analytics assistant. Use only provided analysis context. If missing, say unknown. Respond in plain text with concise bullets and concrete actions.";
+            let user = format!("Question: {}\n\nAnalysis context:\n{}", question, context);
+            let answer = client.answer(system, &user)?;
+            println!("{}", answer);
+        }
         Commands::Report {
             artifacts,
             format,
@@ -377,6 +446,9 @@ fn main() -> Result<()> {
         }
         Commands::Analyze(args) => {
             run_analyze(args)?;
+        }
+        Commands::AnalyzeCompare(args) => {
+            run_analyze_compare(args)?;
         }
     }
 
@@ -457,6 +529,8 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.rank_by.as_deref(),
         args.top,
         args.min_records,
+        args.alert_top5_share,
+        args.alert_blank_share,
     )?;
     match args.output_format {
         OutputFormat::Md => {
@@ -474,6 +548,11 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             println!("Analysis written to {}", args.out.display());
             println!("Analysis JSON written to {}", json_path.display());
         }
+        OutputFormat::Html => {
+            let html = markdown_to_html(&report.markdown);
+            fs::write(&args.out, html)?;
+            println!("Analysis (html) written to {}", args.out.display());
+        }
     }
     println!(
         "Detected/used groups: {}",
@@ -485,6 +564,148 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             .join(", ")
     );
     Ok(())
+}
+
+fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
+    let base_txt = fs::read_to_string(&args.base)
+        .map_err(|e| anyhow!("failed to read base json '{}': {}", args.base.display(), e))?;
+    let new_txt = fs::read_to_string(&args.new)
+        .map_err(|e| anyhow!("failed to read new json '{}': {}", args.new.display(), e))?;
+    let base: serde_json::Value = serde_json::from_str(&base_txt).map_err(|e| {
+        anyhow!(
+            "failed to parse base json '{}': {}",
+            args.base.display(),
+            e
+        )
+    })?;
+    let new: serde_json::Value = serde_json::from_str(&new_txt)
+        .map_err(|e| anyhow!("failed to parse new json '{}': {}", args.new.display(), e))?;
+
+    let base_records = base.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
+    let new_records = new.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
+    let base_segments = base.get("segments").and_then(|x| x.as_u64()).unwrap_or(0);
+    let new_segments = new.get("segments").and_then(|x| x.as_u64()).unwrap_or(0);
+    let base_top5_count = base.get("top5_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    let new_top5_count = new.get("top5_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    let base_top5_pct = pct(base_top5_count, base_records);
+    let new_top5_pct = pct(new_top5_count, new_records);
+    let primary_metric = new
+        .get("primary_metric")
+        .and_then(|x| x.as_str())
+        .or_else(|| base.get("primary_metric").and_then(|x| x.as_str()))
+        .unwrap_or("primary_metric")
+        .to_string();
+
+    let base_map = groups_to_map(&base, &primary_metric);
+    let new_map = groups_to_map(&new, &primary_metric);
+    let mut keys = base_map.keys().cloned().collect::<HashSet<_>>();
+    keys.extend(new_map.keys().cloned());
+
+    let mut movers = keys
+        .into_iter()
+        .map(|k| {
+            let (bc, bs, bp) = base_map.get(&k).copied().unwrap_or((0, 0.0, 0.0));
+            let (nc, ns, np) = new_map.get(&k).copied().unwrap_or((0, 0.0, 0.0));
+            let d_share = ns - bs;
+            let d_primary = np - bp;
+            (k, bc, nc, bs, ns, d_share, bp, np, d_primary)
+        })
+        .collect::<Vec<_>>();
+    movers.sort_by(|a, b| {
+        b.5.abs()
+            .partial_cmp(&a.5.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut md = String::new();
+    md.push_str("# Analysis Comparison\n\n");
+    md.push_str(&format!("- Base: {}\n", args.base.display()));
+    md.push_str(&format!("- New: {}\n", args.new.display()));
+    md.push_str(&format!("- Base records: {}\n", base_records));
+    md.push_str(&format!("- New records: {}\n", new_records));
+    md.push_str(&format!("- Base segments: {}\n", base_segments));
+    md.push_str(&format!("- New segments: {}\n", new_segments));
+    md.push('\n');
+
+    md.push_str("## Executive Delta\n\n");
+    md.push_str(&format!(
+        "- Top-5 concentration changed from {:.1}% to {:.1}% ({:+.1} pp).\n",
+        base_top5_pct,
+        new_top5_pct,
+        new_top5_pct - base_top5_pct
+    ));
+    md.push_str(&format!(
+        "- Segment count changed from {} to {} ({:+}).\n",
+        base_segments,
+        new_segments,
+        new_segments as i64 - base_segments as i64
+    ));
+    md.push('\n');
+
+    md.push_str("## Biggest Movers (by record share)\n\n");
+    md.push_str(&format!(
+        "| Segment | Base Records | New Records | Base Share | New Share | Delta Share (pp) | Base {} | New {} | Delta {} |\n",
+        primary_metric, primary_metric, primary_metric
+    ));
+    md.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for (seg, bc, nc, bs, ns, ds, bp, np, dp) in movers.iter().take(args.top_movers) {
+        md.push_str(&format!(
+            "| {} | {} | {} | {:.1}% | {:.1}% | {:+.1} | {} | {} | {} |\n",
+            seg.replace('|', "\\|"),
+            bc,
+            nc,
+            bs,
+            ns,
+            ds,
+            fmt_num(*bp, 2),
+            fmt_num(*np, 2),
+            fmt_num(*dp, 2)
+        ));
+    }
+
+    match args.output_format {
+        CompareOutputFormat::Md => {
+            fs::write(&args.out, md)?;
+            println!("Comparison report (markdown) written to {}", args.out.display());
+        }
+        CompareOutputFormat::Html => {
+            fs::write(&args.out, markdown_to_html(&md))?;
+            println!("Comparison report (html) written to {}", args.out.display());
+        }
+    }
+    Ok(())
+}
+
+fn groups_to_map(v: &serde_json::Value, primary_metric: &str) -> HashMap<String, (u64, f64, f64)> {
+    let mut out = HashMap::new();
+    let groups = v
+        .get("groups")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for g in groups {
+        let name = g
+            .get("group")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        let count = g.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+        let share = g.get("count_share_pct").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let primary = g
+            .get(primary_metric)
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        out.insert(name, (count, share, primary));
+    }
+    out
+}
+
+fn pct(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        (num as f64 / den as f64) * 100.0
+    }
 }
 
 fn materialize_analyze_input(args: &AnalyzeArgs) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -1336,6 +1557,8 @@ fn analyze_table_csv(
     rank_by: Option<&str>,
     top_n: usize,
     min_records: u64,
+    alert_top5_share: Option<f64>,
+    alert_blank_share: Option<f64>,
 ) -> Result<AnalysisReport> {
     let mut rdr = csv::Reader::from_path(input)?;
     let headers = rdr.headers()?.clone();
@@ -1467,6 +1690,11 @@ fn analyze_table_csv(
         .map(|(m, _)| m.clone())
         .or_else(|| metric_cols.first().map(|(m, _)| m.clone()));
     let total_count_all = by_group.values().map(|(c, _)| *c).sum::<u64>();
+    let blank_count_all = by_group
+        .iter()
+        .filter(|(g, _)| is_blank_group_key(g))
+        .map(|(_, (c, _))| *c)
+        .sum::<u64>();
     let total_primary_all = if let Some(pm) = &primary_metric {
         by_group
             .values()
@@ -1596,6 +1824,29 @@ fn analyze_table_csv(
     } else {
         0.0
     };
+    let blank_share_pct = if total_count > 0 {
+        (blank_count_all as f64 / total_count as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let mut alerts = Vec::new();
+    if let Some(threshold) = alert_top5_share {
+        if top5_count_pct >= threshold {
+            alerts.push(format!(
+                "High concentration: top 5 segments account for {:.1}% of records (threshold {:.1}%).",
+                top5_count_pct, threshold
+            ));
+        }
+    }
+    if let Some(threshold) = alert_blank_share {
+        if blank_share_pct >= threshold {
+            alerts.push(format!(
+                "High blank-segment share: {:.1}% of records are grouped as (blank) (threshold {:.1}%).",
+                blank_share_pct, threshold
+            ));
+        }
+    }
 
     md.push_str("## Executive Summary\n\n");
     if let Some((group, count, sums)) = top1 {
@@ -1654,6 +1905,14 @@ fn analyze_table_csv(
         ));
     }
     md.push('\n');
+
+    if !alerts.is_empty() {
+        md.push_str("## Alerts\n\n");
+        for a in &alerts {
+            md.push_str(&format!("- {}\n", a));
+        }
+        md.push('\n');
+    }
 
     let top_words = if word_freq {
         top_word_counts(&word_counts, 12)
@@ -1851,6 +2110,12 @@ fn analyze_table_csv(
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
         "min_records": min_records,
+        "blank_share_pct": blank_share_pct,
+        "alert_thresholds": {
+            "top5_share": alert_top5_share,
+            "blank_share": alert_blank_share
+        },
+        "alerts": alerts,
         "primary_metric": primary_metric,
         "top5_count": top5_count,
         "top5_primary_metric_value": top5_primary,
@@ -2015,6 +2280,79 @@ fn auto_detect_numeric_metrics(
 fn parse_numeric(v: &str) -> Option<f64> {
     let s = v.replace(',', "").replace('$', "");
     s.parse::<f64>().ok()
+}
+
+fn markdown_to_html(markdown: &str) -> String {
+    let mut out = String::new();
+    let parser = MdParser::new_ext(markdown, Options::all());
+    html::push_html(&mut out, parser);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>FactorLens Report</title><style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;max-width:1024px;margin:24px auto;padding:0 16px;line-height:1.5}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:6px 8px;text-align:left}}th{{background:#f5f5f5}}code{{background:#f3f3f3;padding:2px 4px;border-radius:4px}}</style></head><body>{}</body></html>",
+        out
+    )
+}
+
+fn build_analysis_prompt_context(v: &serde_json::Value) -> String {
+    let records = v.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
+    let segments = v.get("segments").and_then(|x| x.as_u64()).unwrap_or(0);
+    let group_by = v
+        .get("group_by")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let metrics = v
+        .get("metrics")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let alerts = v
+        .get("alerts")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|| "".to_string());
+    let top_groups = v
+        .get("groups")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter()
+                .take(8)
+                .map(|g| {
+                    let name = g
+                        .get("group")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("(unknown)");
+                    let count = g.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+                    format!("{} (records={})", name, count)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "records={} | segments={} | group_by={} | metrics={}\nalerts={}\ntop_groups={}",
+        records,
+        segments,
+        group_by,
+        metrics,
+        if alerts.is_empty() { "none" } else { &alerts },
+        top_groups
+    )
 }
 
 fn should_normalize_group_column(col: &str) -> bool {

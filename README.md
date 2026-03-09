@@ -203,6 +203,8 @@ cargo run -p factor_cli -- analyze \
   --rank-by revenue_usd \
   --agg median \
   --percentiles p50,p90 \
+  --alert-top5-share 60 \
+  --alert-blank-share 10 \
   --top 10 \
   --min-records 20 \
   --out artifacts/analysis_filtered_ranked.md
@@ -214,8 +216,8 @@ cargo run -p factor_cli -- analyze \
   --metrics revenue_usd \
   --normalize-text-groups \
   --word-freq \
-  --output-format json \
-  --out artifacts/analysis_title.json
+  --output-format html \
+  --out artifacts/analysis_title.html
 ```
 
 Auto-detect useful grouping columns (if `--group-by` is omitted):
@@ -253,7 +255,7 @@ curl -fL "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" \
   -o /path/to/rds-global-bundle.pem
 
 factorlens analyze \
-  --query "SELECT * FROM transform.analytics.sales LIMIT 5000" \
+  --query "SELECT * FROM schema.table_a LIMIT 5000" \
   --postgres-ssl-mode require \
   --postgres-ca-file /path/to/rds-global-bundle.pem \
   --profile exec_custom \
@@ -276,10 +278,11 @@ Notes:
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
 - `--agg` controls metric aggregation: `sum` (default), `mean`, or `median`.
 - `--percentiles` adds optional metric columns (`p50`, `p90`) per metric.
+- `--alert-top5-share` and `--alert-blank-share` add threshold-based alerts to report output.
 - `--top` controls how many groups are listed in the report.
 - `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
 - `--word-freq` adds a Top Words section/counts for `name`/`title`-style grouping columns.
-- `--output-format` supports `md`, `json`, or `both` (default).
+- `--output-format` supports `md`, `json`, `both` (default), or `html`.
 - `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
 
 Example `--profile-config` file:
@@ -324,6 +327,16 @@ factorlens explain \
   --model anthropic.claude-3-5-sonnet-20240620-v1:0 \
   --artifacts /path/to/artifacts \
   --question "What drove the largest drawdown?"
+```
+
+Explain from generic table analysis output (`analysis.json`):
+
+```bash
+factorlens explain-analyze \
+  --backend bedrock \
+  --model anthropic.claude-3-haiku-20240307-v1:0 \
+  --analysis-json /path/to/analysis.json \
+  --question "What are the top concentration risks and 3 actions?"
 ```
 
 ### What Bedrock Step Is Doing

@@ -23,6 +23,7 @@ rustls.workspace = true
 rustls-native-certs.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+pulldown-cmark.workspace = true
 factor_core = { path = "../factor_core" }
 factor_io = { path = "../factor_io" }
 llm_local = { path = "../llm_local" }

@@ -10,6 +10,10 @@ dist/
 data/gold*
 data/silver*
 data/bronze*
+*gold_*
+*silver_*
+*bronze_*
 profiles/*.local.toml
 profiles/*.private.toml
 other
+TO_DO.md
