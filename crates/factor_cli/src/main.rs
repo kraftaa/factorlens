@@ -136,6 +136,8 @@ struct AnalyzeArgs {
     auto_group_k: usize,
     #[arg(long, value_delimiter = ',')]
     metrics: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    count_only: bool,
     #[arg(long, value_enum, default_value = "sum")]
     agg: AggKind,
     #[arg(long, value_delimiter = ',')]
@@ -521,6 +523,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         &args.group_by,
         args.auto_group_k,
         &args.metrics,
+        args.count_only,
         args.agg,
         &args.percentiles,
         args.normalize_text_groups,
@@ -1549,6 +1552,7 @@ fn analyze_table_csv(
     group_by: &[String],
     auto_group_k: usize,
     metrics: &[String],
+    count_only: bool,
     agg: AggKind,
     percentiles: &[PercentileKind],
     normalize_text_groups: bool,
@@ -1575,7 +1579,9 @@ fn analyze_table_csv(
         return Err(anyhow!("no grouping columns selected or detected"));
     }
 
-    let metric_cols = if metrics.is_empty() {
+    let metric_cols = if count_only {
+        Vec::new()
+    } else if metrics.is_empty() {
         auto_detect_numeric_metrics(input, &headers, &resolved_groups, 3)?
     } else {
         let cols = metrics
@@ -1590,13 +1596,27 @@ fn analyze_table_csv(
             .collect::<Result<Vec<_>>>()?;
         cols
     };
-    let rank_metric = rank_by.and_then(|rb| {
-        metric_cols
-            .iter()
-            .find(|(m, _)| m == rb)
-            .map(|(m, _)| m.clone())
-    });
-    if let Some(rb) = rank_by {
+    if count_only {
+        if let Some(rb) = rank_by {
+            if rb != "count" {
+                return Err(anyhow!(
+                    "--count-only supports ranking by count only; remove --rank-by or use --rank-by count"
+                ));
+            }
+        }
+    }
+    let rank_metric = if count_only {
+        None
+    } else {
+        rank_by.and_then(|rb| {
+            metric_cols
+                .iter()
+                .find(|(m, _)| m == rb)
+                .map(|(m, _)| m.clone())
+        })
+    };
+    if !count_only {
+        if let Some(rb) = rank_by {
         if rank_metric.is_none() {
             return Err(anyhow!(
                 "rank metric '{}' not found. Available metrics: {}",
@@ -1608,6 +1628,7 @@ fn analyze_table_csv(
                     .join(", ")
             ));
         }
+    }
     }
 
     let group_idxs = resolved_groups
@@ -1766,7 +1787,10 @@ fn analyze_table_csv(
     ));
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
-    md.push_str(&format!("- Metric aggregation: {}\n", agg.label()));
+    md.push_str(&format!(
+        "- Metric aggregation: {}\n",
+        if count_only { "Count-only (no numeric metrics)" } else { agg.label() }
+    ));
     if !percentiles.is_empty() {
         md.push_str(&format!(
             "- Extra percentile columns: {}\n",
@@ -1781,7 +1805,11 @@ fn analyze_table_csv(
         md.push_str("- Text normalization for name/title groups: enabled\n");
     }
     if metric_cols.is_empty() {
-        md.push_str("- Metrics: none detected (count-only analysis)\n\n");
+        if count_only {
+            md.push_str("- Metrics: disabled via --count-only\n\n");
+        } else {
+            md.push_str("- Metrics: none detected (count-only analysis)\n\n");
+        }
     } else {
         md.push_str(&format!(
             "- Metrics: {}\n\n",
@@ -2101,6 +2129,7 @@ fn analyze_table_csv(
         "metrics": display_metrics,
         "base_metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "metric_aggregation": agg.label().to_lowercase(),
+        "count_only": count_only,
         "percentiles": percentiles.iter().map(|p| p.label()).collect::<Vec<_>>(),
         "normalize_text_groups": normalize_text_groups,
         "word_frequency": top_words

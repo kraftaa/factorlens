@@ -278,6 +278,7 @@ Notes:
 - `--rank-by` ranks groups by a chosen metric (default ranking is by count).
 - `--agg` controls metric aggregation: `sum` (default), `mean`, or `median`.
 - `--percentiles` adds optional metric columns (`p50`, `p90`) per metric.
+- `--count-only` disables numeric metric aggregation and reports concentration using records only.
 - `--alert-top5-share` and `--alert-blank-share` add threshold-based alerts to report output.
 - `--top` controls how many groups are listed in the report.
 - `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
@@ -337,6 +338,20 @@ factorlens explain-analyze \
   --model anthropic.claude-3-haiku-20240307-v1:0 \
   --analysis-json /path/to/analysis.json \
   --question "What are the top concentration risks and 3 actions?"
+```
+
+### MCP Server (Optional)
+
+If you want to call FactorLens as tools from an MCP client, use:
+
+- `scripts/mcp/factorlens_mcp_server.py`
+- `scripts/mcp/README.md`
+
+Quick start:
+
+```bash
+pip install mcp
+python scripts/mcp/factorlens_mcp_server.py
 ```
 
 ### What Bedrock Step Is Doing
