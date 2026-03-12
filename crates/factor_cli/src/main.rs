@@ -157,6 +157,8 @@ struct AnalyzeArgs {
     top: usize,
     #[arg(long, default_value_t = 0)]
     top_insights: usize,
+    #[arg(long, default_value_t = 2)]
+    opportunity_min_records: u64,
     #[arg(long, default_value_t = 1)]
     min_records: u64,
     #[arg(long)]
@@ -589,6 +591,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.rank_by.as_deref(),
         args.top,
         args.top_insights,
+        args.opportunity_min_records,
         args.min_records,
         args.alert_top5_share,
         args.alert_blank_share,
@@ -2080,6 +2083,7 @@ fn analyze_table_csv(
     rank_by: Option<&str>,
     top_n: usize,
     top_insights: usize,
+    opportunity_min_records: u64,
     min_records: u64,
     alert_top5_share: Option<f64>,
     alert_blank_share: Option<f64>,
@@ -2320,6 +2324,10 @@ fn analyze_table_csv(
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
     if top_insights > 0 {
         md.push_str(&format!("- Top insights requested: {}\n", top_insights));
+        md.push_str(&format!(
+            "- Opportunity min records: {}\n",
+            opportunity_min_records
+        ));
     }
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
     md.push_str(&format!(
@@ -2656,7 +2664,9 @@ fn analyze_table_csv(
             });
             for (group, count, _, _, _, per_record) in by_per_record
                 .iter()
-                .filter(|(g, c, _, _, _, _)| !is_blank_group_key(g) && *c >= 2)
+                .filter(|(g, c, _, _, _, _)| {
+                    !is_blank_group_key(g) && *c >= opportunity_min_records
+                })
                 .take(top_insights)
             {
                 top_opportunities.push(format!(
@@ -2820,6 +2830,7 @@ fn analyze_table_csv(
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
         "top_insights": top_insights,
+        "opportunity_min_records": opportunity_min_records,
         "min_records": min_records,
         "blank_share_pct": blank_share_pct,
         "alert_thresholds": {

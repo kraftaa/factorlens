@@ -509,6 +509,7 @@ Notes:
   Quote rules containing `<` or `>` in shell commands, for example: `--alert-rule 'segments<50,top5_record_share_pct>60'`.
 - `--top` controls how many groups are listed in the report.
 - `--top-insights` adds deterministic Top Risks and Top Opportunities bullets to the report.
+- `--opportunity-min-records` sets minimum records required for Top Opportunities candidates (default: `2`).
 - `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
 - `--word-freq` adds a Top Words section/counts for `name`/`title`-style grouping columns.
 - `--output-format` supports `md`, `json`, `both` (default), or `html`.
