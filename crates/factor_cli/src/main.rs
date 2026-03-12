@@ -149,6 +149,8 @@ struct AnalyzeArgs {
     word_freq: bool,
     #[arg(long, value_delimiter = ',')]
     r#where: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    exclude_blank_groups: bool,
     #[arg(long)]
     rank_by: Option<String>,
     #[arg(long, default_value_t = 20)]
@@ -193,6 +195,8 @@ struct AnalyzeSuggestArgs {
     max_metrics: usize,
     #[arg(long, default_value_t = 2000)]
     sample_rows: usize,
+    #[arg(long)]
+    out_profile: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "both")]
     output_format: SuggestOutputFormat,
 }
@@ -560,6 +564,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.normalize_text_groups,
         args.word_freq,
         &args.r#where,
+        args.exclude_blank_groups,
         args.rank_by.as_deref(),
         args.top,
         args.min_records,
@@ -633,7 +638,10 @@ fn run_analyze_suggest(args: AnalyzeSuggestArgs) -> Result<()> {
         args.auto_group_k,
         args.max_metrics,
     );
-    let profile_path = args.out.with_extension("toml");
+    let profile_path = args
+        .out_profile
+        .clone()
+        .unwrap_or_else(|| args.out.with_extension("toml"));
     fs::write(&profile_path, profile_toml)?;
 
     match args.output_format {
@@ -2012,6 +2020,7 @@ fn analyze_table_csv(
     normalize_text_groups: bool,
     word_freq: bool,
     where_clauses: &[String],
+    exclude_blank_groups: bool,
     rank_by: Option<&str>,
     top_n: usize,
     min_records: u64,
@@ -2116,7 +2125,6 @@ fn analyze_table_csv(
         if !matches_where_filters(&rec, &where_filters) {
             continue;
         }
-        row_count += 1;
         let gk = group_idxs
             .iter()
             .enumerate()
@@ -2136,6 +2144,10 @@ fn analyze_table_csv(
             })
             .collect::<Vec<_>>()
             .join(" | ");
+        if exclude_blank_groups && is_blank_group_key(&gk) {
+            continue;
+        }
+        row_count += 1;
 
         if word_freq {
             for (i, _) in &word_group_cols {
@@ -2235,6 +2247,14 @@ fn analyze_table_csv(
                 .join(", ")
         ));
     }
+    md.push_str(&format!(
+        "- Blank groups: {}\n",
+        if exclude_blank_groups {
+            "excluded"
+        } else {
+            "included"
+        }
+    ));
     md.push_str(&format!(
         "- Ranking: {}\n",
         rank_metric.clone().unwrap_or_else(|| "count".to_string())
@@ -2580,6 +2600,7 @@ fn analyze_table_csv(
             .iter()
             .map(|(name, _, val)| format!("{}={}", name, val))
             .collect::<Vec<_>>(),
+        "exclude_blank_groups": exclude_blank_groups,
         "metrics": display_metrics,
         "base_metrics": metric_cols.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "metric_aggregation": agg.label().to_lowercase(),

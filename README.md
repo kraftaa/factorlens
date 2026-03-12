@@ -492,12 +492,14 @@ Notes:
 - `--agg` controls metric aggregation: `sum` (default), `mean`, or `median`.
 - `--percentiles` adds optional metric columns (`p50`, `p90`) per metric.
 - `--count-only` disables numeric metric aggregation and reports concentration using records only.
+- `--exclude-blank-groups` drops `(blank)` segment keys before ranking/reporting.
 - `--alert-top5-share` and `--alert-blank-share` add threshold-based alerts to report output.
 - `--top` controls how many groups are listed in the report.
 - `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
 - `--word-freq` adds a Top Words section/counts for `name`/`title`-style grouping columns.
 - `--output-format` supports `md`, `json`, `both` (default), or `html`.
 - `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
+- `analyze-suggest --out-profile <path.toml>` writes a ready profile file directly.
 
 Example `--profile-config` file:
 
