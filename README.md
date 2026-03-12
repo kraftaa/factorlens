@@ -1,8 +1,71 @@
 # FactorLens
 
-FactorLens is an offline-first factor attribution assistant in Rust.
+FactorLens is a Rust CLI for factor and risk attribution with built-in AI explanations for business reviews.
 
-It computes statistical factors (PCA) from price history, writes artifacts, and supports explainability through a pluggable LLM backend interface (`local` and `bedrock`).
+It computes factor analytics first, then explains computed artifacts through a pluggable LLM backend interface (`local` and `bedrock`).
+
+## What It Looks Like
+
+```bash
+cargo run -p factor_cli -- analyze \
+  --input data/your_file.csv \
+  --group-by region,product_line,channel \
+  --metrics revenue_usd \
+  --out artifacts/analysis.md
+```
+
+Example report excerpt:
+
+```text
+## Executive Summary
+
+- Largest segment is `US | Core | Direct` with 28.4% of records and 32.1% of total revenue_usd.
+- Top 5 segments represent 61.5% of records and 67.9% of revenue_usd.
+```
+
+AI layer on top:
+
+```text
+Summary:
+Growth is concentrated in US direct channel performance, while product-line mix
+is creating downside concentration risk in a small number of segments.
+```
+
+## Workflow
+
+| Command | Purpose |
+|---|---|
+| `analyze` | factor/segment attribution from CSV or Postgres |
+| `analyze-compare` | snapshot delta analysis (biggest movers) |
+| `explain-analyze` | executive narrative and actions from computed JSON |
+| `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
+
+## Demo
+
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["CSV/Postgres"] --> B["Factor/Segment Model (Rust)"]
+    B --> C["Attribution Artifacts (JSON/CSV)"]
+    C --> D["Explanation Layer (Local LLM or Bedrock)"]
+    C --> E["Reports (Markdown/HTML/JSON)"]
+```
+
+Math engine first, explanation layer second.
+
+## Why This Exists
+
+Many analytics workflows produce dashboards without a clear explanation of why metrics changed.
+FactorLens prioritizes attribution and residual math first, then translates those computed results into business language.
+
+## Integrations
+
+- Local LLMs via `llama.cpp`
+- AWS Bedrock
+- Claude Desktop / Claude Code via MCP
+- CSV and Postgres data sources
 
 ## MVP Features
 
@@ -228,6 +291,60 @@ cargo run -p factor_cli -- analyze \
   --out artifacts/analysis_auto.md
 ```
 
+## Analyze Compare
+
+Create two analysis snapshots, then compare them:
+
+```bash
+# base snapshot
+cargo run -p factor_cli -- analyze \
+  --input data/your_file_a.csv \
+  --group-by region,channel,product_line \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+  --out artifacts/analysis_a.md
+
+# new snapshot
+cargo run -p factor_cli -- analyze \
+  --input data/your_file_b.csv \
+  --group-by region,channel,product_line \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+  --out artifacts/analysis_b.md
+
+# compare (markdown)
+cargo run -p factor_cli -- analyze-compare \
+  --base artifacts/analysis_a.json \
+  --new artifacts/analysis_b.json \
+  --out artifacts/compare.md
+
+# compare (html)
+cargo run -p factor_cli -- analyze-compare \
+  --base artifacts/analysis_a.json \
+  --new artifacts/analysis_b.json \
+  --output-format html \
+  --out artifacts/compare.html
+
+# compare (json)
+cargo run -p factor_cli -- analyze-compare \
+  --base artifacts/analysis_a.json \
+  --new artifacts/analysis_b.json \
+  --output-format json \
+  --out artifacts/compare.json
+
+# compare (both markdown + json)
+cargo run -p factor_cli -- analyze-compare \
+  --base artifacts/analysis_a.json \
+  --new artifacts/analysis_b.json \
+  --output-format both \
+  --out artifacts/compare.md
+```
+
+Notes:
+- `analyze` outputs `<out>.json` by default (`--output-format both`).
+- `analyze-compare` supports `--output-format md|html|json|both`.
+- `--top-movers` controls how many largest movers are shown (default: `10`).
+
 Or analyze directly from Postgres:
 
 ```bash
@@ -332,6 +449,16 @@ factorlens explain \
 
 Explain from generic table analysis output (`analysis.json`):
 
+Local model
+```bash
+factorlens explain-analyze \
+  --backend local \
+  --model /path/to/model.gguf \
+  --analysis-json /path/to/analysis.json \
+  --question "What are the top concentration risks and 3 actions?"
+```
+
+Bedrock
 ```bash
 factorlens explain-analyze \
   --backend bedrock \
