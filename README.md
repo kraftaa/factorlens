@@ -4,6 +4,9 @@ FactorLens is a Rust CLI for factor and risk attribution with built-in AI explan
 
 It computes factor analytics first, then explains computed artifacts through a pluggable LLM backend interface (`local` and `bedrock`).
 
+[![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
+[![GHCR](https://img.shields.io/badge/ghcr-factorlens--mcp-blue)](https://github.com/kraftaa/factorlens/pkgs/container/factorlens-mcp)
+
 ## What It Looks Like
 
 ```bash
@@ -40,8 +43,76 @@ is creating downside concentration risk in a small number of segments.
 | `explain-analyze` | executive narrative and actions from computed JSON |
 | `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
 
-## Demo
+## 2-Minute Quickstart
 
+```bash
+# 1) baseline snapshot (100 rows)
+factorlens analyze \
+  --input data/factorlens_demo_sales_100.csv \
+  --group-by region,channel,product_line,plan_tier \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+  --out artifacts/demo_sales_100.md
+
+# 2) new snapshot (150 rows)
+factorlens analyze \
+  --input data/factorlens_demo_sales_150.csv \
+  --group-by region,channel,product_line,plan_tier \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+  --out artifacts/demo_sales_150.md
+
+# 3) compare + explain
+factorlens analyze-compare \
+  --base artifacts/demo_sales_100.json \
+  --new artifacts/demo_sales_150.json \
+  --output-format html \
+  --out artifacts/demo_compare.html
+
+factorlens explain-analyze \
+  --backend bedrock \
+  --model anthropic.claude-3-haiku-20240307-v1:0 \
+  --analysis-json artifacts/demo_sales_150.json \
+  --question "What are the top concentration risks and what 3 actions should we take in the next 30 days?"
+```
+
+One-command runner:
+
+```bash
+./scripts/demo_sales.sh
+# optional Bedrock:
+RUN_BEDROCK=1 AWS_REGION=eu-central-1 ./scripts/demo_sales.sh
+```
+
+## Demo Data
+
+Public-safe demo files included:
+
+- `data/factorlens_demo_sales_100.csv`
+- `data/factorlens_demo_sales_150.csv` (use for compare)
+
+Optional Postgres load:
+
+```bash
+psql "$DATABASE_URL" -c "
+create schema if not exists demo;
+drop table if exists demo.factorlens_demo_sales_100;
+drop table if exists demo.factorlens_demo_sales_150;
+create table demo.factorlens_demo_sales_100 (
+  order_date date,
+  region text,
+  channel text,
+  product_line text,
+  plan_tier int,
+  revenue_usd numeric(14,2),
+  cost_usd numeric(14,2),
+  orders int
+);
+create table demo.factorlens_demo_sales_150 (like demo.factorlens_demo_sales_100);
+"
+psql "$DATABASE_URL" -c "\copy demo.factorlens_demo_sales_100 from 'data/factorlens_demo_sales_100.csv' with (format csv, header true)"
+psql "$DATABASE_URL" -c "\copy demo.factorlens_demo_sales_150 from 'data/factorlens_demo_sales_150.csv' with (format csv, header true)"
+```
 
 ## Architecture
 
@@ -59,6 +130,14 @@ Math engine first, explanation layer second.
 
 Many analytics workflows produce dashboards without a clear explanation of why metrics changed.
 FactorLens prioritizes attribution and residual math first, then translates those computed results into business language.
+
+## What This Is Not
+
+- Not a trading bot
+- Not a price prediction model
+- Not a chat-first analytics toy
+
+FactorLens computes attribution first, then uses LLMs only to explain computed artifacts.
 
 ## Integrations
 
