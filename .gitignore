@@ -17,3 +17,4 @@ profiles/*.local.toml
 profiles/*.private.toml
 other
 TO_DO.md
+docs/
