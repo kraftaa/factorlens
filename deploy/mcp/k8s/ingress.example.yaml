@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: factorlens-mcp
+  namespace: analytics
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  tls:
+  - hosts:
+    - factorlens-mcp.internal.example.com
+    secretName: factorlens-mcp-tls
+  rules:
+  - host: factorlens-mcp.internal.example.com
+    http:
+      paths:
+      - path: /mcp
+        pathType: Prefix
+        backend:
+          service:
+            name: factorlens-mcp
+            port:
+              number: 80

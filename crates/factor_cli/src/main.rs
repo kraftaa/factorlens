@@ -182,6 +182,8 @@ struct AnalyzeCompareArgs {
 enum CompareOutputFormat {
     Md,
     Html,
+    Json,
+    Both,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -666,6 +668,46 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
         ));
     }
 
+    let movers_json = movers
+        .iter()
+        .take(args.top_movers)
+        .map(|(seg, bc, nc, bs, ns, ds, bp, np, dp)| {
+            serde_json::json!({
+                "segment": seg,
+                "base_records": bc,
+                "new_records": nc,
+                "base_share_pct": bs,
+                "new_share_pct": ns,
+                "delta_share_pp": ds,
+                "base_primary_metric_value": bp,
+                "new_primary_metric_value": np,
+                "delta_primary_metric_value": dp
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let json_out = serde_json::json!({
+        "base": args.base.display().to_string(),
+        "new": args.new.display().to_string(),
+        "base_records": base_records,
+        "new_records": new_records,
+        "base_segments": base_segments,
+        "new_segments": new_segments,
+        "primary_metric": primary_metric,
+        "top5_concentration": {
+            "base_pct": base_top5_pct,
+            "new_pct": new_top5_pct,
+            "delta_pp": new_top5_pct - base_top5_pct
+        },
+        "segment_count_delta": {
+            "base": base_segments,
+            "new": new_segments,
+            "delta": new_segments as i64 - base_segments as i64
+        },
+        "top_movers_limit": args.top_movers,
+        "movers": movers_json
+    });
+
     match args.output_format {
         CompareOutputFormat::Md => {
             fs::write(&args.out, md)?;
@@ -674,6 +716,17 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
         CompareOutputFormat::Html => {
             fs::write(&args.out, markdown_to_html(&md))?;
             println!("Comparison report (html) written to {}", args.out.display());
+        }
+        CompareOutputFormat::Json => {
+            fs::write(&args.out, serde_json::to_string_pretty(&json_out)?)?;
+            println!("Comparison report (json) written to {}", args.out.display());
+        }
+        CompareOutputFormat::Both => {
+            fs::write(&args.out, md)?;
+            let json_path = args.out.with_extension("json");
+            fs::write(&json_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!("Comparison report (markdown) written to {}", args.out.display());
+            println!("Comparison report (json) written to {}", json_path.display());
         }
     }
     Ok(())

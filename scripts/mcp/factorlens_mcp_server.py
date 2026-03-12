@@ -29,8 +29,9 @@ mcp = FastMCP("factorlens")
 
 
 VALID_OUTPUT_FORMATS = {"md", "json", "both", "html"}
-VALID_COMPARE_OUTPUT_FORMATS = {"md", "html"}
+VALID_COMPARE_OUTPUT_FORMATS = {"md", "html", "json", "both"}
 VALID_BACKENDS = {"local", "bedrock"}
+VALID_POSTGRES_SSL_MODES = {"disable", "prefer", "require"}
 
 
 def _split_roots(env_key: str, defaults: list[Path]) -> list[Path]:
@@ -216,6 +217,97 @@ def analyze_csv(
 
 
 @mcp.tool()
+def analyze_query(
+    out: str,
+    query: str | None = None,
+    query_file: str | None = None,
+    postgres_url: str | None = None,
+    postgres_ssl_mode: str = "prefer",
+    postgres_ca_file: str | None = None,
+    profile: str | None = None,
+    profile_config: str | None = None,
+    group_by_csv: str | None = None,
+    metrics_csv: str | None = None,
+    where_csv: str | None = None,
+    rank_by: str | None = None,
+    agg: str = "sum",
+    percentiles_csv: str | None = None,
+    min_records: int = 1,
+    top: int = 20,
+    count_only: bool = False,
+    normalize_text_groups: bool = False,
+    word_freq: bool = False,
+    output_format: str = "both",
+    timeout_sec: int | None = None,
+) -> str:
+    if output_format not in VALID_OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {sorted(VALID_OUTPUT_FORMATS)}")
+    if agg not in {"sum", "mean", "median"}:
+        raise ValueError("agg must be one of: sum, mean, median")
+    if min_records < 1:
+        raise ValueError("min_records must be >= 1")
+    if top < 1:
+        raise ValueError("top must be >= 1")
+    if postgres_ssl_mode not in VALID_POSTGRES_SSL_MODES:
+        raise ValueError(
+            f"postgres_ssl_mode must be one of {sorted(VALID_POSTGRES_SSL_MODES)}"
+        )
+    if bool(query) == bool(query_file):
+        raise ValueError("provide exactly one of query or query_file")
+
+    out_path = _validate_write_path(out, "out")
+    query_file_path: Path | None = None
+    if query_file:
+        query_file_path = _validate_read_path(query_file, "query_file")
+    ca_file_path: Path | None = None
+    if postgres_ca_file:
+        ca_file_path = _validate_read_path(postgres_ca_file, "postgres_ca_file")
+
+    cmd = [
+        "analyze",
+        "--out",
+        str(out_path),
+        "--output-format",
+        output_format,
+        "--agg",
+        agg,
+        "--min-records",
+        str(min_records),
+        "--top",
+        str(top),
+        "--postgres-ssl-mode",
+        postgres_ssl_mode,
+    ]
+
+    _append_optional(cmd, "--postgres-url", postgres_url)
+    if query:
+        cmd.extend(["--query", query])
+    if query_file_path:
+        cmd.extend(["--query-file", str(query_file_path)])
+    if ca_file_path:
+        cmd.extend(["--postgres-ca-file", str(ca_file_path)])
+
+    _append_optional(cmd, "--profile", profile)
+    if profile_config:
+        cfg = _validate_read_path(profile_config, "profile_config")
+        cmd.extend(["--profile-config", str(cfg)])
+    _append_optional(cmd, "--group-by", group_by_csv)
+    _append_optional(cmd, "--metrics", metrics_csv)
+    _append_optional(cmd, "--where", where_csv)
+    _append_optional(cmd, "--rank-by", rank_by)
+    _append_optional(cmd, "--percentiles", percentiles_csv)
+
+    if count_only:
+        cmd.append("--count-only")
+    if normalize_text_groups:
+        cmd.append("--normalize-text-groups")
+    if word_freq:
+        cmd.append("--word-freq")
+
+    return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
 def analyze_compare(
     base_json: str,
     new_json: str,
@@ -288,4 +380,12 @@ def healthcheck(timeout_sec: int | None = 20) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        raise RuntimeError(
+            "MCP_TRANSPORT must be one of: stdio, sse, streamable-http"
+        )
+    if transport == "sse":
+        mcp.run("sse", mount_path=os.getenv("MCP_MOUNT_PATH"))
+    else:
+        mcp.run(transport)

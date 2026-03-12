@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: factorlens-mcp-config
+  namespace: analytics
+data:
+  MCP_TRANSPORT: "streamable-http"
+  FASTMCP_HOST: "0.0.0.0"
+  FASTMCP_PORT: "8000"
+  FASTMCP_STREAMABLE_HTTP_PATH: "/mcp"
+  FACTORLENS_CMD_TIMEOUT_SEC: "300"
+  FACTORLENS_ALLOWED_READ_DIRS: "/data,/profiles,/artifacts"
+  FACTORLENS_ALLOWED_WRITE_DIRS: "/artifacts"
+  AWS_REGION: "eu-central-1"

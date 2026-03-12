@@ -9,7 +9,8 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 ## What It Exposes
 
 - `analyze_csv`: run `factorlens analyze` on CSV input
-- `analyze_compare`: compare two `analysis.json` snapshots
+- `analyze_query`: run `factorlens analyze` on Postgres query input
+- `analyze_compare`: compare two `analysis.json` snapshots (`md`, `html`, `json`, or `both`)
 - `explain_analyze`: run `factorlens explain-analyze` (Bedrock or local)
 - `healthcheck`: quick CLI availability check
 
@@ -53,6 +54,9 @@ Environment variables:
 - `FACTORLENS_ALLOWED_READ_DIRS`: comma-separated readable roots
 - `FACTORLENS_ALLOWED_WRITE_DIRS`: comma-separated writable roots
 - `FACTORLENS_CMD_TIMEOUT_SEC`: default timeout per command
+- `MCP_TRANSPORT`: `stdio` (default), `sse`, or `streamable-http`
+- `MCP_MOUNT_PATH`: optional mount path when `MCP_TRANSPORT=sse`
+- `FASTMCP_HOST`, `FASTMCP_PORT`, `FASTMCP_STREAMABLE_HTTP_PATH`: network settings for hosted MCP mode
 
 Defaults (if env vars omitted):
 
@@ -93,5 +97,19 @@ Explain analysis:
   "backend": "bedrock",
   "model": "anthropic.claude-3-haiku-20240307-v1:0",
   "question": "Top concentration risks and 3 actions?"
+}
+```
+
+Analyze Postgres query:
+
+```json
+{
+  "out": "/path/to/artifacts/query_report.md",
+  "query": "select region, channel, revenue_usd from analytics.sales limit 5000",
+  "postgres_ssl_mode": "require",
+  "postgres_ca_file": "/path/to/rds-global-bundle.pem",
+  "profile": "demo_exec",
+  "profile_config": "/path/to/profiles/marketplace.local.toml",
+  "output_format": "both"
 }
 ```
