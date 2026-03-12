@@ -39,6 +39,7 @@ is creating downside concentration risk in a small number of segments.
 | Command | Purpose |
 |---|---|
 | `analyze` | factor/segment attribution from CSV or Postgres |
+| `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
 | `analyze-compare` | snapshot delta analysis (biggest movers) |
 | `explain-analyze` | executive narrative and actions from computed JSON |
 | `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
@@ -113,6 +114,22 @@ create table demo.factorlens_demo_sales_150 (like demo.factorlens_demo_sales_100
 psql "$DATABASE_URL" -c "\copy demo.factorlens_demo_sales_100 from 'data/factorlens_demo_sales_100.csv' with (format csv, header true)"
 psql "$DATABASE_URL" -c "\copy demo.factorlens_demo_sales_150 from 'data/factorlens_demo_sales_150.csv' with (format csv, header true)"
 ```
+
+Generate a starter profile automatically from a new dataset:
+
+```bash
+factorlens analyze-suggest \
+  --input data/factorlens_demo_sales_150.csv \
+  --out artifacts/demo_suggest.md \
+  --profile-name demo_exec \
+  --auto-group-k 4 \
+  --max-metrics 3
+```
+
+This writes:
+- `artifacts/demo_suggest.md` (human summary)
+- `artifacts/demo_suggest.json` (machine-readable suggestion report)
+- `artifacts/demo_suggest.toml` (ready profile config block)
 
 ## Architecture
 

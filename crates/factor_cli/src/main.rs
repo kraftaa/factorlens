@@ -16,7 +16,7 @@ use postgres::{Client, NoTls};
 use postgres_rustls::MakeTlsConnector;
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use rustls::ClientConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
@@ -72,6 +72,7 @@ enum Commands {
         out: PathBuf,
     },
     Analyze(AnalyzeArgs),
+    AnalyzeSuggest(AnalyzeSuggestArgs),
     AnalyzeCompare(AnalyzeCompareArgs),
 }
 
@@ -178,10 +179,35 @@ struct AnalyzeCompareArgs {
     out: PathBuf,
 }
 
+#[derive(Args, Clone)]
+struct AnalyzeSuggestArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, default_value = "suggested")]
+    profile_name: String,
+    #[arg(long, default_value_t = 3)]
+    auto_group_k: usize,
+    #[arg(long, default_value_t = 3)]
+    max_metrics: usize,
+    #[arg(long, default_value_t = 2000)]
+    sample_rows: usize,
+    #[arg(long, value_enum, default_value = "both")]
+    output_format: SuggestOutputFormat,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
 enum CompareOutputFormat {
     Md,
     Html,
+    Json,
+    Both,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum SuggestOutputFormat {
+    Md,
     Json,
     Both,
 }
@@ -451,6 +477,9 @@ fn main() -> Result<()> {
         Commands::Analyze(args) => {
             run_analyze(args)?;
         }
+        Commands::AnalyzeSuggest(args) => {
+            run_analyze_suggest(args)?;
+        }
         Commands::AnalyzeCompare(args) => {
             run_analyze_compare(args)?;
         }
@@ -569,6 +598,378 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             .join(", ")
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SuggestColumn {
+    name: String,
+    non_empty: u64,
+    fill_pct: f64,
+    distinct_count: usize,
+    numeric_ratio: f64,
+    date_ratio: f64,
+    inferred_role: String,
+    top_values: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalyzeSuggestReport {
+    input: String,
+    sampled_rows: usize,
+    profile_name: String,
+    suggested_group_by: Vec<String>,
+    suggested_metrics: Vec<String>,
+    suggested_rank_by: Option<String>,
+    suggested_date_column: Option<String>,
+    warnings: Vec<String>,
+    columns: Vec<SuggestColumn>,
+}
+
+fn run_analyze_suggest(args: AnalyzeSuggestArgs) -> Result<()> {
+    let report = analyze_suggest_csv(&args)?;
+    let profile_toml = build_suggested_profile_toml(
+        &report,
+        &args.profile_name,
+        args.auto_group_k,
+        args.max_metrics,
+    );
+    let profile_path = args.out.with_extension("toml");
+    fs::write(&profile_path, profile_toml)?;
+
+    match args.output_format {
+        SuggestOutputFormat::Md => {
+            fs::write(&args.out, suggest_report_markdown(&report, &profile_path))?;
+            println!("Analyze suggest report (markdown) written to {}", args.out.display());
+        }
+        SuggestOutputFormat::Json => {
+            fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
+            println!("Analyze suggest report (json) written to {}", args.out.display());
+        }
+        SuggestOutputFormat::Both => {
+            fs::write(&args.out, suggest_report_markdown(&report, &profile_path))?;
+            let json_path = args.out.with_extension("json");
+            fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
+            println!("Analyze suggest report (markdown) written to {}", args.out.display());
+            println!("Analyze suggest report (json) written to {}", json_path.display());
+        }
+    }
+    println!("Suggested profile TOML written to {}", profile_path.display());
+    Ok(())
+}
+
+fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport> {
+    let mut rdr = csv::Reader::from_path(&args.input)?;
+    let headers = rdr.headers()?.clone();
+    let col_count = headers.len();
+    if col_count == 0 {
+        return Err(anyhow!("input CSV has no columns"));
+    }
+
+    let mut sampled_rows = 0usize;
+    let mut non_empty = vec![0u64; col_count];
+    let mut numeric_ok = vec![0u64; col_count];
+    let mut date_ok = vec![0u64; col_count];
+    let mut distinct = vec![HashSet::<String>::new(); col_count];
+    let mut counts = vec![HashMap::<String, u64>::new(); col_count];
+
+    for rec in rdr.records().take(args.sample_rows) {
+        let rec = rec?;
+        sampled_rows += 1;
+        for i in 0..col_count {
+            let raw = rec.get(i).unwrap_or("").trim();
+            if raw.is_empty() {
+                continue;
+            }
+            non_empty[i] += 1;
+            if parse_numeric(raw).is_some() {
+                numeric_ok[i] += 1;
+            }
+            if parse_date_like(raw).is_some() {
+                date_ok[i] += 1;
+            }
+
+            if distinct[i].len() < 2000 {
+                distinct[i].insert(raw.to_string());
+            }
+            if counts[i].len() < 300 || counts[i].contains_key(raw) {
+                *counts[i].entry(raw.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if sampled_rows == 0 {
+        return Err(anyhow!("input CSV has no rows"));
+    }
+
+    let mut columns = Vec::with_capacity(col_count);
+    for i in 0..col_count {
+        let name = headers.get(i).unwrap_or("").to_string();
+        let ne = non_empty[i];
+        let fill_pct = (ne as f64 / sampled_rows as f64) * 100.0;
+        let numeric_ratio = if ne == 0 {
+            0.0
+        } else {
+            numeric_ok[i] as f64 / ne as f64
+        };
+        let date_ratio = if ne == 0 {
+            0.0
+        } else {
+            date_ok[i] as f64 / ne as f64
+        };
+        let distinct_count = distinct[i].len();
+        let inferred_role = infer_column_role(&name, fill_pct, distinct_count, numeric_ratio, date_ratio);
+        let mut top_values = counts[i]
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>();
+        top_values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_values.truncate(5);
+
+        columns.push(SuggestColumn {
+            name,
+            non_empty: ne,
+            fill_pct,
+            distinct_count,
+            numeric_ratio,
+            date_ratio,
+            inferred_role,
+            top_values,
+        });
+    }
+
+    let mut suggested_group_by = columns
+        .iter()
+        .filter(|c| c.inferred_role == "dimension")
+        .cloned()
+        .collect::<Vec<_>>();
+    suggested_group_by.sort_by(|a, b| {
+        let a_penalty = (a.distinct_count as i64 - 12).abs();
+        let b_penalty = (b.distinct_count as i64 - 12).abs();
+        a_penalty
+            .cmp(&b_penalty)
+            .then_with(|| b.fill_pct.partial_cmp(&a.fill_pct).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let suggested_group_by = suggested_group_by
+        .into_iter()
+        .take(args.auto_group_k)
+        .map(|c| c.name)
+        .collect::<Vec<_>>();
+
+    let mut suggested_metrics = columns
+        .iter()
+        .filter(|c| c.inferred_role == "metric")
+        .cloned()
+        .collect::<Vec<_>>();
+    suggested_metrics.sort_by(|a, b| {
+        metric_priority(&b.name)
+            .cmp(&metric_priority(&a.name))
+            .then_with(|| b.non_empty.cmp(&a.non_empty))
+    });
+    let suggested_metrics = suggested_metrics
+        .into_iter()
+        .take(args.max_metrics)
+        .map(|c| c.name)
+        .collect::<Vec<_>>();
+
+    let suggested_rank_by = suggested_metrics.first().cloned();
+    let suggested_date_column = columns
+        .iter()
+        .filter(|c| c.inferred_role == "date")
+        .max_by(|a, b| a.fill_pct.partial_cmp(&b.fill_pct).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|c| c.name.clone());
+
+    let mut warnings = Vec::new();
+    if suggested_group_by.is_empty() {
+        warnings.push("No strong dimension columns detected. Pass --group-by manually.".to_string());
+    }
+    if suggested_metrics.is_empty() {
+        warnings.push("No strong metric columns detected. Pass --metrics manually.".to_string());
+    }
+    for c in columns.iter().filter(|c| c.fill_pct < 30.0 && c.inferred_role == "dimension") {
+        warnings.push(format!(
+            "Dimension '{}' has low fill rate ({:.1}%).",
+            c.name, c.fill_pct
+        ));
+    }
+
+    Ok(AnalyzeSuggestReport {
+        input: args.input.display().to_string(),
+        sampled_rows,
+        profile_name: args.profile_name.clone(),
+        suggested_group_by,
+        suggested_metrics,
+        suggested_rank_by,
+        suggested_date_column,
+        warnings,
+        columns,
+    })
+}
+
+fn infer_column_role(
+    name: &str,
+    fill_pct: f64,
+    distinct_count: usize,
+    numeric_ratio: f64,
+    date_ratio: f64,
+) -> String {
+    let n = name.to_lowercase();
+    if date_ratio >= 0.9 || n == "date" || n.ends_with("_date") || n.contains("timestamp") {
+        return "date".to_string();
+    }
+    if numeric_ratio >= 0.85
+        && fill_pct >= 20.0
+        && distinct_count <= 20
+        && (n.contains("tier")
+            || n.contains("plan")
+            || n.contains("flag")
+            || n.contains("status")
+            || n.contains("bucket")
+            || n.contains("class"))
+    {
+        return "dimension".to_string();
+    }
+    let id_like = n == "id"
+        || n.ends_with("_id")
+        || n.ends_with("_uuid")
+        || n.contains("uuid")
+        || n.ends_with("_url");
+    if numeric_ratio >= 0.85 && !id_like {
+        return "metric".to_string();
+    }
+    if !id_like && fill_pct >= 20.0 && (2..=80).contains(&distinct_count) {
+        return "dimension".to_string();
+    }
+    if numeric_ratio >= 0.85 {
+        return "numeric_other".to_string();
+    }
+    "text_other".to_string()
+}
+
+fn metric_priority(name: &str) -> i32 {
+    let n = name.to_lowercase();
+    if n.contains("revenue") || n.contains("gmv") || n.contains("sales") || n.contains("amount") {
+        return 3;
+    }
+    if n.contains("cost") || n.contains("profit") || n.contains("margin") {
+        return 2;
+    }
+    if n.contains("qty") || n.contains("quantity") || n.contains("count") || n.contains("orders")
+    {
+        return 1;
+    }
+    0
+}
+
+fn build_suggested_profile_toml(
+    report: &AnalyzeSuggestReport,
+    profile_name: &str,
+    auto_group_k: usize,
+    max_metrics: usize,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("[profiles.{}]\n", profile_name));
+    if !report.suggested_group_by.is_empty() {
+        s.push_str(&format!(
+            "group_by = [{}]\n",
+            report
+                .suggested_group_by
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !report.suggested_metrics.is_empty() {
+        s.push_str(&format!(
+            "metrics = [{}]\n",
+            report
+                .suggested_metrics
+                .iter()
+                .take(max_metrics)
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(rank_by) = &report.suggested_rank_by {
+        s.push_str(&format!("rank_by = \"{}\"\n", rank_by));
+    }
+    s.push_str("top = 15\n");
+    s.push_str("min_records = 10\n");
+    s.push_str(&format!("auto_group_k = {}\n", auto_group_k));
+    s
+}
+
+fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf) -> String {
+    let mut md = String::new();
+    md.push_str("# Analyze Suggest Report\n\n");
+    md.push_str(&format!("- Input: {}\n", report.input));
+    md.push_str(&format!("- Sampled rows: {}\n", report.sampled_rows));
+    md.push_str(&format!("- Suggested profile name: `{}`\n", report.profile_name));
+    md.push_str(&format!("- Suggested profile path: {}\n\n", profile_path.display()));
+
+    md.push_str("## Suggested Columns\n\n");
+    md.push_str(&format!(
+        "- group_by: {}\n",
+        if report.suggested_group_by.is_empty() {
+            "(none)".to_string()
+        } else {
+            report.suggested_group_by.join(", ")
+        }
+    ));
+    md.push_str(&format!(
+        "- metrics: {}\n",
+        if report.suggested_metrics.is_empty() {
+            "(none)".to_string()
+        } else {
+            report.suggested_metrics.join(", ")
+        }
+    ));
+    md.push_str(&format!(
+        "- rank_by: {}\n",
+        report
+            .suggested_rank_by
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string())
+    ));
+    md.push_str(&format!(
+        "- date_column: {}\n\n",
+        report
+            .suggested_date_column
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string())
+    ));
+
+    if !report.warnings.is_empty() {
+        md.push_str("## Warnings\n\n");
+        for w in &report.warnings {
+            md.push_str(&format!("- {}\n", w));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Column Profile\n\n");
+    md.push_str("| Column | Role | Fill % | Distinct | Numeric Ratio | Date Ratio | Top Values |\n");
+    md.push_str("|---|---|---:|---:|---:|---:|---|\n");
+    for c in &report.columns {
+        let top_vals = c
+            .top_values
+            .iter()
+            .map(|(v, n)| format!("{} ({})", v.replace('|', "\\|"), n))
+            .collect::<Vec<_>>()
+            .join("; ");
+        md.push_str(&format!(
+            "| {} | {} | {:.1}% | {} | {:.2} | {:.2} | {} |\n",
+            c.name,
+            c.inferred_role,
+            c.fill_pct,
+            c.distinct_count,
+            c.numeric_ratio,
+            c.date_ratio,
+            top_vals
+        ));
+    }
+    md
 }
 
 fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
@@ -2362,6 +2763,26 @@ fn auto_detect_numeric_metrics(
 fn parse_numeric(v: &str) -> Option<f64> {
     let s = v.replace(',', "").replace('$', "");
     s.parse::<f64>().ok()
+}
+
+fn parse_date_like(v: &str) -> Option<chrono::NaiveDate> {
+    let s = v.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d);
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.date());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(dt.date());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.date_naive());
+    }
+    None
 }
 
 fn markdown_to_html(markdown: &str) -> String {
