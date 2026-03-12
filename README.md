@@ -126,6 +126,17 @@ factorlens analyze-suggest \
   --max-metrics 3
 ```
 
+Large file tip:
+
+```bash
+factorlens analyze-suggest \
+  --input data/factorlens_demo_sales_150.csv \
+  --out artifacts/demo_suggest_random.md \
+  --sample-rows 1000 \
+  --sample-mode random \
+  --sample-seed 42
+```
+
 This writes:
 - `artifacts/demo_suggest.md` (human summary)
 - `artifacts/demo_suggest.json` (machine-readable suggestion report)

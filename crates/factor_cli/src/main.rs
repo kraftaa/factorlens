@@ -197,6 +197,10 @@ struct AnalyzeSuggestArgs {
     max_metrics: usize,
     #[arg(long, default_value_t = 2000)]
     sample_rows: usize,
+    #[arg(long, value_enum, default_value = "head")]
+    sample_mode: SampleMode,
+    #[arg(long, default_value_t = 42)]
+    sample_seed: u64,
     #[arg(long)]
     out_profile: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "both")]
@@ -216,6 +220,12 @@ enum SuggestOutputFormat {
     Md,
     Json,
     Both,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum SampleMode {
+    Head,
+    Random,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -624,6 +634,8 @@ struct SuggestColumn {
 struct AnalyzeSuggestReport {
     input: String,
     sampled_rows: usize,
+    sample_mode: String,
+    sample_seed: u64,
     profile_name: String,
     suggested_group_by: Vec<String>,
     suggested_metrics: Vec<String>,
@@ -683,8 +695,30 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
     let mut distinct = vec![HashSet::<String>::new(); col_count];
     let mut counts = vec![HashMap::<String, u64>::new(); col_count];
 
-    for rec in rdr.records().take(args.sample_rows) {
-        let rec = rec?;
+    let mut sampled_records: Vec<StringRecord> = Vec::new();
+    match args.sample_mode {
+        SampleMode::Head => {
+            for rec in rdr.records().take(args.sample_rows) {
+                sampled_records.push(rec?);
+            }
+        }
+        SampleMode::Random => {
+            let mut state = args.sample_seed;
+            for (idx, rec) in rdr.records().enumerate() {
+                let rec = rec?;
+                if sampled_records.len() < args.sample_rows {
+                    sampled_records.push(rec);
+                    continue;
+                }
+                let j = pseudo_rand_below(&mut state, (idx + 1) as u64) as usize;
+                if j < args.sample_rows {
+                    sampled_records[j] = rec;
+                }
+            }
+        }
+    }
+
+    for rec in &sampled_records {
         sampled_rows += 1;
         for i in 0..col_count {
             let raw = rec.get(i).unwrap_or("").trim();
@@ -806,6 +840,11 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
     Ok(AnalyzeSuggestReport {
         input: args.input.display().to_string(),
         sampled_rows,
+        sample_mode: match args.sample_mode {
+            SampleMode::Head => "head".to_string(),
+            SampleMode::Random => "random".to_string(),
+        },
+        sample_seed: args.sample_seed,
         profile_name: args.profile_name.clone(),
         suggested_group_by,
         suggested_metrics,
@@ -916,6 +955,10 @@ fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf
     md.push_str("# Analyze Suggest Report\n\n");
     md.push_str(&format!("- Input: {}\n", report.input));
     md.push_str(&format!("- Sampled rows: {}\n", report.sampled_rows));
+    md.push_str(&format!(
+        "- Sample mode: {} (seed={})\n",
+        report.sample_mode, report.sample_seed
+    ));
     md.push_str(&format!("- Suggested profile name: `{}`\n", report.profile_name));
     md.push_str(&format!("- Suggested profile path: {}\n\n", profile_path.display()));
 
@@ -3110,6 +3153,18 @@ fn percentile_value(values: &[f64], q: f64) -> f64 {
     } else {
         let w = rank - lo as f64;
         xs[lo] * (1.0 - w) + xs[hi] * w
+    }
+}
+
+fn pseudo_rand_below(state: &mut u64, upper_exclusive: u64) -> u64 {
+    // Deterministic LCG-based pseudo-random for lightweight sampling.
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1);
+    if upper_exclusive == 0 {
+        0
+    } else {
+        *state % upper_exclusive
     }
 }
 
