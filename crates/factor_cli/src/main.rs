@@ -155,6 +155,8 @@ struct AnalyzeArgs {
     rank_by: Option<String>,
     #[arg(long, default_value_t = 20)]
     top: usize,
+    #[arg(long, default_value_t = 0)]
+    top_insights: usize,
     #[arg(long, default_value_t = 1)]
     min_records: u64,
     #[arg(long)]
@@ -567,6 +569,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.exclude_blank_groups,
         args.rank_by.as_deref(),
         args.top,
+        args.top_insights,
         args.min_records,
         args.alert_top5_share,
         args.alert_blank_share,
@@ -2023,6 +2026,7 @@ fn analyze_table_csv(
     exclude_blank_groups: bool,
     rank_by: Option<&str>,
     top_n: usize,
+    top_insights: usize,
     min_records: u64,
     alert_top5_share: Option<f64>,
     alert_blank_share: Option<f64>,
@@ -2260,6 +2264,9 @@ fn analyze_table_csv(
         rank_metric.clone().unwrap_or_else(|| "count".to_string())
     ));
     md.push_str(&format!("- Top rows shown: {}\n", top_n));
+    if top_insights > 0 {
+        md.push_str(&format!("- Top insights requested: {}\n", top_insights));
+    }
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
     md.push_str(&format!(
         "- Metric aggregation: {}\n",
@@ -2494,6 +2501,122 @@ fn analyze_table_csv(
 
     md.push('\n');
 
+    let mut top_risks = Vec::<String>::new();
+    let mut top_opportunities = Vec::<String>::new();
+    if top_insights > 0 {
+        let mut by_count_share = rows
+            .iter()
+            .map(|(group, count, sums)| {
+                let count_share = if total_count > 0 {
+                    (*count as f64 / total_count as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let primary_value = if let Some(pm) = &primary_metric {
+                    sums.get(pm).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let primary_share = if agg == AggKind::Sum && total_primary.abs() > 1e-12 {
+                    (primary_value / total_primary) * 100.0
+                } else {
+                    0.0
+                };
+                let per_record = if *count > 0 {
+                    primary_value / *count as f64
+                } else {
+                    0.0
+                };
+                (
+                    group.clone(),
+                    *count,
+                    count_share,
+                    primary_value,
+                    primary_share,
+                    per_record,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        by_count_share.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (group, count, count_share, _, primary_share, _) in
+            by_count_share.iter().take(top_insights)
+        {
+            if let Some(pm) = &primary_metric {
+                if agg == AggKind::Sum {
+                    top_risks.push(format!(
+                        "`{}` concentration: {} records ({:.1}% of total records), {:.1}% of total {}.",
+                        group, count, count_share, primary_share, pm
+                    ));
+                } else {
+                    top_risks.push(format!(
+                        "`{}` concentration: {} records ({:.1}% of total records).",
+                        group, count, count_share
+                    ));
+                }
+            } else {
+                top_risks.push(format!(
+                    "`{}` concentration: {} records ({:.1}% of total records).",
+                    group, count, count_share
+                ));
+            }
+        }
+
+        if let Some(pm) = &primary_metric {
+            let mut by_per_record = by_count_share.clone();
+            by_per_record.sort_by(|a, b| {
+                b.5.partial_cmp(&a.5)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (group, count, _, _, _, per_record) in by_per_record
+                .iter()
+                .filter(|(g, c, _, _, _, _)| !is_blank_group_key(g) && *c >= 2)
+                .take(top_insights)
+            {
+                top_opportunities.push(format!(
+                    "`{}` has high {} per record ({}) across {} records.",
+                    group,
+                    pm,
+                    fmt_num(*per_record, 2),
+                    count
+                ));
+            }
+        } else {
+            if top5_count_pct < 40.0 {
+                top_opportunities.push(format!(
+                    "Low concentration tail opportunity: top 5 segments are {:.1}% of records.",
+                    top5_count_pct
+                ));
+            }
+            if !top5_names.is_empty() {
+                top_opportunities.push(format!(
+                    "Prioritize the top segments first: {}.",
+                    top5_names
+                        .iter()
+                        .take(top_insights)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+
+        md.push_str("## Top Insights\n\n");
+        md.push_str("### Risks\n\n");
+        for line in &top_risks {
+            md.push_str(&format!("- {}\n", line));
+        }
+        md.push('\n');
+        md.push_str("### Opportunities\n\n");
+        for line in &top_opportunities {
+            md.push_str(&format!("- {}\n", line));
+        }
+        md.push('\n');
+    }
+
     let mut display_metrics = metric_cols
         .iter()
         .map(|(m, _)| m.clone())
@@ -2613,6 +2736,7 @@ fn analyze_table_csv(
             .collect::<Vec<_>>(),
         "rank_by": rank_metric.clone().unwrap_or_else(|| "count".to_string()),
         "top": top_n,
+        "top_insights": top_insights,
         "min_records": min_records,
         "blank_share_pct": blank_share_pct,
         "alert_thresholds": {
@@ -2623,6 +2747,8 @@ fn analyze_table_csv(
         "primary_metric": primary_metric,
         "top5_count": top5_count,
         "top5_primary_metric_value": top5_primary,
+        "top_risks": top_risks,
+        "top_opportunities": top_opportunities,
         "groups": json_rows,
     });
 
