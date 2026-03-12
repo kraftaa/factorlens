@@ -163,6 +163,8 @@ struct AnalyzeArgs {
     alert_top5_share: Option<f64>,
     #[arg(long)]
     alert_blank_share: Option<f64>,
+    #[arg(long, value_delimiter = ',')]
+    alert_rule: Vec<String>,
     #[arg(long)]
     out: PathBuf,
     #[arg(long, value_enum, default_value = "both")]
@@ -471,11 +473,18 @@ fn main() -> Result<()> {
                 BackendArg::Bedrock => Backend::Bedrock,
             };
             let client = build_client(backend, model);
-            let context = build_analysis_prompt_context(&v);
-            let system = "You are an analytics assistant. Use only provided analysis context. If missing, say unknown. Respond in plain text with concise bullets and concrete actions.";
+            let evidence = build_analysis_evidence(&v);
+            let context = build_analysis_prompt_context(&v, &evidence);
+            let system = "You are an analytics assistant. Use only provided analysis context. If missing, say unknown. Respond in plain text with concise bullets and concrete actions. Cite evidence IDs like [E1], [E2] for each claim.";
             let user = format!("Question: {}\n\nAnalysis context:\n{}", question, context);
             let answer = client.answer(system, &user)?;
-            println!("{}", answer);
+            println!("{}", answer.trim());
+            if !evidence.is_empty() {
+                println!("\nEvidence:");
+                for (i, line) in evidence.iter().enumerate() {
+                    println!("- [E{}] {}", i + 1, line);
+                }
+            }
         }
         Commands::Report {
             artifacts,
@@ -583,6 +592,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
         args.min_records,
         args.alert_top5_share,
         args.alert_blank_share,
+        &args.alert_rule,
     )?;
     match args.output_format {
         OutputFormat::Md => {
@@ -2073,6 +2083,7 @@ fn analyze_table_csv(
     min_records: u64,
     alert_top5_share: Option<f64>,
     alert_blank_share: Option<f64>,
+    alert_rules: &[String],
 ) -> Result<AnalysisReport> {
     let mut rdr = csv::Reader::from_path(input)?;
     let headers = rdr.headers()?.clone();
@@ -2397,6 +2408,35 @@ fn analyze_table_csv(
                 "High blank-segment share: {:.1}% of records are grouped as (blank) (threshold {:.1}%).",
                 blank_share_pct, threshold
             ));
+        }
+    }
+
+    let mut alert_rule_results = Vec::new();
+    if !alert_rules.is_empty() {
+        let ctx = AlertEvalContext {
+            top5_record_share_pct: top5_count_pct,
+            blank_share_pct,
+            segments: segment_count as f64,
+            records: total_count as f64,
+        };
+        for raw in alert_rules {
+            let parsed = parse_alert_rule(raw)?;
+            let matched = eval_alert_rule(&parsed, &ctx);
+            if matched {
+                alerts.push(format!(
+                    "Rule triggered: {} (actual={:.3})",
+                    raw.trim(),
+                    alert_metric_value(&parsed.metric, &ctx)
+                ));
+            }
+            alert_rule_results.push(serde_json::json!({
+                "rule": raw.trim(),
+                "metric": parsed.metric,
+                "operator": parsed.op,
+                "threshold": parsed.threshold,
+                "actual": alert_metric_value(&parsed.metric, &ctx),
+                "triggered": matched
+            }));
         }
     }
 
@@ -2787,6 +2827,7 @@ fn analyze_table_csv(
             "blank_share": alert_blank_share
         },
         "alerts": alerts,
+        "alert_rule_results": alert_rule_results,
         "primary_metric": primary_metric,
         "top5_count": top5_count,
         "top5_primary_metric_value": top5_primary,
@@ -2985,7 +3026,7 @@ fn markdown_to_html(markdown: &str) -> String {
     )
 }
 
-fn build_analysis_prompt_context(v: &serde_json::Value) -> String {
+fn build_analysis_prompt_context(v: &serde_json::Value, evidence: &[String]) -> String {
     let records = v.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
     let segments = v.get("segments").and_then(|x| x.as_u64()).unwrap_or(0);
     let group_by = v
@@ -3018,34 +3059,76 @@ fn build_analysis_prompt_context(v: &serde_json::Value) -> String {
                 .join("; ")
         })
         .unwrap_or_else(|| "".to_string());
-    let top_groups = v
-        .get("groups")
-        .and_then(|x| x.as_array())
-        .map(|xs| {
-            xs.iter()
-                .take(8)
-                .map(|g| {
-                    let name = g
-                        .get("group")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("(unknown)");
-                    let count = g.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
-                    format!("{} (records={})", name, count)
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .unwrap_or_else(|| "none".to_string());
+    let evidence_block = if evidence.is_empty() {
+        "none".to_string()
+    } else {
+        evidence
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("[E{}] {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
-        "records={} | segments={} | group_by={} | metrics={}\nalerts={}\ntop_groups={}",
+        "records={} | segments={} | group_by={} | metrics={}\nalerts={}\nevidence:\n{}",
         records,
         segments,
         group_by,
         metrics,
         if alerts.is_empty() { "none" } else { &alerts },
-        top_groups
+        evidence_block
     )
+}
+
+fn build_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let top_groups = v
+        .get("groups")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let primary_metric = v
+        .get("primary_metric")
+        .and_then(|x| x.as_str())
+        .unwrap_or("primary_metric");
+
+    for g in top_groups.iter().take(8) {
+        let name = g
+            .get("group")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(unknown)");
+        let count = g.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+        let count_share = g
+            .get("count_share_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let primary_val = g
+            .get(primary_metric)
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        out.push(format!(
+            "group='{}' records={} record_share_pct={:.1} {}={}",
+            name,
+            count,
+            count_share,
+            primary_metric,
+            fmt_num(primary_val, 2)
+        ));
+    }
+
+    let alerts = v
+        .get("alerts")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for a in alerts {
+        if let Some(s) = a.as_str() {
+            out.push(format!("alert='{}'", s));
+        }
+    }
+
+    out
 }
 
 fn should_normalize_group_column(col: &str) -> bool {
@@ -3186,6 +3269,96 @@ fn fmt_num(value: f64, decimals: usize) -> String {
         format!("{}{}", sign, grouped_int)
     } else {
         format!("{}{}.{}", sign, grouped_int, frac_part)
+    }
+}
+
+#[derive(Debug)]
+struct ParsedAlertRule {
+    metric: String,
+    op: String,
+    threshold: f64,
+}
+
+#[derive(Debug)]
+struct AlertEvalContext {
+    top5_record_share_pct: f64,
+    blank_share_pct: f64,
+    segments: f64,
+    records: f64,
+}
+
+fn parse_alert_rule(raw: &str) -> Result<ParsedAlertRule> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty --alert-rule"));
+    }
+    let ops = [">=", "<=", "!=", ">", "<", "="];
+    for op in ops {
+        if let Some((lhs, rhs)) = s.split_once(op) {
+            let metric = lhs.trim().to_lowercase();
+            if metric.is_empty() {
+                return Err(anyhow!("invalid --alert-rule '{}': missing metric", s));
+            }
+            if !is_supported_alert_metric(&metric) {
+                return Err(anyhow!(
+                    "invalid --alert-rule '{}': unsupported metric '{}'. Supported: top5_record_share_pct, blank_share_pct, segments, records",
+                    s,
+                    metric
+                ));
+            }
+            let threshold = rhs
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| anyhow!("invalid --alert-rule '{}': bad threshold", s))?;
+            return Ok(ParsedAlertRule {
+                metric,
+                op: op.to_string(),
+                threshold,
+            });
+        }
+    }
+    Err(anyhow!(
+        "invalid --alert-rule '{}'; expected metric<op>number (e.g., top5_record_share_pct>60)",
+        s
+    ))
+}
+
+fn is_supported_alert_metric(metric: &str) -> bool {
+    matches!(
+        metric,
+        "top5_record_share_pct"
+            | "top5_share"
+            | "top5_record_share"
+            | "blank_share_pct"
+            | "blank_share"
+            | "segments"
+            | "records"
+    )
+}
+
+fn alert_metric_value(metric: &str, ctx: &AlertEvalContext) -> f64 {
+    match metric {
+        "top5_record_share_pct" | "top5_share" | "top5_record_share" => ctx.top5_record_share_pct,
+        "blank_share_pct" | "blank_share" => ctx.blank_share_pct,
+        "segments" => ctx.segments,
+        "records" => ctx.records,
+        _ => f64::NAN,
+    }
+}
+
+fn eval_alert_rule(rule: &ParsedAlertRule, ctx: &AlertEvalContext) -> bool {
+    let actual = alert_metric_value(&rule.metric, ctx);
+    if actual.is_nan() {
+        return false;
+    }
+    match rule.op.as_str() {
+        ">" => actual > rule.threshold,
+        ">=" => actual >= rule.threshold,
+        "<" => actual < rule.threshold,
+        "<=" => actual <= rule.threshold,
+        "=" => (actual - rule.threshold).abs() < 1e-9,
+        "!=" => (actual - rule.threshold).abs() >= 1e-9,
+        _ => false,
     }
 }
 

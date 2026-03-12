@@ -505,6 +505,8 @@ Notes:
 - `--count-only` disables numeric metric aggregation and reports concentration using records only.
 - `--exclude-blank-groups` drops `(blank)` segment keys before ranking/reporting.
 - `--alert-top5-share` and `--alert-blank-share` add threshold-based alerts to report output.
+- `--alert-rule` adds custom rules (for example: `top5_record_share_pct>60`, `blank_share_pct>10`, `segments<50`).
+  Quote rules containing `<` or `>` in shell commands, for example: `--alert-rule 'segments<50,top5_record_share_pct>60'`.
 - `--top` controls how many groups are listed in the report.
 - `--top-insights` adds deterministic Top Risks and Top Opportunities bullets to the report.
 - `--normalize-text-groups` normalizes group values for columns like `name`/`title` (lowercase + punctuation cleanup).
