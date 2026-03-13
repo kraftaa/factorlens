@@ -2,7 +2,7 @@
 
 A Rust CLI for deterministic factor attribution and analytics workflows, with optional AI-generated explanations.
 
-FactorLens helps explain why metrics change by decomposing results into factor contributions and producing structured analysis artifacts for review workflows.
+FactorLens explains why metrics change by decomposing results into factor contributions and producing structured analysis artifacts.
 FactorLens follows a math-first, AI-second approach: deterministic analytics produce the artifacts, and the LLM layer interprets them.
 
 [![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
@@ -15,13 +15,12 @@ Given a dataset with sales metrics:
 ```bash
 factorlens analyze data/sales_100.csv
 factorlens analyze-compare data/sales_100.csv data/sales_150.csv
-factorlens analyze-compare
 factorlens explain-analyze
 ```
 
 #### Example output  (truncated):
 
-```bash
+```text
 Executive Delta
 
 Top-5 concentration changed from 12.0% → 21.3% (+9.3 pp)
@@ -33,6 +32,7 @@ Top Concentration Changes
 3. US | Direct | Core | 0      7 → 7 records
 ...
 ```
+
 
 ## Design Principles
 
