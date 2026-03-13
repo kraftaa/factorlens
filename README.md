@@ -1,11 +1,47 @@
 # FactorLens
 
-FactorLens is a Rust CLI for factor and risk attribution with built-in AI explanations for business reviews.
+A Rust CLI for deterministic factor attribution and analytics workflows, with optional AI-generated explanations.
 
-It computes factor analytics first, then explains computed artifacts through a pluggable LLM backend interface (`local` and `bedrock`).
+FactorLens helps explain why metrics change by decomposing results into factor contributions and producing structured analysis artifacts for review workflows.
+FactorLens follows a math-first, AI-second approach: deterministic analytics produce the artifacts, and the LLM layer interprets them.
 
 [![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
 [![GHCR](https://img.shields.io/badge/ghcr-factorlens--mcp-blue)](https://github.com/kraftaa/factorlens/pkgs/container/factorlens-mcp)
+
+## Quick Example
+
+Given a dataset with sales metrics:
+
+```bash
+factorlens analyze data/sales_100.csv
+factorlens analyze-compare data/sales_100.csv data/sales_150.csv
+factorlens analyze-compare
+factorlens explain-analyze
+```
+
+#### Example output  (truncated):
+
+```bash
+Executive Delta
+
+Top-5 concentration changed from 12.0% → 21.3% (+9.3 pp)
+Segment count changed from 62 → 60 (-2)
+
+Top Concentration Changes
+1. US | Direct | Premium | 0   9 → 7 records
+2. US | Direct | Core | 1      7 → 7 records
+3. US | Direct | Core | 0      7 → 7 records
+...
+```
+
+## Design Principles
+
+FactorLens follows a few simple design rules:
+
+- **Math-first, AI-second** – deterministic factor attribution produces the artifacts, AI only explains them.
+- **CLI-first workflows** – designed to run locally, in scripts, or inside pipelines.
+- **Structured outputs** – results can be exported as Markdown, JSON, or HTML for humans and automation.
+- **Composable commands** – analysis, comparison, and explanation steps can be combined in workflows.
 
 ## What It Looks Like
 
