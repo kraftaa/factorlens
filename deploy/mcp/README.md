@@ -39,8 +39,9 @@ Shared endpoint:
 ## 2) Deploy to Kubernetes
 
 1. Update image in `deploy/mcp/k8s/deployment.yaml`.
-2. Update namespace/PVC names to your cluster values.
-3. Apply manifests:
+2. Set `serviceAccountName` in `deploy/mcp/k8s/deployment.yaml` to your IRSA/workload-identity service account (required for Bedrock from MCP pod).
+3. Update namespace/storage names to your cluster values.
+4. Apply manifests:
 
 ```bash
 kubectl apply -f deploy/mcp/k8s/configmap.yaml

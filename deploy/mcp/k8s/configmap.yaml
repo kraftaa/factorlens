@@ -9,6 +9,8 @@ data:
   FASTMCP_PORT: "8000"
   FASTMCP_STREAMABLE_HTTP_PATH: "/mcp"
   FACTORLENS_CMD_TIMEOUT_SEC: "300"
-  FACTORLENS_ALLOWED_READ_DIRS: "/data,/profiles,/artifacts"
+  FACTORLENS_ALLOWED_READ_DIRS: "/data,/profiles,/artifacts,/certs"
   FACTORLENS_ALLOWED_WRITE_DIRS: "/artifacts"
+  FASTMCP_STATELESS_HTTP: "true"
   AWS_REGION: "eu-central-1"
+

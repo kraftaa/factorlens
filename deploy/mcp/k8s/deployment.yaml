@@ -6,7 +6,7 @@ metadata:
   labels:
     app: factorlens-mcp
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: factorlens-mcp
@@ -15,6 +15,8 @@ spec:
       labels:
         app: factorlens-mcp
     spec:
+      # Set to your IRSA/workload-identity enabled service account for Bedrock access.
+      serviceAccountName: factorlens-mcp-sa
       containers:
       - name: factorlens-mcp
         image: ghcr.io/kraftaa/factorlens-mcp:latest
@@ -40,6 +42,9 @@ spec:
           readOnly: true
         - name: artifacts
           mountPath: /artifacts
+        - name: db-ca
+          mountPath: /certs
+          readOnly: true
         readinessProbe:
           tcpSocket:
             port: http
@@ -59,11 +64,12 @@ spec:
             memory: "2Gi"
       volumes:
       - name: data
-        persistentVolumeClaim:
-          claimName: factorlens-data-pvc
+        emptyDir: {}
       - name: profiles
-        persistentVolumeClaim:
-          claimName: factorlens-profiles-pvc
+        emptyDir: {}
       - name: artifacts
-        persistentVolumeClaim:
-          claimName: factorlens-artifacts-pvc
+        emptyDir: {}
+      - name: db-ca
+        secret:
+          secretName: factorlens-db-ca
+          optional: true

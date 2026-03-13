@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir mcp
+RUN pip install --no-cache-dir mcp awscli
 
 COPY --from=builder /src/target/release/factorlens /app/bin/factorlens
 COPY scripts/mcp/factorlens_mcp_server.py /app/factorlens_mcp_server.py
