@@ -73,6 +73,7 @@ enum Commands {
         out: PathBuf,
     },
     Analyze(AnalyzeArgs),
+    AnalyzeValidate(AnalyzeArgs),
     AnalyzeSuggest(AnalyzeSuggestArgs),
     AnalyzeCompare(AnalyzeCompareArgs),
 }
@@ -505,6 +506,9 @@ fn main() -> Result<()> {
         Commands::Analyze(args) => {
             run_analyze(args)?;
         }
+        Commands::AnalyzeValidate(args) => {
+            run_analyze_validate(args)?;
+        }
         Commands::AnalyzeSuggest(args) => {
             run_analyze_suggest(args)?;
         }
@@ -634,6 +638,133 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    Ok(())
+}
+
+fn run_analyze_validate(args: AnalyzeArgs) -> Result<()> {
+    let args = apply_analyze_profile(args)?;
+    let (input_path, _temp_path) = materialize_analyze_input(&args)?;
+    let mut rdr = csv::Reader::from_path(&input_path)?;
+    let headers = rdr.headers()?.clone();
+
+    let resolved_groups = if args.group_by.is_empty() {
+        auto_detect_groups(&headers, &input_path, args.auto_group_k)?
+    } else {
+        args.group_by
+            .iter()
+            .map(|g| resolve_group_name(g, &headers))
+            .collect::<Result<Vec<_>>>()?
+    };
+    if resolved_groups.is_empty() {
+        return Err(anyhow!("no grouping columns selected or detected"));
+    }
+
+    let metric_cols = if args.count_only {
+        Vec::new()
+    } else if args.metrics.is_empty() {
+        auto_detect_numeric_metrics(&input_path, &headers, &resolved_groups, 3)?
+    } else {
+        args.metrics
+            .iter()
+            .map(|m| {
+                headers
+                    .iter()
+                    .position(|h| h == m)
+                    .map(|idx| (m.to_string(), idx))
+                    .ok_or_else(|| anyhow!("metric column '{}' not found", m))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    if args.count_only {
+        if let Some(rb) = args.rank_by.as_deref() {
+            if rb != "count" {
+                return Err(anyhow!(
+                    "--count-only supports ranking by count only; remove --rank-by or use --rank-by count"
+                ));
+            }
+        }
+    } else if let Some(rb) = args.rank_by.as_deref() {
+        let rank_metric = metric_cols
+            .iter()
+            .find(|(m, _)| m == rb)
+            .map(|(m, _)| m.clone());
+        if rank_metric.is_none() {
+            return Err(anyhow!(
+                "rank metric '{}' not found. Available metrics: {}",
+                rb,
+                metric_cols
+                    .iter()
+                    .map(|(m, _)| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    let _group_idxs = resolved_groups
+        .iter()
+        .map(|g| {
+            headers
+                .iter()
+                .position(|h| h == g)
+                .ok_or_else(|| anyhow!("group column not found: {}", g))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let where_filters = parse_where_filters(&args.r#where, &headers)?;
+    for raw in &args.alert_rule {
+        let _ = parse_alert_rule(raw)?;
+    }
+
+    println!("Analyze validation: OK");
+    println!("- Input: {}", input_path.display());
+    println!("- Profile: {}", args.profile.as_deref().unwrap_or("(none)"));
+    println!("- Groups: {}", resolved_groups.join(", "));
+    if args.count_only {
+        println!("- Metrics: disabled via --count-only");
+    } else if metric_cols.is_empty() {
+        println!("- Metrics: none detected");
+    } else {
+        println!(
+            "- Metrics: {}",
+            metric_cols
+                .iter()
+                .map(|(m, _)| m.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "- Rank by: {}",
+        args.rank_by.as_deref().unwrap_or("count/default")
+    );
+    println!("- Aggregation: {}", args.agg.label());
+    if args.percentiles.is_empty() {
+        println!("- Percentiles: none");
+    } else {
+        println!(
+            "- Percentiles: {}",
+            args.percentiles
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "- Filters: {}",
+        if where_filters.is_empty() {
+            "none".to_string()
+        } else {
+            where_filters
+                .iter()
+                .map(|(c, _, v)| format!("{}={}", c, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    println!("- Alert rules: {}", args.alert_rule.len());
+    println!("- Headers detected: {}", headers.len());
     Ok(())
 }
 

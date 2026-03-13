@@ -55,9 +55,12 @@ FactorLens follows a few simple design rules:
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
   --group-by region,product_line,channel \
-  --metrics revenue_usd \
-  --out artifacts/analysis.md
+  --metrics revenue_usd
 ```
+
+Default output paths:
+- `artifacts/<input_stem>.md`
+- `artifacts/<input_stem>.json` (when output format includes JSON)
 
 Example report excerpt:
 
@@ -94,28 +97,24 @@ factorlens analyze \
   --input data/factorlens_demo_sales_100.csv \
   --group-by region,channel,product_line,plan_tier \
   --metrics revenue_usd,cost_usd,orders \
-  --rank-by revenue_usd \
-  --out artifacts/demo_sales_100.md
+  --rank-by revenue_usd
 
 # 2) new snapshot (150 rows)
 factorlens analyze \
   --input data/factorlens_demo_sales_150.csv \
   --group-by region,channel,product_line,plan_tier \
   --metrics revenue_usd,cost_usd,orders \
-  --rank-by revenue_usd \
-  --out artifacts/demo_sales_150.md
+  --rank-by revenue_usd
 
 # 3) compare + explain
 factorlens analyze-compare \
   --base artifacts/demo_sales_100.json \
-  --new artifacts/demo_sales_150.json \
-  --output-format html \
-  --out artifacts/demo_compare.html
+  --new artifacts/demo_sales_150.json
 
 factorlens explain-analyze \
   --backend bedrock \
   --model anthropic.claude-3-haiku-20240307-v1:0 \
-  --analysis-json artifacts/demo_sales_150.json \
+  --analysis-json artifacts/analysis_compare.json \
   --question "What are the top concentration risks and what 3 actions should we take in the next 30 days?"
 ```
 
@@ -383,30 +382,26 @@ Analyze any CSV table by grouping columns and numeric metrics you choose:
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
   --group-by region,product_line,channel \
-  --out artifacts/analysis.md
+  --metrics revenue_usd
 
 # profile-based quick starts
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
-  --profile exec \
-  --out artifacts/analysis_exec.md
+  --profile exec
 
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
-  --profile segment \
-  --out artifacts/analysis_segment.md
+  --profile segment
 
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
-  --profile supplier \
-  --out artifacts/analysis_supplier.md
+  --profile supplier
 
 # custom profile config (recommended for private/domain fields)
 cargo run -p factor_cli -- analyze \
   --input data/your_file.csv \
   --profile exec_custom \
-  --profile-config profiles/profiles.example.toml \
-  --out artifacts/analysis.md
+  --profile-config profiles/profiles.example.toml
 
 # filtered + ranked view
 cargo run -p factor_cli -- analyze \
@@ -418,8 +413,7 @@ cargo run -p factor_cli -- analyze \
   --alert-top5-share 60 \
   --alert-blank-share 10 \
   --top 10 \
-  --min-records 20 \
-  --out artifacts/analysis_filtered_ranked.md
+  --min-records 20
 
 # text normalization for name/title grouping + JSON-only output
 cargo run -p factor_cli -- analyze \
@@ -428,16 +422,14 @@ cargo run -p factor_cli -- analyze \
   --metrics revenue_usd \
   --normalize-text-groups \
   --word-freq \
-  --output-format html \
-  --out artifacts/analysis_title.html
+  --output-format html
 ```
 
 Auto-detect useful grouping columns (if `--group-by` is omitted):
 
 ```bash
 cargo run -p factor_cli -- analyze \
-  --input data/your_file.csv \
-  --out artifacts/analysis_auto.md
+  --input data/your_file.csv
 ```
 
 ## Analyze Compare
@@ -450,47 +442,45 @@ cargo run -p factor_cli -- analyze \
   --input data/your_file_a.csv \
   --group-by region,channel,product_line \
   --metrics revenue_usd,cost_usd,orders \
-  --rank-by revenue_usd \
-  --out artifacts/analysis_a.md
+  --rank-by revenue_usd
 
 # new snapshot
 cargo run -p factor_cli -- analyze \
   --input data/your_file_b.csv \
   --group-by region,channel,product_line \
   --metrics revenue_usd,cost_usd,orders \
-  --rank-by revenue_usd \
-  --out artifacts/analysis_b.md
+  --rank-by revenue_usd
 
-# compare (markdown)
+# compare (default: both markdown + json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/analysis_a.json \
-  --new artifacts/analysis_b.json \
-  --out artifacts/compare.md
+  --base artifacts/your_file_a.json \
+  --new artifacts/your_file_b.json
 
 # compare (html)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/analysis_a.json \
-  --new artifacts/analysis_b.json \
+  --base artifacts/your_file_a.json \
+  --new artifacts/your_file_b.json \
   --output-format html \
   --out artifacts/compare.html
 
 # compare (json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/analysis_a.json \
-  --new artifacts/analysis_b.json \
+  --base artifacts/your_file_a.json \
+  --new artifacts/your_file_b.json \
   --output-format json \
   --out artifacts/compare.json
 
 # compare (both markdown + json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/analysis_a.json \
-  --new artifacts/analysis_b.json \
+  --base artifacts/your_file_a.json \
+  --new artifacts/your_file_b.json \
   --output-format both \
   --out artifacts/compare.md
 ```
 
 Notes:
-- `analyze` outputs `<out>.json` by default (`--output-format both`).
+- `analyze` defaults to `artifacts/<input_stem>.md` + `.json` (`--output-format both`).
+- `analyze-compare` defaults to `artifacts/analysis_compare.md` + `.json` (`--output-format both`).
 - `analyze-compare` supports `--output-format md|html|json|both`.
 - `--top-movers` controls how many largest movers are shown (default: `10`).
 

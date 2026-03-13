@@ -328,6 +328,151 @@ def analyze_query(
 
 
 @mcp.tool()
+def analyze_validate_csv(
+    input_csv: str,
+    profile: str | None = None,
+    profile_config: str | None = None,
+    group_by_csv: str | None = None,
+    metrics_csv: str | None = None,
+    where_csv: str | None = None,
+    rank_by: str | None = None,
+    agg: str = "sum",
+    percentiles_csv: str | None = None,
+    min_records: int = 1,
+    top: int = 20,
+    count_only: bool = False,
+    normalize_text_groups: bool = False,
+    word_freq: bool = False,
+    alert_rule_csv: str | None = None,
+    timeout_sec: int | None = None,
+) -> str:
+    if agg not in {"sum", "mean", "median"}:
+        raise ValueError("agg must be one of: sum, mean, median")
+    if min_records < 1:
+        raise ValueError("min_records must be >= 1")
+    if top < 1:
+        raise ValueError("top must be >= 1")
+
+    in_path = _validate_read_path(input_csv, "input_csv")
+
+    cmd = [
+        "analyze-validate",
+        "--input",
+        str(in_path),
+        "--agg",
+        agg,
+        "--min-records",
+        str(min_records),
+        "--top",
+        str(top),
+    ]
+
+    _append_optional(cmd, "--profile", profile)
+    if profile_config:
+        cfg = _validate_read_path(profile_config, "profile_config")
+        cmd.extend(["--profile-config", str(cfg)])
+    _append_optional(cmd, "--group-by", group_by_csv)
+    _append_optional(cmd, "--metrics", metrics_csv)
+    _append_optional(cmd, "--where", where_csv)
+    _append_optional(cmd, "--rank-by", rank_by)
+    _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_optional(cmd, "--alert-rule", alert_rule_csv)
+
+    if count_only:
+        cmd.append("--count-only")
+    if normalize_text_groups:
+        cmd.append("--normalize-text-groups")
+    if word_freq:
+        cmd.append("--word-freq")
+
+    return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
+def analyze_validate_query(
+    query: str | None = None,
+    query_file: str | None = None,
+    postgres_url: str | None = None,
+    postgres_ssl_mode: str = "prefer",
+    postgres_ca_file: str | None = None,
+    profile: str | None = None,
+    profile_config: str | None = None,
+    group_by_csv: str | None = None,
+    metrics_csv: str | None = None,
+    where_csv: str | None = None,
+    rank_by: str | None = None,
+    agg: str = "sum",
+    percentiles_csv: str | None = None,
+    min_records: int = 1,
+    top: int = 20,
+    count_only: bool = False,
+    normalize_text_groups: bool = False,
+    word_freq: bool = False,
+    alert_rule_csv: str | None = None,
+    timeout_sec: int | None = None,
+) -> str:
+    if agg not in {"sum", "mean", "median"}:
+        raise ValueError("agg must be one of: sum, mean, median")
+    if min_records < 1:
+        raise ValueError("min_records must be >= 1")
+    if top < 1:
+        raise ValueError("top must be >= 1")
+    if postgres_ssl_mode not in VALID_POSTGRES_SSL_MODES:
+        raise ValueError(
+            f"postgres_ssl_mode must be one of {sorted(VALID_POSTGRES_SSL_MODES)}"
+        )
+    if bool(query) == bool(query_file):
+        raise ValueError("provide exactly one of query or query_file")
+
+    query_file_path: Path | None = None
+    if query_file:
+        query_file_path = _validate_read_path(query_file, "query_file")
+    ca_file_path: Path | None = None
+    if postgres_ca_file:
+        ca_file_path = _validate_read_path(postgres_ca_file, "postgres_ca_file")
+
+    cmd = [
+        "analyze-validate",
+        "--agg",
+        agg,
+        "--min-records",
+        str(min_records),
+        "--top",
+        str(top),
+        "--postgres-ssl-mode",
+        postgres_ssl_mode,
+    ]
+
+    _append_optional(cmd, "--postgres-url", postgres_url)
+    if query:
+        cmd.extend(["--query", query])
+    if query_file_path:
+        cmd.extend(["--query-file", str(query_file_path)])
+    if ca_file_path:
+        cmd.extend(["--postgres-ca-file", str(ca_file_path)])
+
+    _append_optional(cmd, "--profile", profile)
+    if profile_config:
+        cfg = _validate_read_path(profile_config, "profile_config")
+        cmd.extend(["--profile-config", str(cfg)])
+    _append_optional(cmd, "--group-by", group_by_csv)
+    _append_optional(cmd, "--metrics", metrics_csv)
+    _append_optional(cmd, "--where", where_csv)
+    _append_optional(cmd, "--rank-by", rank_by)
+    _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_optional(cmd, "--alert-rule", alert_rule_csv)
+
+    if count_only:
+        cmd.append("--count-only")
+    if normalize_text_groups:
+        cmd.append("--normalize-text-groups")
+    if word_freq:
+        cmd.append("--word-freq")
+
+    return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
 def analyze_compare(
     base_json: str,
     new_json: str,

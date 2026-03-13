@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   build-and-push:
@@ -49,5 +50,41 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Configure AWS credentials (OIDC for ECR)
+        if: ${{ vars.AWS_REGION != '' && vars.ECR_REPOSITORY != '' && secrets.AWS_ROLE_TO_ASSUME != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: ${{ vars.AWS_REGION != '' && vars.ECR_REPOSITORY != '' && secrets.AWS_ROLE_TO_ASSUME != '' }}
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker metadata (ECR)
+        if: ${{ vars.AWS_REGION != '' && vars.ECR_REPOSITORY != '' && secrets.AWS_ROLE_TO_ASSUME != '' }}
+        id: meta-ecr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (ECR)
+        if: ${{ vars.AWS_REGION != '' && vars.ECR_REPOSITORY != '' && secrets.AWS_ROLE_TO_ASSUME != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/mcp/docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta-ecr.outputs.tags }}
+          labels: ${{ steps.meta-ecr.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
