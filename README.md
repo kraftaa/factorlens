@@ -13,9 +13,15 @@ FactorLens follows a math-first, AI-second approach: deterministic analytics pro
 Given a dataset with sales metrics:
 
 ```bash
-factorlens analyze data/sales_100.csv
-factorlens analyze-compare data/sales_100.csv data/sales_150.csv
-factorlens explain-analyze
+factorlens analyze --input data/sales_100.csv
+factorlens analyze --input data/sales_150.csv
+factorlens analyze-compare  --base artifacts/sales_100.json --new artifacts/sales_150.json
+# Then generate an executive explanation from the compare artifacts:
+factorlens explain-analyze \
+  --backend bedrock \  
+  --analysis-json artifacts/analysis_compare.json \
+  --model anthropic.claude-3-sonnet-20240229-v1:0 \
+  --question "What are the main drivers of revenue concentration?"
 ```
 
 #### Example output  (truncated):

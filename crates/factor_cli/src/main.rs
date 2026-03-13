@@ -182,7 +182,7 @@ struct AnalyzeCompareArgs {
     new: PathBuf,
     #[arg(long, default_value_t = 10)]
     top_movers: usize,
-    #[arg(long, value_enum, default_value = "md")]
+    #[arg(long, value_enum, default_value = "both")]
     output_format: CompareOutputFormat,
     #[arg(long)]
     out: Option<PathBuf>,
