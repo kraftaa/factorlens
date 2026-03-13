@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: factorlens-mcp
-        image: ghcr.io/your-org/factorlens-mcp:latest
+        image: ghcr.io/kraftaa/factorlens-mcp:latest
         imagePullPolicy: IfNotPresent
         ports:
         - name: http
@@ -41,14 +41,12 @@ spec:
         - name: artifacts
           mountPath: /artifacts
         readinessProbe:
-          httpGet:
-            path: /mcp
+          tcpSocket:
             port: http
           initialDelaySeconds: 5
           periodSeconds: 10
         livenessProbe:
-          httpGet:
-            path: /mcp
+          tcpSocket:
             port: http
           initialDelaySeconds: 15
           periodSeconds: 20

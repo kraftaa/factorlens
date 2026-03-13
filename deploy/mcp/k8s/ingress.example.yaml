@@ -8,12 +8,15 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
 spec:
+  # Optional: only needed when clients are outside the cluster.
+  # For in-cluster clients, use Service DNS directly:
+  # http://factorlens-mcp.analytics.svc.cluster.local/mcp
   tls:
   - hosts:
-    - factorlens-mcp.internal.example.com
+    - mcp.your-internal-domain.example
     secretName: factorlens-mcp-tls
   rules:
-  - host: factorlens-mcp.internal.example.com
+  - host: mcp.your-internal-domain.example
     http:
       paths:
       - path: /mcp

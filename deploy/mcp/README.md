@@ -47,13 +47,17 @@ kubectl apply -f deploy/mcp/k8s/configmap.yaml
 kubectl apply -f deploy/mcp/k8s/secret.example.yaml
 kubectl apply -f deploy/mcp/k8s/deployment.yaml
 kubectl apply -f deploy/mcp/k8s/service.yaml
-# optional external/internal ingress
-kubectl apply -f deploy/mcp/k8s/ingress.example.yaml
 ```
 
 Service endpoint inside cluster:
 
 - `http://factorlens-mcp.analytics.svc.cluster.local/mcp`
+
+Ingress:
+
+- Not required for in-cluster clients.
+- Use ingress only if clients are outside the cluster/VPC.
+- If needed, use `deploy/mcp/k8s/ingress.example.yaml` with a real DNS host and TLS secret.
 
 ## 3) Multi-Agent Access (Gateway Pattern)
 
