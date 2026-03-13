@@ -25,7 +25,27 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("factorlens")
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got: {raw}") from exc
+
+
+mcp = FastMCP(
+    "factorlens",
+    host=os.getenv("FASTMCP_HOST", "127.0.0.1"),
+    port=_env_int("FASTMCP_PORT", 8000),
+    mount_path=os.getenv("FASTMCP_MOUNT_PATH", "/"),
+    sse_path=os.getenv("FASTMCP_SSE_PATH", "/sse"),
+    message_path=os.getenv("FASTMCP_MESSAGE_PATH", "/messages/"),
+    streamable_http_path=os.getenv("FASTMCP_STREAMABLE_HTTP_PATH", "/mcp"),
+    log_level=os.getenv("FASTMCP_LOG_LEVEL", "INFO").upper(),
+)
 
 
 VALID_OUTPUT_FORMATS = {"md", "json", "both", "html"}
@@ -384,6 +404,16 @@ if __name__ == "__main__":
     if transport not in {"stdio", "sse", "streamable-http"}:
         raise RuntimeError(
             "MCP_TRANSPORT must be one of: stdio, sse, streamable-http"
+        )
+    if transport == "streamable-http":
+        print(
+            "Starting streamable-http MCP on "
+            f"http://{mcp.settings.host}:{mcp.settings.port}{mcp.settings.streamable_http_path}"
+        )
+    elif transport == "sse":
+        print(
+            "Starting sse MCP on "
+            f"http://{mcp.settings.host}:{mcp.settings.port}"
         )
     if transport == "sse":
         mcp.run("sse", mount_path=os.getenv("MCP_MOUNT_PATH"))

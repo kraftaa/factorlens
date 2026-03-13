@@ -169,7 +169,7 @@ struct AnalyzeArgs {
     #[arg(long, value_delimiter = ',')]
     alert_rule: Vec<String>,
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "both")]
     output_format: OutputFormat,
 }
@@ -185,7 +185,7 @@ struct AnalyzeCompareArgs {
     #[arg(long, value_enum, default_value = "md")]
     output_format: CompareOutputFormat,
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -575,6 +575,11 @@ fn deterministic_answer(
 
 fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     let args = apply_analyze_profile(args)?;
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_analyze_out(&args));
+    ensure_parent_dir(&out_path)?;
     let (input_path, _temp_path) = materialize_analyze_input(&args)?;
     let report = analyze_table_csv(
         &input_path,
@@ -600,24 +605,24 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     )?;
     match args.output_format {
         OutputFormat::Md => {
-            fs::write(&args.out, report.markdown)?;
-            println!("Analysis (markdown) written to {}", args.out.display());
+            fs::write(&out_path, report.markdown)?;
+            println!("Analysis (markdown) written to {}", out_path.display());
         }
         OutputFormat::Json => {
-            fs::write(&args.out, serde_json::to_string_pretty(&report.json)?)?;
-            println!("Analysis (json) written to {}", args.out.display());
+            fs::write(&out_path, serde_json::to_string_pretty(&report.json)?)?;
+            println!("Analysis (json) written to {}", out_path.display());
         }
         OutputFormat::Both => {
-            fs::write(&args.out, report.markdown)?;
-            let json_path = args.out.with_extension("json");
+            fs::write(&out_path, report.markdown)?;
+            let json_path = out_path.with_extension("json");
             fs::write(&json_path, serde_json::to_string_pretty(&report.json)?)?;
-            println!("Analysis written to {}", args.out.display());
+            println!("Analysis written to {}", out_path.display());
             println!("Analysis JSON written to {}", json_path.display());
         }
         OutputFormat::Html => {
             let html = markdown_to_html(&report.markdown);
-            fs::write(&args.out, html)?;
-            println!("Analysis (html) written to {}", args.out.display());
+            fs::write(&out_path, html)?;
+            println!("Analysis (html) written to {}", out_path.display());
         }
     }
     println!(
@@ -629,6 +634,32 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    Ok(())
+}
+
+fn default_analyze_out(args: &AnalyzeArgs) -> PathBuf {
+    let base_stem = args
+        .input
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "analysis".to_string());
+    let base = PathBuf::from("artifacts").join(base_stem);
+
+    match args.output_format {
+        OutputFormat::Md | OutputFormat::Both => base.with_extension("md"),
+        OutputFormat::Json => base.with_extension("json"),
+        OutputFormat::Html => base.with_extension("html"),
+    }
+}
+
+fn ensure_parent_dir(path: &PathBuf) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     Ok(())
 }
 
@@ -1041,6 +1072,12 @@ fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf
 }
 
 fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_analyze_compare_out(args.output_format));
+    ensure_parent_dir(&out_path)?;
+
     let base_txt = fs::read_to_string(&args.base)
         .map_err(|e| anyhow!("failed to read base json '{}': {}", args.base.display(), e))?;
     let new_txt = fs::read_to_string(&args.new)
@@ -1179,26 +1216,36 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
 
     match args.output_format {
         CompareOutputFormat::Md => {
-            fs::write(&args.out, md)?;
-            println!("Comparison report (markdown) written to {}", args.out.display());
+            fs::write(&out_path, md)?;
+            println!("Comparison report (markdown) written to {}", out_path.display());
         }
         CompareOutputFormat::Html => {
-            fs::write(&args.out, markdown_to_html(&md))?;
-            println!("Comparison report (html) written to {}", args.out.display());
+            fs::write(&out_path, markdown_to_html(&md))?;
+            println!("Comparison report (html) written to {}", out_path.display());
         }
         CompareOutputFormat::Json => {
-            fs::write(&args.out, serde_json::to_string_pretty(&json_out)?)?;
-            println!("Comparison report (json) written to {}", args.out.display());
+            fs::write(&out_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!("Comparison report (json) written to {}", out_path.display());
         }
         CompareOutputFormat::Both => {
-            fs::write(&args.out, md)?;
-            let json_path = args.out.with_extension("json");
+            fs::write(&out_path, md)?;
+            let json_path = out_path.with_extension("json");
             fs::write(&json_path, serde_json::to_string_pretty(&json_out)?)?;
-            println!("Comparison report (markdown) written to {}", args.out.display());
+            println!("Comparison report (markdown) written to {}", out_path.display());
             println!("Comparison report (json) written to {}", json_path.display());
         }
     }
     Ok(())
+}
+
+fn default_analyze_compare_out(format: CompareOutputFormat) -> PathBuf {
+    match format {
+        CompareOutputFormat::Md | CompareOutputFormat::Both => {
+            PathBuf::from("artifacts/analysis_compare.md")
+        }
+        CompareOutputFormat::Html => PathBuf::from("artifacts/analysis_compare.html"),
+        CompareOutputFormat::Json => PathBuf::from("artifacts/analysis_compare.json"),
+    }
 }
 
 fn groups_to_map(v: &serde_json::Value, primary_metric: &str) -> HashMap<String, (u64, f64, f64)> {
