@@ -328,7 +328,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "factor_cli"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "factor_core"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "factor_io"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "llm_local"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "report"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "factor_io",
