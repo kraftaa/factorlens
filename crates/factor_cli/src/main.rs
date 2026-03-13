@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Parser)]
 #[command(name = "factorlens")]
 #[command(about = "Local factor attribution + explainability CLI")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
