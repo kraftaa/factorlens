@@ -1,41 +1,100 @@
 # FactorLens
 
-A Rust CLI for deterministic factor attribution and analytics workflows, with optional AI-generated explanations.
+FactorLens is a Rust CLI that explains **why metrics changed**.
 
-FactorLens explains why metrics change by decomposing results into factor contributions and producing structured analysis artifacts.
-FactorLens follows a math-first, AI-second approach: deterministic analytics produce the artifacts, and the LLM layer interprets them.
+Dashboards show that metrics moved. FactorLens decomposes those changes into driver contributions using deterministic math, then optionally generates narrative explanations.
+
+Typical flow:
+
+`metric change -> driver contributions -> closure check -> residual segments`
 
 [![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
 [![GHCR](https://img.shields.io/badge/ghcr-factorlens--mcp-blue)](https://github.com/kraftaa/factorlens/pkgs/container/factorlens-mcp)
 
-## Quick Example
-
-Given a dataset with sales metrics:
+## Example
 
 ```bash
-factorlens analyze --input data/demo_revenue.csv --group-by region,channel --metrics revenue_usd,traffic,conversion_rate,avg_price_usd --rank-by revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens analyze-investigate --input data/demo_revenue.csv --metric revenue_usd --driver-preset amount --dedup-drivers false --driver-contrib percent --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens explain-analyze \
-  --backend bedrock \
-  --analysis-json artifacts/analyze_demo_revenue.json \
-  --model anthropic.claude-3-sonnet-20240229-v1:0 \
-  --question "What are the main drivers of revenue concentration?"
+factorlens analyze-drivers \
+  --input data/demo_revenue_residual.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
 ```
 
-#### Example output  (truncated):
+Output:
 
 ```text
-Executive Delta
+revenue_usd change: -16.4%
 
-- Top-5 concentration changed from 100.0% to 100.0% (+0.0 pp).
-- Segment count changed from 3 to 3 (+0).
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
 
-Top Concentration Changes
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 1.18% across 56 rows
 
-1. `APAC | Marketplace`   6 -> 9 records (+10.7 pp)
-2. `US | Direct`   12 -> 9 records (-10.7 pp)
-3. `EU | Partner`   10 -> 10 records (+0.0 pp)
+Driver contributions
+- orders: -15.9%
+- avg_price_usd: -2.0%
+
+Closure check
+- explained: -17.9%
+- residual: +1.5% (+77,765.73)
+
+Residual segments
+- campaign = spring_launch: mean residual +5,151.67 (16 rows)
+- channel = Marketplace: mean residual +5,151.67 (16 rows)
+- device_type = mobile: mean residual +5,151.67 (16 rows)
 ```
+
+## Real Use Cases
+
+- Revenue debugging: decompose changes into orders, price, or mix effects.
+- Growth analytics: explain movement in conversion, CAC, or AOV.
+- Data pipeline sanity checks: large residuals often reveal joins, missing data, or definition drift.
+- CI metric monitoring: run FactorLens in pipelines to catch unusual metric behavior.
+
+## Quick Start
+
+```bash
+factorlens analyze \
+  --input data/demo_revenue.csv \
+  --group-by region,channel \
+  --metrics revenue_usd,traffic,conversion_rate,avg_price_usd \
+  --rank-by revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+
+factorlens analyze-drivers \
+  --input data/demo_revenue.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+```
+
+## Workflow
+
+Typical workflow:
+
+- `analyze` - explore segments and concentration.
+- `analyze-drivers` - explain metric changes automatically.
+- `analyze-compare` - compare two snapshots.
+- `explain-analyze` - add optional narrative explanation.
+
+| Command | Purpose |
+|---|---|
+| `analyze` | factor/segment attribution from CSV or Postgres |
+| `analyze-investigate` | metric change decomposition into top driver contributions |
+| `analyze-drivers` | automatic metric identity detection and driver decomposition |
+| `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
+| `analyze-compare` | snapshot delta analysis (biggest movers) |
+| `explain-analyze` | executive narrative and actions from computed JSON |
+| `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
 
 ## Design Principles
 
@@ -46,48 +105,7 @@ FactorLens follows a few simple design rules:
 - **Structured outputs** – results can be exported as Markdown, JSON, or HTML for humans and automation.
 - **Composable commands** – analysis, comparison, and explanation steps can be combined in workflows.
 
-## What It Looks Like
-
-```bash
-cargo run -p factor_cli -- analyze \
-  --input data/your_file.csv \
-  --group-by region,product_line,channel \
-  --metrics revenue_usd
-```
-
-Default output paths:
-- `artifacts/<input_stem>.md`
-- `artifacts/<input_stem>.json` (when output format includes JSON)
-
-Example report excerpt:
-
-```text
-## Executive Summary
-
-- Largest segment is `US | Core | Direct` with 28.4% of records and 32.1% of total revenue_usd.
-- Top 5 segments represent 61.5% of records and 67.9% of revenue_usd.
-```
-
-AI layer on top:
-
-```text
-Summary:
-Growth is concentrated in US direct channel performance, while product-line mix
-is creating downside concentration risk in a small number of segments.
-```
-
-## Workflow
-
-| Command | Purpose |
-|---|---|
-| `analyze` | factor/segment attribution from CSV or Postgres |
-| `analyze-investigate` | metric change decomposition into top driver contributions |
-| `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
-| `analyze-compare` | snapshot delta analysis (biggest movers) |
-| `explain-analyze` | executive narrative and actions from computed JSON |
-| `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
-
-## 2-Minute Quickstart
+## Demo Workflow
 
 ```bash
 # 1) baseline snapshot (100 rows)
@@ -545,6 +563,121 @@ Notes:
 - Driver contribution view: `--driver-contrib percent|amount|both`.
 - Manual driver expressions: `sum(col)`, `avg(col)`, `count(col)`, `count(*)`, `count_distinct(col)`.
 - `analyze` answers “which segments changed?” while `analyze-investigate` answers “what drove the metric change?”.
+- `analyze-investigate` reports `decomposition_mode`: `regression` when numeric drivers support a fitted model, otherwise `heuristic`.
+- Demo commands use `--anchor-date 2026-04-15` so `--period last --time-grain month` resolves to March 2026 vs February 2026 regardless of today’s date.
+
+Example output:
+
+```text
+revenue_usd change: -16.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Decomposition mode: regression
+
+Driver contributions
+- sum(orders): -13.0% | delta=-696191.18
+- sum(traffic): -2.2% | delta=-116243.57
+- avg(avg_price_usd): -1.1% | delta=-61590.98
+
+Closure check
+- explained: -16.3% (99%)
+- residual: -0.1% (-6,146.70)
+```
+
+## Analyze Drivers
+
+Use `analyze-drivers` when you want FactorLens to infer the metric identity automatically instead of passing drivers.
+
+```bash
+# one-file period compare
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/demo_revenue.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+
+# two-file compare
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/day1.csv \
+  --input-new data/day2.csv \
+  --metric revenue_usd
+```
+
+Example output:
+
+```text
+revenue_usd change: -14.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 0.00% across 56 rows
+
+Driver contributions
+- orders: -11.3%
+- avg_price_usd: -3.2%
+
+Closure check
+- explained: -14.5% (100%)
+- residual: +0.1% (+5,970.47)
+
+Artifacts written
+- artifacts/drivers_demo_revenue.md
+- artifacts/drivers_demo_revenue.json
+```
+
+Residual demo:
+
+```bash
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/demo_revenue_residual.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+```
+
+```text
+revenue_usd change: -16.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 1.18% across 56 rows
+
+Driver contributions
+- orders: -15.9%
+- avg_price_usd: -2.0%
+
+Closure check
+- explained: -17.9% (109%)
+- residual: +1.5% (+77,765.73)
+
+Residual segments
+- campaign = spring_launch: mean residual +5,151.67 (16 rows)
+- channel = Marketplace: mean residual +5,151.67 (16 rows)
+- device_type = mobile: mean residual +5,151.67 (16 rows)
+
+Artifacts written
+- artifacts/drivers_demo_revenue_residual.md
+- artifacts/drivers_demo_revenue_residual.json
+```
+
+Notes:
+- Current scope infers two-term identities only: `metric ~= a * b` or `metric ~= a / b`.
+- Residual is computed as observed metric change minus explained identity change.
+- Residual segments rank leftover numeric/categorical fields against row-level unexplained error.
+- `analyze-drivers` is always math-first; `analyze-investigate` may fall back to heuristic mode when only non-numeric/count-distinct drivers are available.
+- Demo commands use `--anchor-date 2026-04-15` so `--period last --time-grain month` resolves to March 2026 vs February 2026 regardless of today’s date.
+- Period mode uses one input file plus `--date-column` and period flags.
+- Two-file mode uses `--input` and `--input-new`.
+- Default output path is `artifacts/drivers_<input_stem>.md` + `.json`.
 
 Or analyze directly from Postgres:
 
