@@ -14,7 +14,8 @@ Given a dataset with sales metrics:
 
 ```bash
 factorlens analyze --input data/demo_revenue.csv --group-by region,channel --metrics revenue_usd,traffic,conversion_rate,avg_price_usd --rank-by revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens analyze-investigate --input data/demo_revenue.csv --metric revenue_usd --driver-preset amount --dedup-drivers false --driver-contrib percent --date-column date --time-grain month --period last --anchor-date 2026-04-15
+factorlens analyze-investigate --input data/demo_revenue_residual.csv --metric revenue_usd --driver-preset amount --dedup-drivers false --driver-contrib both --date-column date --time-grain month --period last --anchor-date 2026-04-15
+factorlens analyze-drivers --input data/demo_revenue.csv --metric revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
 factorlens explain-analyze \
   --backend bedrock \
   --analysis-json artifacts/analyze_demo_revenue.json \
@@ -25,16 +26,20 @@ factorlens explain-analyze \
 #### Example output  (truncated):
 
 ```text
-Executive Delta
+revenue_usd change: -16.4%
 
-- Top-5 concentration changed from 100.0% to 100.0% (+0.0 pp).
-- Segment count changed from 3 to 3 (+0).
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
 
-Top Concentration Changes
+Decomposition mode: regression
 
-1. `APAC | Marketplace`   6 -> 9 records (+10.7 pp)
-2. `US | Direct`   12 -> 9 records (-10.7 pp)
-3. `EU | Partner`   10 -> 10 records (+0.0 pp)
+Driver contributions
+- sum(orders): -13.0% | delta=-696191.18
+- sum(traffic): -2.2% | delta=-116243.57
+- avg(avg_price_usd): -1.1% | delta=-61590.98
+
+Closure check
+- explained: -16.3% (99%)
+- residual: -0.1% (-6,146.70)
 ```
 
 ## Design Principles
@@ -82,6 +87,7 @@ is creating downside concentration risk in a small number of segments.
 |---|---|
 | `analyze` | factor/segment attribution from CSV or Postgres |
 | `analyze-investigate` | metric change decomposition into top driver contributions |
+| `analyze-drivers` | automatic metric identity detection and driver decomposition |
 | `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
 | `analyze-compare` | snapshot delta analysis (biggest movers) |
 | `explain-analyze` | executive narrative and actions from computed JSON |
@@ -545,6 +551,121 @@ Notes:
 - Driver contribution view: `--driver-contrib percent|amount|both`.
 - Manual driver expressions: `sum(col)`, `avg(col)`, `count(col)`, `count(*)`, `count_distinct(col)`.
 - `analyze` answers “which segments changed?” while `analyze-investigate` answers “what drove the metric change?”.
+- `analyze-investigate` reports `decomposition_mode`: `regression` when numeric drivers support a fitted model, otherwise `heuristic`.
+- Demo commands use `--anchor-date 2026-04-15` so `--period last --time-grain month` resolves to March 2026 vs February 2026 regardless of today’s date.
+
+Example output:
+
+```text
+revenue_usd change: -16.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Decomposition mode: regression
+
+Driver contributions
+- sum(orders): -13.0% | delta=-696191.18
+- sum(traffic): -2.2% | delta=-116243.57
+- avg(avg_price_usd): -1.1% | delta=-61590.98
+
+Closure check
+- explained: -16.3% (99%)
+- residual: -0.1% (-6,146.70)
+```
+
+## Analyze Drivers
+
+Use `analyze-drivers` when you want FactorLens to infer the metric identity automatically instead of passing drivers.
+
+```bash
+# one-file period compare
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/demo_revenue.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+
+# two-file compare
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/day1.csv \
+  --input-new data/day2.csv \
+  --metric revenue_usd
+```
+
+Example output:
+
+```text
+revenue_usd change: -14.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 0.00% across 56 rows
+
+Driver contributions
+- orders: -11.3%
+- avg_price_usd: -3.2%
+
+Closure check
+- explained: -14.5% (100%)
+- residual: +0.1% (+5,970.47)
+
+Artifacts written
+- artifacts/drivers_demo_revenue.md
+- artifacts/drivers_demo_revenue.json
+```
+
+Residual demo:
+
+```bash
+cargo run -p factor_cli -- analyze-drivers \
+  --input data/demo_revenue_residual.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+```
+
+```text
+revenue_usd change: -16.4%
+
+Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
+
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 1.18% across 56 rows
+
+Driver contributions
+- orders: -15.9%
+- avg_price_usd: -2.0%
+
+Closure check
+- explained: -17.9% (109%)
+- residual: +1.5% (+77,765.73)
+
+Residual segments
+- campaign = spring_launch: mean residual +5,151.67 (16 rows)
+- channel = Marketplace: mean residual +5,151.67 (16 rows)
+- device_type = mobile: mean residual +5,151.67 (16 rows)
+
+Artifacts written
+- artifacts/drivers_demo_revenue_residual.md
+- artifacts/drivers_demo_revenue_residual.json
+```
+
+Notes:
+- Current scope infers two-term identities only: `metric ~= a * b` or `metric ~= a / b`.
+- Residual is computed as observed metric change minus explained identity change.
+- Residual segments rank leftover numeric/categorical fields against row-level unexplained error.
+- `analyze-drivers` is always math-first; `analyze-investigate` may fall back to heuristic mode when only non-numeric/count-distinct drivers are available.
+- Demo commands use `--anchor-date 2026-04-15` so `--period last --time-grain month` resolves to March 2026 vs February 2026 regardless of today’s date.
+- Period mode uses one input file plus `--date-column` and period flags.
+- Two-file mode uses `--input` and `--input-new`.
+- Default output path is `artifacts/drivers_<input_stem>.md` + `.json`.
 
 Or analyze directly from Postgres:
 
