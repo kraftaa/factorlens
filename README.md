@@ -13,13 +13,11 @@ FactorLens follows a math-first, AI-second approach: deterministic analytics pro
 Given a dataset with sales metrics:
 
 ```bash
-factorlens analyze --input data/sales_100.csv
-factorlens analyze --input data/sales_150.csv
-factorlens analyze-compare  --base artifacts/sales_100.json --new artifacts/sales_150.json
-# Then generate an executive explanation from the compare artifacts:
+factorlens analyze --input data/demo_revenue.csv --group-by region,channel --metrics revenue_usd,traffic,conversion_rate,avg_price_usd --rank-by revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
+factorlens analyze-investigate --input data/demo_revenue.csv --metric revenue_usd --driver-preset amount --dedup-drivers false --driver-contrib percent --date-column date --time-grain month --period last --anchor-date 2026-04-15
 factorlens explain-analyze \
-  --backend bedrock \  
-  --analysis-json artifacts/analysis_compare.json \
+  --backend bedrock \
+  --analysis-json artifacts/analyze_demo_revenue.json \
   --model anthropic.claude-3-sonnet-20240229-v1:0 \
   --question "What are the main drivers of revenue concentration?"
 ```
@@ -29,16 +27,15 @@ factorlens explain-analyze \
 ```text
 Executive Delta
 
-Top-5 concentration changed from 12.0% → 21.3% (+9.3 pp)
-Segment count changed from 62 → 60 (-2)
+- Top-5 concentration changed from 100.0% to 100.0% (+0.0 pp).
+- Segment count changed from 3 to 3 (+0).
 
 Top Concentration Changes
-1. US | Direct | Premium | 0   9 → 7 records
-2. US | Direct | Core | 1      7 → 7 records
-3. US | Direct | Core | 0      7 → 7 records
-...
-```
 
+1. `APAC | Marketplace`   6 -> 9 records (+10.7 pp)
+2. `US | Direct`   12 -> 9 records (-10.7 pp)
+3. `EU | Partner`   10 -> 10 records (+0.0 pp)
+```
 
 ## Design Principles
 
@@ -84,6 +81,7 @@ is creating downside concentration risk in a small number of segments.
 | Command | Purpose |
 |---|---|
 | `analyze` | factor/segment attribution from CSV or Postgres |
+| `analyze-investigate` | metric change decomposition into top driver contributions |
 | `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
 | `analyze-compare` | snapshot delta analysis (biggest movers) |
 | `explain-analyze` | executive narrative and actions from computed JSON |
@@ -480,9 +478,73 @@ cargo run -p factor_cli -- analyze-compare \
 
 Notes:
 - `analyze` defaults to `artifacts/<input_stem>.md` + `.json` (`--output-format both`).
+- `analyze` now prefixes default outputs as `artifacts/analyze_<input_stem>.md` + `.json`.
+- `analyze-investigate` now prefixes default outputs as `artifacts/investigate_<input_stem>.md` + `.json`.
 - `analyze-compare` defaults to `artifacts/analysis_compare.md` + `.json` (`--output-format both`).
 - `analyze-compare` supports `--output-format md|html|json|both`.
 - `--top-movers` controls how many largest movers are shown (default: `10`).
+
+## Analyze Investigate
+
+Use `analyze-investigate` when you want a compact “metric change + top drivers” output.
+
+```bash
+# mixed deterministic drivers
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/analytics.sales.csv \
+  --metric customer_purchase_order_retail_total_price \
+  --driver-preset mixed \
+  --driver-contrib both \
+  --date-column quote_group_created_at \
+  --time-grain month \
+  --period current
+
+# id/entity-volume drivers
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/analytics.sales.csv \
+  --metric customer_purchase_order_retail_total_price \
+  --driver-preset id \
+  --driver-contrib both \
+  --date-column quote_group_created_at \
+  --time-grain month \
+  --period current
+
+# amount drivers (numeric, de-duplicated)
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/analytics.sales.csv \
+  --metric customer_purchase_order_retail_total_price \
+  --driver-preset amount \
+  --driver-contrib both \
+  --date-column quote_group_created_at \
+  --time-grain month \
+  --period current
+
+# category drivers
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/analytics.sales.csv \
+  --metric customer_purchase_order_retail_total_price \
+  --driver-preset category \
+  --driver-contrib both \
+  --date-column quote_group_created_at \
+  --time-grain month \
+  --period current
+
+# explicit drivers (manual override)
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/analytics.sales.csv \
+  --metric customer_purchase_order_retail_total_price \
+  --drivers 'count_distinct(quote_group_id),count_distinct(customer_purchase_order_id),count_distinct(provider_id)' \
+  --driver-contrib both \
+  --date-column quote_group_created_at \
+  --time-grain month \
+  --period current
+```
+
+Notes:
+- Driver presets: `id|amount|category|mixed`.
+- Driver contribution view: `--driver-contrib percent|amount|both`.
+- Manual driver expressions: `sum(col)`, `avg(col)`, `count(col)`, `count(*)`, `count_distinct(col)`.
+- `analyze` answers “which segments changed?” while `analyze-investigate` answers “what drove the metric change?”.
 
 Or analyze directly from Postgres:
 
