@@ -1,87 +1,90 @@
 # FactorLens
 
-A Rust CLI for deterministic factor attribution and analytics workflows, with optional AI-generated explanations.
+FactorLens is a Rust CLI that explains **why metrics changed**.
 
-FactorLens explains why metrics change by decomposing results into factor contributions and producing structured analysis artifacts.
-FactorLens follows a math-first, AI-second approach: deterministic analytics produce the artifacts, and the LLM layer interprets them.
+Dashboards show that metrics moved. FactorLens decomposes those changes into driver contributions using deterministic math, then optionally generates narrative explanations.
+
+Typical flow:
+
+`metric change -> driver contributions -> closure check -> residual segments`
 
 [![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
 [![GHCR](https://img.shields.io/badge/ghcr-factorlens--mcp-blue)](https://github.com/kraftaa/factorlens/pkgs/container/factorlens-mcp)
 
-## Quick Example
-
-Given a dataset with sales metrics:
+## Example
 
 ```bash
-factorlens analyze --input data/demo_revenue.csv --group-by region,channel --metrics revenue_usd,traffic,conversion_rate,avg_price_usd --rank-by revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens analyze-investigate --input data/demo_revenue_residual.csv --metric revenue_usd --driver-preset amount --dedup-drivers false --driver-contrib both --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens analyze-drivers --input data/demo_revenue.csv --metric revenue_usd --date-column date --time-grain month --period last --anchor-date 2026-04-15
-factorlens explain-analyze \
-  --backend bedrock \
-  --analysis-json artifacts/analyze_demo_revenue.json \
-  --model anthropic.claude-3-sonnet-20240229-v1:0 \
-  --question "What are the main drivers of revenue concentration?"
+factorlens analyze-drivers \
+  --input data/demo_revenue_residual.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
 ```
 
-#### Example output  (truncated):
+Output:
 
 ```text
 revenue_usd change: -16.4%
 
 Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
 
-Decomposition mode: regression
+Inferred identity
+- revenue_usd ≈ orders * avg_price_usd
+- fit MAPE: 1.18% across 56 rows
 
 Driver contributions
-- sum(orders): -13.0% | delta=-696191.18
-- sum(traffic): -2.2% | delta=-116243.57
-- avg(avg_price_usd): -1.1% | delta=-61590.98
+- orders: -15.9%
+- avg_price_usd: -2.0%
 
 Closure check
-- explained: -16.3% (99%)
-- residual: -0.1% (-6,146.70)
+- explained: -17.9%
+- residual: +1.5% (+77,765.73)
+
+Residual segments
+- campaign = spring_launch: mean residual +5,151.67 (16 rows)
+- channel = Marketplace: mean residual +5,151.67 (16 rows)
+- device_type = mobile: mean residual +5,151.67 (16 rows)
 ```
 
-## Design Principles
+## Real Use Cases
 
-FactorLens follows a few simple design rules:
+- Revenue debugging: decompose changes into orders, price, or mix effects.
+- Growth analytics: explain movement in conversion, CAC, or AOV.
+- Data pipeline sanity checks: large residuals often reveal joins, missing data, or definition drift.
+- CI metric monitoring: run FactorLens in pipelines to catch unusual metric behavior.
 
-- **Math-first, AI-second** – deterministic factor attribution produces the artifacts, AI only explains them.
-- **CLI-first workflows** – designed to run locally, in scripts, or inside pipelines.
-- **Structured outputs** – results can be exported as Markdown, JSON, or HTML for humans and automation.
-- **Composable commands** – analysis, comparison, and explanation steps can be combined in workflows.
-
-## What It Looks Like
+## Quick Start
 
 ```bash
-cargo run -p factor_cli -- analyze \
-  --input data/your_file.csv \
-  --group-by region,product_line,channel \
-  --metrics revenue_usd
-```
+factorlens analyze \
+  --input data/demo_revenue.csv \
+  --group-by region,channel \
+  --metrics revenue_usd,traffic,conversion_rate,avg_price_usd \
+  --rank-by revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
 
-Default output paths:
-- `artifacts/<input_stem>.md`
-- `artifacts/<input_stem>.json` (when output format includes JSON)
-
-Example report excerpt:
-
-```text
-## Executive Summary
-
-- Largest segment is `US | Core | Direct` with 28.4% of records and 32.1% of total revenue_usd.
-- Top 5 segments represent 61.5% of records and 67.9% of revenue_usd.
-```
-
-AI layer on top:
-
-```text
-Summary:
-Growth is concentrated in US direct channel performance, while product-line mix
-is creating downside concentration risk in a small number of segments.
+factorlens analyze-drivers \
+  --input data/demo_revenue.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
 ```
 
 ## Workflow
+
+Typical workflow:
+
+- `analyze` - explore segments and concentration.
+- `analyze-drivers` - explain metric changes automatically.
+- `analyze-compare` - compare two snapshots.
+- `explain-analyze` - add optional narrative explanation.
 
 | Command | Purpose |
 |---|---|
@@ -93,7 +96,16 @@ is creating downside concentration risk in a small number of segments.
 | `explain-analyze` | executive narrative and actions from computed JSON |
 | `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
 
-## 2-Minute Quickstart
+## Design Principles
+
+FactorLens follows a few simple design rules:
+
+- **Math-first, AI-second** – deterministic factor attribution produces the artifacts, AI only explains them.
+- **CLI-first workflows** – designed to run locally, in scripts, or inside pipelines.
+- **Structured outputs** – results can be exported as Markdown, JSON, or HTML for humans and automation.
+- **Composable commands** – analysis, comparison, and explanation steps can be combined in workflows.
+
+## Demo Workflow
 
 ```bash
 # 1) baseline snapshot (100 rows)
