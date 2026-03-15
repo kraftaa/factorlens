@@ -1412,6 +1412,8 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
     let right_base = aggregate_column(&base_rows, identity.right_idx, identity.right_agg);
     let right_new = aggregate_column(&new_rows, identity.right_idx, identity.right_agg);
 
+    // For multiplicative/divisive identities, split the modeled change by each
+    // side's log-ratio contribution so the two driver percentages add back up.
     let left_term = safe_ln_ratio(left_new, left_base);
     let right_term_raw = safe_ln_ratio(right_new, right_base);
     let right_term = match identity.op {
@@ -1419,6 +1421,8 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
         DriverIdentityOp::Divide => -right_term_raw,
     };
     let denom = left_term + right_term;
+    // Use row-level predicted metric totals from the inferred identity for
+    // closure, rather than mixing in a separate aggregate heuristic.
     let modeled_base = aggregate_identity_prediction(&base_rows, &identity);
     let modeled_new = aggregate_identity_prediction(&new_rows, &identity);
     let explained_change_pct = pct_change(modeled_new, modeled_base);
@@ -1430,6 +1434,8 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
     } else {
         (0.0, 0.0)
     };
+    // Residual is whatever actual period-over-period movement is left after the
+    // inferred identity's modeled change is accounted for.
     let residual_pct = total_change_pct - explained_change_pct;
     let metric_delta = metric_new - metric_base;
     let residual_amount = metric_delta - (modeled_new - modeled_base);
@@ -2806,6 +2812,22 @@ fn infer_numeric_driver_agg(col_name: &str) -> DriverAgg {
     }
 }
 
+fn is_count_like_numeric_column(col_name: &str) -> bool {
+    let n = col_name.to_ascii_lowercase();
+    n.starts_with("count_") || n.ends_with("_count") || n.contains("_count_")
+}
+
+fn is_indicator_like_numeric_column(col_name: &str) -> bool {
+    let n = col_name.to_ascii_lowercase();
+    n.starts_with("is_")
+        || n.starts_with("has_")
+        || n.contains("flag")
+        || n.contains("plan")
+        || n.contains("indicator")
+        || n.contains("bool")
+        || n.contains("boolean")
+}
+
 fn auto_select_numeric_drivers(
     headers: &StringRecord,
     rows: &[StringRecord],
@@ -2824,7 +2846,15 @@ fn auto_select_numeric_drivers(
             || lname.ends_with("_id")
             || lname.contains("date")
             || lname.contains("time")
+            || is_count_like_numeric_column(&lname)
         {
+            continue;
+        }
+        let (distinct_count, non_empty) = approx_distinct_count(rows, idx, 5000);
+        if non_empty < 20 {
+            continue;
+        }
+        if distinct_count <= 3 || (is_indicator_like_numeric_column(&lname) && distinct_count <= 10) {
             continue;
         }
         let mut xs = Vec::<f64>::new();
@@ -5928,6 +5958,35 @@ mod tests {
             infer_numeric_driver_agg("traffic"),
             DriverAgg::Sum
         ));
+    }
+
+    #[test]
+    fn auto_select_numeric_drivers_skips_count_like_columns() {
+        let headers = StringRecord::from(vec![
+            "quote_group_created_at",
+            "customer_purchase_order_retail_total_price_usd",
+            "net_gmv",
+            "count_proposal_per_quote_group",
+            "advantage_plan",
+        ]);
+        let rows = (0..40)
+            .map(|i| {
+                StringRecord::from(vec![
+                    format!("2026-02-{:02}", (i % 28) + 1),
+                    format!("{}", 1000.0 + (i as f64 * 10.0)),
+                    format!("{}", 700.0 + (i as f64 * 8.0)),
+                    format!("{}", 3 + (i % 5)),
+                    format!("{}", i % 2),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        let selected = auto_select_numeric_drivers(&headers, &rows, 1, 0, 5, None);
+        let names = selected.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+
+        assert!(names.contains(&"net_gmv".to_string()));
+        assert!(!names.contains(&"count_proposal_per_quote_group".to_string()));
+        assert!(!names.contains(&"advantage_plan".to_string()));
     }
 
     #[test]

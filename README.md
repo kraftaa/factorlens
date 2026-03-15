@@ -59,14 +59,10 @@ Residual segments
 
 ```bash
 factorlens analyze \
-  --input data/demo_revenue.csv \
-  --group-by region,channel \
-  --metrics revenue_usd,traffic,conversion_rate,avg_price_usd \
+  --input data/factorlens_demo_sales_100.csv \
+  --group-by region,channel,product_line \
+  --metrics revenue_usd,cost_usd,orders \
   --rank-by revenue_usd \
-  --date-column date \
-  --time-grain month \
-  --period last \
-  --anchor-date 2026-04-15
 
 factorlens analyze-drivers \
   --input data/demo_revenue.csv \
@@ -95,6 +91,18 @@ Typical workflow:
 | `analyze-compare` | snapshot delta analysis (biggest movers) |
 | `explain-analyze` | executive narrative and actions from computed JSON |
 | `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
+
+## When To Use Which
+
+- `analyze` answers: **which groups changed?**
+- `analyze-investigate` answers: **which numeric drivers account for the metric change?**
+- `analyze-drivers` answers: **what metric identity or formula explains the change?**
+
+Practical rule:
+
+- Start with `analyze` for wide business tables.
+- Use `analyze-investigate` when you have a curated dataset with a few meaningful numeric drivers.
+- Use `analyze-drivers` when the metric likely has a formula such as `revenue ≈ orders * avg_price`.
 
 ## Design Principles
 
@@ -287,24 +295,24 @@ cargo build -p factor_cli --release
 
 ```bash
 cargo run -p factor_cli -- factors fit \
-  --prices data/prices.csv \
+  --prices path/to/prices.csv \
   --k 3 \
   --out artifacts/ \
-  --portfolio data/portfolio.csv
+  --portfolio path/to/portfolio.csv
 
 # safer residual analysis: auto-pick k (< number of assets)
 cargo run -p factor_cli -- factors fit \
-  --prices data/prices.csv \
+  --prices path/to/prices.csv \
   --k-auto \
   --out artifacts/ \
-  --portfolio data/portfolio.csv
+  --portfolio path/to/portfolio.csv
 
 # alternative: derive weights automatically from holdings
 cargo run -p factor_cli -- factors fit \
-  --prices data/prices.csv \
+  --prices path/to/prices.csv \
   --k 3 \
   --out artifacts/ \
-  --holdings data/holdings.csv
+  --holdings path/to/holdings.csv
 
 cargo run -p factor_cli -- report \
   --artifacts artifacts/ \
@@ -313,10 +321,10 @@ cargo run -p factor_cli -- report \
 
 # known-factor regression mode (MKT/SMB/HML-style)
 cargo run -p factor_cli -- factors regress \
-  --prices data/prices.csv \
-  --factors data/factors.csv \
+  --prices path/to/prices.csv \
+  --factors path/to/factors.csv \
   --out artifacts/ \
-  --portfolio data/portfolio.csv
+  --portfolio path/to/portfolio.csv
 
 cargo run -p factor_cli -- explain \
   --backend local \
@@ -340,8 +348,8 @@ cargo run -p factor_cli -- explain \
 Examples:
 
 ```bash
-cargo run -p factor_cli -- factors fit --prices data/prices.csv --k 3 --out artifacts/ --portfolio data/portfolio.csv
-cargo run -p factor_cli -- factors fit --prices data/prices.csv --k 3 --out artifacts/ --portfolio data/portfolio.csv --include-weekends
+cargo run -p factor_cli -- factors fit --prices path/to/prices.csv --k 3 --out artifacts/ --portfolio path/to/portfolio.csv
+cargo run -p factor_cli -- factors fit --prices path/to/prices.csv --k 3 --out artifacts/ --portfolio path/to/portfolio.csv --include-weekends
 
 cargo run -p factor_cli -- explain --backend local --model models/llama_instruct.gguf --artifacts artifacts/ --question "What drove the largest drawdown?" --focus-factors factor_1,factor_2
 ```
@@ -353,7 +361,7 @@ By default, FactorLens auto-generates factor names from your dataset loadings
 
 You can still override labels with a CSV or TSV file via `--factor-labels`.
 
-Example `data/factor_labels.csv`:
+Example `factor_labels.csv`:
 
 ```csv
 factor,label
@@ -365,7 +373,7 @@ factor_3_contrib,Idiosyncratic Spread
 Use in `explain`:
 
 ```bash
-cargo run -p factor_cli -- explain --backend local --model models/llama_instruct.gguf --artifacts artifacts/ --question "What drove the largest drawdown?" --factor-labels data/factor_labels.csv
+cargo run -p factor_cli -- explain --backend local --model models/llama_instruct.gguf --artifacts artifacts/ --question "What drove the largest drawdown?" --factor-labels path/to/factor_labels.csv
 ```
 
 Notes:
@@ -390,9 +398,23 @@ Notes:
 - Which assets are most aligned with `factor_1` loadings?
 - Which assets increased my exposure to downside factors most?
 
-## Generic Table Analysis
+## Analyze
 
-Analyze any CSV table by grouping columns and numeric metrics you choose:
+Use `analyze` when you want to see **which groups changed** or where concentration lives.
+
+Recommended demo file:
+
+- `data/factorlens_demo_sales_100.csv`
+
+```bash
+cargo run -p factor_cli -- analyze \
+  --input data/factorlens_demo_sales_100.csv \
+  --group-by region,channel,product_line \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+```
+
+Generic patterns:
 
 ```bash
 cargo run -p factor_cli -- analyze \
@@ -452,44 +474,49 @@ cargo run -p factor_cli -- analyze \
 
 Create two analysis snapshots, then compare them:
 
+Recommended demo files:
+
+- `data/factorlens_demo_sales_100.csv`
+- `data/factorlens_demo_sales_150.csv`
+
 ```bash
 # base snapshot
 cargo run -p factor_cli -- analyze \
-  --input data/your_file_a.csv \
+  --input data/factorlens_demo_sales_100.csv \
   --group-by region,channel,product_line \
   --metrics revenue_usd,cost_usd,orders \
   --rank-by revenue_usd
 
 # new snapshot
 cargo run -p factor_cli -- analyze \
-  --input data/your_file_b.csv \
+  --input data/factorlens_demo_sales_150.csv \
   --group-by region,channel,product_line \
   --metrics revenue_usd,cost_usd,orders \
   --rank-by revenue_usd
 
 # compare (default: both markdown + json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/your_file_a.json \
-  --new artifacts/your_file_b.json
+  --base artifacts/analyze_factorlens_demo_sales_100.json \
+  --new artifacts/analyze_factorlens_demo_sales_150.json
 
 # compare (html)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/your_file_a.json \
-  --new artifacts/your_file_b.json \
+  --base artifacts/analyze_factorlens_demo_sales_100.json \
+  --new artifacts/analyze_factorlens_demo_sales_150.json \
   --output-format html \
   --out artifacts/compare.html
 
 # compare (json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/your_file_a.json \
-  --new artifacts/your_file_b.json \
+  --base artifacts/analyze_factorlens_demo_sales_100.json \
+  --new artifacts/analyze_factorlens_demo_sales_150.json \
   --output-format json \
   --out artifacts/compare.json
 
 # compare (both markdown + json)
 cargo run -p factor_cli -- analyze-compare \
-  --base artifacts/your_file_a.json \
-  --new artifacts/your_file_b.json \
+  --base artifacts/analyze_factorlens_demo_sales_100.json \
+  --new artifacts/analyze_factorlens_demo_sales_150.json \
   --output-format both \
   --out artifacts/compare.md
 ```
@@ -504,65 +531,71 @@ Notes:
 
 ## Analyze Investigate
 
-Use `analyze-investigate` when you want a compact “metric change + top drivers” output.
+Use `analyze-investigate` when you want a compact “metric change + top drivers” output from a **curated numeric driver set**.
+
+Recommended demo file:
+
+- `data/demo_revenue_residual.csv`
+
+It works best when your input already contains a small number of meaningful numeric drivers such as:
+
+- `net_gmv`
+- `orders`
+- `traffic`
+- `avg_price_usd`
+- distinct-count style entity columns via explicit `--drivers`
 
 ```bash
-# mixed deterministic drivers
+# numeric driver accounting
 cargo run -p factor_cli -- analyze-investigate \
-  --input data/analytics.sales.csv \
-  --metric customer_purchase_order_retail_total_price \
-  --driver-preset mixed \
-  --driver-contrib both \
-  --date-column quote_group_created_at \
-  --time-grain month \
-  --period current
-
-# id/entity-volume drivers
-cargo run -p factor_cli -- analyze-investigate \
-  --input data/analytics.sales.csv \
-  --metric customer_purchase_order_retail_total_price \
-  --driver-preset id \
-  --driver-contrib both \
-  --date-column quote_group_created_at \
-  --time-grain month \
-  --period current
-
-# amount drivers (numeric, de-duplicated)
-cargo run -p factor_cli -- analyze-investigate \
-  --input data/analytics.sales.csv \
-  --metric customer_purchase_order_retail_total_price \
+  --input data/demo_revenue_residual.csv \
+  --metric revenue_usd \
   --driver-preset amount \
   --driver-contrib both \
-  --date-column quote_group_created_at \
+  --date-column date \
   --time-grain month \
-  --period current
+  --period last \
+  --anchor-date 2026-04-15
 
-# category drivers
+# entity-volume drivers
 cargo run -p factor_cli -- analyze-investigate \
-  --input data/analytics.sales.csv \
-  --metric customer_purchase_order_retail_total_price \
-  --driver-preset category \
+  --input data/your_file.csv \
+  --metric revenue_usd \
+  --driver-preset id \
   --driver-contrib both \
-  --date-column quote_group_created_at \
+  --date-column date \
   --time-grain month \
-  --period current
+  --period last
+
+# mixed exploratory scan
+cargo run -p factor_cli -- analyze-investigate \
+  --input data/your_file.csv \
+  --metric revenue_usd \
+  --driver-preset mixed \
+  --driver-contrib both \
+  --date-column date \
+  --time-grain month \
+  --period last
 
 # explicit drivers (manual override)
 cargo run -p factor_cli -- analyze-investigate \
-  --input data/analytics.sales.csv \
-  --metric customer_purchase_order_retail_total_price \
-  --drivers 'count_distinct(quote_group_id),count_distinct(customer_purchase_order_id),count_distinct(provider_id)' \
+  --input data/your_file.csv \
+  --metric revenue_usd \
+  --drivers 'count_distinct(order_id),count_distinct(customer_id),count_distinct(account_id)' \
   --driver-contrib both \
-  --date-column quote_group_created_at \
+  --date-column date \
   --time-grain month \
-  --period current
+  --period last
 ```
 
 Notes:
 - Driver presets: `id|amount|category|mixed`.
 - Driver contribution view: `--driver-contrib percent|amount|both`.
 - Manual driver expressions: `sum(col)`, `avg(col)`, `count(col)`, `count(*)`, `count_distinct(col)`.
-- `analyze` answers “which segments changed?” while `analyze-investigate` answers “what drove the metric change?”.
+- `analyze-investigate` is best for numeric driver accounting, not first-pass discovery.
+- For wide business tables, start with `analyze` and use `analyze-investigate` only after curating a smaller set of useful drivers.
+- `amount` is usually the best first preset for spend, GMV, order, or traffic-style measures.
+- `mixed` is exploratory and may be noisier than `amount`.
 - `analyze-investigate` reports `decomposition_mode`: `regression` when numeric drivers support a fitted model, otherwise `heuristic`.
 - Demo commands use `--anchor-date 2026-04-15` so `--period last --time-grain month` resolves to March 2026 vs February 2026 regardless of today’s date.
 
@@ -576,9 +609,9 @@ Window: 2026-03-01..2026-03-31 vs 2026-02-01..2026-02-28
 Decomposition mode: regression
 
 Driver contributions
-- sum(orders): -13.0% | delta=-696191.18
-- sum(traffic): -2.2% | delta=-116243.57
-- avg(avg_price_usd): -1.1% | delta=-61590.98
+- sum(orders): -13.0% | delta=-696,191.18
+- sum(traffic): -2.2% | delta=-116,243.57
+- avg(avg_price_usd): -1.1% | delta=-61,590.98
 
 Closure check
 - explained: -16.3% (99%)
@@ -588,6 +621,17 @@ Closure check
 ## Analyze Drivers
 
 Use `analyze-drivers` when you want FactorLens to infer the metric identity automatically instead of passing drivers.
+
+Recommended demo files:
+
+- `data/demo_revenue.csv` for a clean identity example
+- `data/demo_revenue_residual.csv` for residual analysis
+
+This is best for metrics that likely come from a formula, such as:
+
+- `revenue ≈ orders * avg_price`
+- `conversion ≈ purchases / visits`
+- `aov ≈ revenue / orders`
 
 ```bash
 # one-file period compare
