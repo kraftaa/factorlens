@@ -10,6 +10,7 @@ dist/
 data/gold*
 data/silver*
 data/bronze*
+data/inv*
 *gold_*
 *silver_*
 *bronze_*
