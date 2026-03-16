@@ -81,7 +81,7 @@ if [[ "${RUN_BEDROCK:-0}" == "1" ]]; then
 ${REPORT}"
   export PROMPT
 
-  cat > /tmp/bedrock_marketplace.json <<EOF
+  cat > /tmp/bedrock_analysis.json <<EOF
 {
   "messages": [
     {
@@ -98,11 +98,11 @@ ${REPORT}"
 }
 EOF
 
-  echo "[Bedrock] Summarizing marketplace report..."
+  echo "[Bedrock] Summarizing analysis report..."
   aws bedrock-runtime converse \
     --region "$AWS_REGION" \
     --model-id "$MODEL_ID" \
-    --cli-input-json file:///tmp/bedrock_marketplace.json \
+    --cli-input-json file:///tmp/bedrock_analysis.json \
     --query 'output.message.content[0].text' \
     --output text
 fi
