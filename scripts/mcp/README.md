@@ -77,7 +77,7 @@ python scripts/mcp/factorlens_mcp_server.py
 ## Example MCP Calls
 
 Analyze CSV:
-
+(These examples use placeholder paths.)
 ```json
 {
   "input_csv": "/path/to/input.csv",
