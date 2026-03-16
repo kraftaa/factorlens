@@ -80,12 +80,12 @@ Analyze CSV:
 
 ```json
 {
-  "input_csv": "/path/to/data/input.csv",
-  "out": "/path/to/artifacts/demo_exec.html",
-  "profile": "demo_exec",
-  "profile_config": "/path/to/profiles/profile.toml",
-  "count_only": true,
-  "output_format": "html"
+  "input_csv": "/path/to/input.csv",
+  "out": "/path/to/artifacts/report.md",
+  "group_by_csv": "region,channel",
+  "metrics_csv": "revenue_usd",
+  "rank_by": "revenue_usd",
+  "output_format": "both"
 }
 ```
 
@@ -96,7 +96,7 @@ Explain analysis:
   "analysis_json": "/path/to/artifacts/analysis.json",
   "backend": "bedrock",
   "model": "anthropic.claude-3-haiku-20240307-v1:0",
-  "question": "Top concentration risks and 3 actions?"
+  "question": "What are the main drivers of revenue concentration?"
 }
 ```
 
@@ -108,8 +108,9 @@ Analyze Postgres query:
   "query": "select region, channel, revenue_usd from analytics.sales limit 5000",
   "postgres_ssl_mode": "require",
   "postgres_ca_file": "/path/to/rds-global-bundle.pem",
-  "profile": "demo_exec",
-  "profile_config": "/path/to/profiles/marketplace.local.toml",
+  "group_by_csv": "region,channel",
+  "metrics_csv": "revenue_usd",
+  "rank_by": "revenue_usd",
   "output_format": "both"
 }
 ```
