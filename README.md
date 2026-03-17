@@ -11,6 +11,27 @@ Typical flow:
 [![Release](https://img.shields.io/github/v/release/kraftaa/factorlens)](https://github.com/kraftaa/factorlens/releases)
 [![GHCR](https://img.shields.io/badge/ghcr-factorlens--mcp-blue)](https://github.com/kraftaa/factorlens/pkgs/container/factorlens-mcp)
 
+## Quick Start
+
+```bash
+pip install factorlens
+factorlens --help
+
+factorlens analyze \
+  --input data/factorlens_demo_sales_100.csv \
+  --group-by region,channel,product_line \
+  --metrics revenue_usd,cost_usd,orders \
+  --rank-by revenue_usd \
+
+factorlens analyze-drivers \
+  --input data/demo_revenue.csv \
+  --metric revenue_usd \
+  --date-column date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15
+```
+
 ## Example
 
 ```bash
@@ -54,27 +75,6 @@ Residual segments
 - Growth analytics: explain movement in conversion, CAC, or AOV.
 - Data pipeline sanity checks: large residuals often reveal joins, missing data, or definition drift.
 - CI metric monitoring: run FactorLens in pipelines to catch unusual metric behavior.
-
-## Quick Start
-
-```bash
-pip install factorlens
-factorlens --help
-
-factorlens analyze \
-  --input data/factorlens_demo_sales_100.csv \
-  --group-by region,channel,product_line \
-  --metrics revenue_usd,cost_usd,orders \
-  --rank-by revenue_usd \
-
-factorlens analyze-drivers \
-  --input data/demo_revenue.csv \
-  --metric revenue_usd \
-  --date-column date \
-  --time-grain month \
-  --period last \
-  --anchor-date 2026-04-15
-```
 
 ## Workflow
 
