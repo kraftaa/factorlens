@@ -58,6 +58,9 @@ Residual segments
 ## Quick Start
 
 ```bash
+pip install factorlens
+factorlens --help
+
 factorlens analyze \
   --input data/factorlens_demo_sales_100.csv \
   --group-by region,channel,product_line \
@@ -806,7 +809,7 @@ Install from PyPI:
 For packaging/build/publish details, see `BUILD_INSTRUCTIONS.md`.
 
 ```bash
-pip install --upgrade factorlens==0.1.3
+pip install factorlens
 factorlens --help
 ```
 
