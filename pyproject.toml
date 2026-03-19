@@ -28,5 +28,5 @@ manifest-path = "crates/factor_cli/Cargo.toml"
 strip = true
 
 [project.urls]
-Homepage = "https://github.com/your-org/factorlens"
-Repository = "https://github.com/your-org/factorlens"
+Homepage = "https://github.com/kraftaa/factorlens"
+Repository = "https://github.com/kraftaa/factorlens"
