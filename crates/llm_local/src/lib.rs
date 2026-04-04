@@ -166,8 +166,8 @@ fn clean_generation(raw: &str, system_prompt: &str) -> String {
     }
 
     let out_trim = out_trim.trim_start();
-    if out_trim.starts_with(system_prompt) {
-        out = out_trim[system_prompt.len()..].trim_start().to_string();
+    if let Some(stripped) = out_trim.strip_prefix(system_prompt) {
+        out = stripped.trim_start().to_string();
     } else {
         out = out_trim.to_string();
     }

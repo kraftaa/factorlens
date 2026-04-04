@@ -8,6 +8,11 @@ dist/
 *.egg-info/
 .venv/
 .idea/
+.DS_Store
+data/.DS_Store
+certs/
+mcp-template-generated-5/
+mcp-template-generated-6/
 data/gold*
 data/silver*
 data/bronze*
@@ -18,5 +23,6 @@ data/inv*
 profiles/*.local.toml
 profiles/*.private.toml
 other
+/other/
 TO_DO.md
 docs/

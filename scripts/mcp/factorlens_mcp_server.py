@@ -74,13 +74,13 @@ def _read_roots() -> list[Path]:
     c = _cwd()
     return _split_roots(
         "FACTORLENS_ALLOWED_READ_DIRS",
-        [c / "data", c / "profiles", c / "artifacts", c],
+        [c / "data", c / "profiles", c / "artifacts", c / "certs"],
     )
 
 
 def _write_roots() -> list[Path]:
     c = _cwd()
-    return _split_roots("FACTORLENS_ALLOWED_WRITE_DIRS", [c / "artifacts", c])
+    return _split_roots("FACTORLENS_ALLOWED_WRITE_DIRS", [c / "artifacts"])
 
 
 def _is_within(path: Path, roots: list[Path]) -> bool:
@@ -125,7 +125,7 @@ def _factorlens_bin() -> str:
 
 
 def _timeout_sec(requested: int | None) -> int:
-    env_default = int(os.getenv("FACTORLENS_CMD_TIMEOUT_SEC", "180"))
+    env_default = _env_int("FACTORLENS_CMD_TIMEOUT_SEC", 180)
     if requested is None:
         return env_default
     if requested <= 0:
@@ -168,6 +168,27 @@ def _append_optional(cmd: list[str], flag: str, value: str | None) -> None:
         cmd.extend([flag, str(value)])
 
 
+def _append_period_flags(
+    cmd: list[str],
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
+) -> None:
+    _append_optional(cmd, "--date-column", date_column)
+    _append_optional(cmd, "--time-grain", time_grain)
+    _append_optional(cmd, "--period", period)
+    _append_optional(cmd, "--anchor-date", anchor_date)
+    _append_optional(cmd, "--current-start", current_start)
+    _append_optional(cmd, "--current-end", current_end)
+    _append_optional(cmd, "--previous-start", previous_start)
+    _append_optional(cmd, "--previous-end", previous_end)
+
+
 @mcp.tool()
 def analyze_csv(
     input_csv: str,
@@ -185,6 +206,14 @@ def analyze_csv(
     count_only: bool = False,
     normalize_text_groups: bool = False,
     word_freq: bool = False,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
     output_format: str = "both",
     timeout_sec: int | None = None,
 ) -> str:
@@ -225,6 +254,17 @@ def analyze_csv(
     _append_optional(cmd, "--where", where_csv)
     _append_optional(cmd, "--rank-by", rank_by)
     _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
 
     if count_only:
         cmd.append("--count-only")
@@ -257,6 +297,14 @@ def analyze_query(
     count_only: bool = False,
     normalize_text_groups: bool = False,
     word_freq: bool = False,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
     output_format: str = "both",
     timeout_sec: int | None = None,
 ) -> str:
@@ -316,6 +364,17 @@ def analyze_query(
     _append_optional(cmd, "--where", where_csv)
     _append_optional(cmd, "--rank-by", rank_by)
     _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
 
     if count_only:
         cmd.append("--count-only")
@@ -343,6 +402,14 @@ def analyze_validate_csv(
     count_only: bool = False,
     normalize_text_groups: bool = False,
     word_freq: bool = False,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
     alert_rule_csv: str | None = None,
     timeout_sec: int | None = None,
 ) -> str:
@@ -376,6 +443,17 @@ def analyze_validate_csv(
     _append_optional(cmd, "--where", where_csv)
     _append_optional(cmd, "--rank-by", rank_by)
     _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
     _append_optional(cmd, "--alert-rule", alert_rule_csv)
 
     if count_only:
@@ -408,6 +486,14 @@ def analyze_validate_query(
     count_only: bool = False,
     normalize_text_groups: bool = False,
     word_freq: bool = False,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
     alert_rule_csv: str | None = None,
     timeout_sec: int | None = None,
 ) -> str:
@@ -460,6 +546,17 @@ def analyze_validate_query(
     _append_optional(cmd, "--where", where_csv)
     _append_optional(cmd, "--rank-by", rank_by)
     _append_optional(cmd, "--percentiles", percentiles_csv)
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
     _append_optional(cmd, "--alert-rule", alert_rule_csv)
 
     if count_only:

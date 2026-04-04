@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -240,6 +240,10 @@ struct InvestigateArgs {
     metric: String,
     #[arg(long, value_delimiter = ',')]
     drivers: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    driver_include: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    driver_exclude: Vec<String>,
     #[arg(long, value_enum)]
     driver_preset: Option<DriverPreset>,
     #[arg(long, value_enum, default_value = "deterministic")]
@@ -938,9 +942,7 @@ fn run_analyze_investigate(args: InvestigateArgs) -> Result<()> {
         return Err(anyhow!("--top-drivers must be >= 1"));
     }
     if !args.drivers.is_empty() && args.driver_preset.is_some() {
-        return Err(anyhow!(
-            "use either --drivers or --driver-preset, not both"
-        ));
+        return Err(anyhow!("use either --drivers or --driver-preset, not both"));
     }
     let mut rdr = csv::Reader::from_path(&args.input)?;
     let headers = rdr.headers()?.clone();
@@ -963,14 +965,17 @@ fn run_analyze_investigate(args: InvestigateArgs) -> Result<()> {
     } else {
         auto_detect_date_column(&headers, &rows)
     };
-    let date_idx = date_col_name.as_ref().and_then(|n| headers.iter().position(|h| h == n));
+    let date_idx = date_col_name
+        .as_ref()
+        .and_then(|n| headers.iter().position(|h| h == n));
     let didx = date_idx.ok_or_else(|| {
         anyhow!(
             "date column is required for investigate mode; pass --date-column or provide a detectable date column"
         )
     })?;
 
-    let period_cfg = parse_period_cfg_from_investigate(&args, date_col_name.clone().unwrap_or_default())?;
+    let period_cfg =
+        parse_period_cfg_from_investigate(&args, date_col_name.clone().unwrap_or_default())?;
 
     let mut curr_metric = 0.0_f64;
     let mut prev_metric = 0.0_f64;
@@ -989,6 +994,7 @@ fn run_analyze_investigate(args: InvestigateArgs) -> Result<()> {
             .map(|d| parse_investigate_driver(d, &headers))
             .collect::<Result<Vec<_>>>()?
     };
+    driver_specs = apply_driver_filters(driver_specs, &args.driver_include, &args.driver_exclude);
     driver_specs = dedup_driver_specs(driver_specs);
     if driver_specs.is_empty() {
         return Err(anyhow!(
@@ -1172,8 +1178,8 @@ fn run_analyze_investigate(args: InvestigateArgs) -> Result<()> {
             let mut total_abs = 0.0_f64;
             for spec in &driver_specs {
                 let name = &spec.label;
-                let d = *driver_curr.get(name).unwrap_or(&0.0)
-                    - *driver_prev.get(name).unwrap_or(&0.0);
+                let d =
+                    *driver_curr.get(name).unwrap_or(&0.0) - *driver_prev.get(name).unwrap_or(&0.0);
                 total_abs += d.abs();
                 raw.push((name.clone(), d));
             }
@@ -1267,7 +1273,10 @@ fn run_analyze_investigate(args: InvestigateArgs) -> Result<()> {
     }
     println!();
     println!("Closure check");
-    println!("- explained: {:+.1}% ({:.0}%)", explained_pct, explained_share_pct);
+    println!(
+        "- explained: {:+.1}% ({:.0}%)",
+        explained_pct, explained_share_pct
+    );
     println!(
         "- residual: {:+.1}% ({})",
         residual.residual_pct,
@@ -1453,7 +1462,10 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
         format!(
             "base={} new={}",
             args.input.display(),
-            args.input_new.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            args.input_new
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         )
     } else {
         let cfg = parse_period_cfg_from_driver_args(&args, headers.clone())?;
@@ -1464,8 +1476,14 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
     };
 
     let identity_text = match identity.op {
-        DriverIdentityOp::Multiply => format!("{} ≈ {} * {}", identity.metric, identity.left, identity.right),
-        DriverIdentityOp::Divide => format!("{} ≈ {} / {}", identity.metric, identity.left, identity.right),
+        DriverIdentityOp::Multiply => format!(
+            "{} ≈ {} * {}",
+            identity.metric, identity.left, identity.right
+        ),
+        DriverIdentityOp::Divide => format!(
+            "{} ≈ {} / {}",
+            identity.metric, identity.left, identity.right
+        ),
     };
     let explained_share_pct = if total_change_pct.abs() > 1e-12 {
         (explained_change_pct / total_change_pct) * 100.0
@@ -1486,8 +1504,16 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
     );
     println!();
     println!("Driver contributions");
-    println!("- {}: {:+.1}%", driver_identity_name(&identity.left), left_contrib);
-    println!("- {}: {:+.1}%", driver_identity_name(&identity.right), right_contrib);
+    println!(
+        "- {}: {:+.1}%",
+        driver_identity_name(&identity.left),
+        left_contrib
+    );
+    println!(
+        "- {}: {:+.1}%",
+        driver_identity_name(&identity.right),
+        right_contrib
+    );
     println!();
     println!("Closure check");
     println!(
@@ -1567,7 +1593,10 @@ fn run_analyze_drivers(args: AnalyzeDriversArgs) -> Result<()> {
     match args.output_format {
         InvestigateOutputFormat::Md => {
             fs::write(&out_path, markdown)?;
-            println!("Analyze drivers (markdown) written to {}", out_path.display());
+            println!(
+                "Analyze drivers (markdown) written to {}",
+                out_path.display()
+            );
         }
         InvestigateOutputFormat::Json => {
             fs::write(&out_path, serde_json::to_string_pretty(&json)?)?;
@@ -1640,12 +1669,16 @@ fn parse_period_cfg_from_driver_args(
     let date_column = if let Some(dc) = &args.date_column {
         resolve_group_name(dc, &headers)?.to_string()
     } else {
-        return Err(anyhow!("--date-column is required when --input-new is not provided"));
+        return Err(anyhow!(
+            "--date-column is required when --input-new is not provided"
+        ));
     };
     let temp = InvestigateArgs {
         input: args.input.clone(),
         metric: args.metric.clone(),
         drivers: vec![],
+        driver_include: vec![],
+        driver_exclude: vec![],
         driver_preset: None,
         auto_drivers: AutoDriversMode::Deterministic,
         dedup_drivers: true,
@@ -1702,8 +1735,13 @@ fn infer_driver_identity(
             let (left_idx, left_name) = &numeric_cols[i];
             let (right_idx, right_name) = &numeric_cols[j];
             for op in [DriverIdentityOp::Multiply, DriverIdentityOp::Divide] {
-                let (mape, rows_used) =
-                    candidate_identity_fit(all_rows.iter().copied(), metric_idx, *left_idx, *right_idx, op);
+                let (mape, rows_used) = candidate_identity_fit(
+                    all_rows.iter().copied(),
+                    metric_idx,
+                    *left_idx,
+                    *right_idx,
+                    op,
+                );
                 if rows_used >= 20 && mape.is_finite() {
                     candidates.push(DriverIdentity {
                         metric: headers.get(metric_idx).unwrap_or("metric").to_string(),
@@ -1882,6 +1920,7 @@ fn analyze_drivers_residual_summary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn investigate_residual_summary(
     headers: &StringRecord,
     rows: &[StringRecord],
@@ -2095,7 +2134,10 @@ fn residual_signals_from_rows(
                         name: name.to_string(),
                         signal_type: "numeric".to_string(),
                         score: corr.abs(),
-                        detail: format!("{} values correlate with residual (corr={:+.2})", direction, corr),
+                        detail: format!(
+                            "{} values correlate with residual (corr={:+.2})",
+                            direction, corr
+                        ),
                     });
                 }
             }
@@ -2118,10 +2160,7 @@ fn residual_signals_from_rows(
                     let score = mean.abs() * (count as f64).sqrt();
                     (value, mean, count, score)
                 })
-                .max_by(|a, b| {
-                    a.3.partial_cmp(&b.3)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                .max_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
             if let Some((value, mean, count, score)) = best {
                 if mean.abs() < 1_000.0 {
                     continue;
@@ -2166,6 +2205,7 @@ fn infer_numeric_column_from_residuals(row_residuals: &[(&StringRecord, f64)], i
     non_empty >= 20 && (parsed as f64 / non_empty as f64) >= 0.8
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_analyze_drivers_markdown(
     args: &AnalyzeDriversArgs,
     identity: &DriverIdentity,
@@ -2183,8 +2223,14 @@ fn render_analyze_drivers_markdown(
     period_summary: &str,
 ) -> String {
     let expression = match identity.op {
-        DriverIdentityOp::Multiply => format!("{} ≈ {} * {}", identity.metric, identity.left, identity.right),
-        DriverIdentityOp::Divide => format!("{} ≈ {} / {}", identity.metric, identity.left, identity.right),
+        DriverIdentityOp::Multiply => format!(
+            "{} ≈ {} * {}",
+            identity.metric, identity.left, identity.right
+        ),
+        DriverIdentityOp::Divide => format!(
+            "{} ≈ {} / {}",
+            identity.metric, identity.left, identity.right
+        ),
     };
     let explained_share_pct = if total_change_pct.abs() > 1e-12 {
         (explained_change_pct / total_change_pct) * 100.0
@@ -2197,7 +2243,10 @@ fn render_analyze_drivers_markdown(
     if let Some(input_new) = &args.input_new {
         md.push_str(&format!("- Input new: {}\n", input_new.display()));
     }
-    md.push_str(&format!("## {} change: {:+.1}%\n\n", identity.metric, total_change_pct));
+    md.push_str(&format!(
+        "## {} change: {:+.1}%\n\n",
+        identity.metric, total_change_pct
+    ));
     md.push_str(&format!("Window: `{}`\n\n", period_summary));
     md.push_str("## Inferred identity\n\n");
     md.push_str(&format!("- `{}`\n", expression));
@@ -2236,12 +2285,17 @@ fn render_analyze_drivers_markdown(
     if !residual.signals.is_empty() {
         md.push_str("\n## Residual segments\n\n");
         for signal in &residual.signals {
-            md.push_str(&format!("- {}: {}\n", pretty_signal_name(&signal.name), signal.detail));
+            md.push_str(&format!(
+                "- {}: {}\n",
+                pretty_signal_name(&signal.name),
+                signal.detail
+            ));
         }
     }
     md.push_str("\n## Artifacts written\n\n");
     let (md_path, json_path) = investigate_both_paths(
-        &args.out
+        &args
+            .out
             .clone()
             .unwrap_or_else(|| default_analyze_drivers_out(args)),
     );
@@ -2250,8 +2304,9 @@ fn render_analyze_drivers_markdown(
     md
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_investigate_markdown(
-    input: &PathBuf,
+    input: &Path,
     metric: &str,
     metric_change_pct: f64,
     _curr_metric: f64,
@@ -2266,7 +2321,10 @@ fn render_investigate_markdown(
     let mut md = String::new();
     md.push_str("# Investigate Report\n\n");
     md.push_str(&format!("- Input: {}\n", input.display()));
-    md.push_str(&format!("## {} change: {:+.2}%\n\n", metric, metric_change_pct));
+    md.push_str(&format!(
+        "## {} change: {:+.2}%\n\n",
+        metric, metric_change_pct
+    ));
     md.push_str(&format!(
         "Window: `{}..{} vs {}..{}`\n\n",
         period_cfg.current_start,
@@ -2282,7 +2340,10 @@ fn render_investigate_markdown(
         md.push_str(&format!("| {} | {:+.2}% | {:+.4} |\n", name, pct, delta));
     }
     md.push_str("\n## Closure check\n\n");
-    md.push_str(&format!("- explained: {:+.2}% ({:.0}%)\n", explained_pct, explained_share_pct));
+    md.push_str(&format!(
+        "- explained: {:+.2}% ({:.0}%)\n",
+        explained_pct, explained_share_pct
+    ));
     md.push_str(&format!(
         "- residual: {:+.2}% ({}).\n",
         residual.residual_pct,
@@ -2291,21 +2352,25 @@ fn render_investigate_markdown(
     if !residual.signals.is_empty() {
         md.push_str("\n## Residual segments\n\n");
         for signal in &residual.signals {
-            md.push_str(&format!("- {}: {}\n", pretty_signal_name(&signal.name), signal.detail));
+            md.push_str(&format!(
+                "- {}: {}\n",
+                pretty_signal_name(&signal.name),
+                signal.detail
+            ));
         }
     }
     md
 }
 
-fn investigate_both_paths(out_path: &PathBuf) -> (PathBuf, PathBuf) {
+fn investigate_both_paths(out_path: &Path) -> (PathBuf, PathBuf) {
     let ext = out_path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if ext == "json" {
-        (out_path.with_extension("md"), out_path.clone())
+        (out_path.with_extension("md"), out_path.to_path_buf())
     } else {
-        (out_path.clone(), out_path.with_extension("json"))
+        (out_path.to_path_buf(), out_path.with_extension("json"))
     }
 }
 
@@ -2444,6 +2509,43 @@ fn parse_driver_fn(raw: &str) -> Option<(String, &str)> {
     }
     let arg = raw[open + 1..raw.len() - 1].trim();
     Some((fname, arg))
+}
+
+fn apply_driver_filters(
+    mut specs: Vec<DriverSpec>,
+    driver_include: &[String],
+    driver_exclude: &[String],
+) -> Vec<DriverSpec> {
+    let matches_filter = |label: &str, set: &HashSet<String>| -> bool {
+        let normalized = label.to_ascii_lowercase();
+        if set.contains(&normalized) {
+            return true;
+        }
+        if let Some((_, arg)) = parse_driver_fn(label) {
+            return set.contains(&arg.to_ascii_lowercase());
+        }
+        false
+    };
+
+    if !driver_include.is_empty() {
+        let include_set = driver_include
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<HashSet<_>>();
+        if !include_set.is_empty() {
+            specs.retain(|d| matches_filter(&d.label, &include_set));
+        }
+    }
+    if !driver_exclude.is_empty() {
+        let exclude_set = driver_exclude
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<HashSet<_>>();
+        specs.retain(|d| !matches_filter(&d.label, &exclude_set));
+    }
+    specs
 }
 
 fn auto_select_driver_specs(
@@ -2630,7 +2732,8 @@ fn auto_select_id_like_drivers(
             let lname = name.to_ascii_lowercase();
             let is_uuid_dup = lname.ends_with("_uuid")
                 && header_name_set.contains(&(lname.trim_end_matches("_uuid").to_string() + "_id"));
-            if (lname == "id" || lname.ends_with("_id") || lname.ends_with("_uuid")) && !is_uuid_dup {
+            if (lname == "id" || lname.ends_with("_id") || lname.ends_with("_uuid")) && !is_uuid_dup
+            {
                 Some((name.to_string(), idx))
             } else {
                 None
@@ -2706,7 +2809,15 @@ fn auto_select_categorical_drivers(
         }
         if contains_any(
             &lname,
-            &["name", "title", "description", "comment", "note", "email", "address"],
+            &[
+                "name",
+                "title",
+                "description",
+                "comment",
+                "note",
+                "email",
+                "address",
+            ],
         ) {
             score -= 25;
         }
@@ -2828,6 +2939,21 @@ fn is_indicator_like_numeric_column(col_name: &str) -> bool {
         || n.contains("boolean")
 }
 
+fn is_text_identity_like_column(col_name: &str) -> bool {
+    // Columns that look like free-text identifiers or contact info should not be treated as numeric drivers.
+    let n = col_name.to_ascii_lowercase();
+    n.contains("email")
+        || n.contains("name")
+        || n.contains("address")
+        || n.contains("phone")
+        || n.contains("url")
+        || n.contains("http")
+        || n.contains("uuid")
+        || n.contains("guid")
+        || n.contains("ip")
+        || n.contains("contact")
+}
+
 fn auto_select_numeric_drivers(
     headers: &StringRecord,
     rows: &[StringRecord],
@@ -2836,6 +2962,9 @@ fn auto_select_numeric_drivers(
     top_n: usize,
     dedup_corr_threshold: Option<f64>,
 ) -> Vec<(String, usize)> {
+    if top_n == 0 {
+        return vec![];
+    }
     let mut scored = Vec::<(String, usize, f64)>::new();
     for (idx, name) in headers.iter().enumerate() {
         if idx == metric_idx || idx == date_idx {
@@ -2847,6 +2976,7 @@ fn auto_select_numeric_drivers(
             || lname.contains("date")
             || lname.contains("time")
             || is_count_like_numeric_column(&lname)
+            || is_text_identity_like_column(&lname)
         {
             continue;
         }
@@ -2854,18 +2984,33 @@ fn auto_select_numeric_drivers(
         if non_empty < 20 {
             continue;
         }
-        if distinct_count <= 3 || (is_indicator_like_numeric_column(&lname) && distinct_count <= 10) {
+        if distinct_count <= 3 || (is_indicator_like_numeric_column(&lname) && distinct_count <= 10)
+        {
             continue;
         }
         let mut xs = Vec::<f64>::new();
         let mut ys = Vec::<f64>::new();
+        let mut parsed_driver = 0usize;
+        let mut seen = 0usize;
         for rec in rows.iter().take(5000) {
-            let x = parse_numeric(rec.get(idx).unwrap_or("").trim());
-            let y = parse_numeric(rec.get(metric_idx).unwrap_or("").trim());
+            let raw_x = rec.get(idx).unwrap_or("").trim();
+            let raw_y = rec.get(metric_idx).unwrap_or("").trim();
+            let x = parse_numeric(raw_x);
+            if !raw_x.is_empty() {
+                seen += 1;
+                if x.is_some() {
+                    parsed_driver += 1;
+                }
+            }
+            let y = parse_numeric(raw_y);
             if let (Some(x), Some(y)) = (x, y) {
                 xs.push(x);
                 ys.push(y);
             }
+        }
+        // Require at least 60% of non-empty values to be parseable as numeric to avoid misclassifying text columns.
+        if seen > 0 && (parsed_driver as f64) / (seen as f64) < 0.6 {
+            continue;
         }
         if xs.len() < 20 {
             continue;
@@ -2881,17 +3026,27 @@ fn auto_select_numeric_drivers(
             .then_with(|| a.0.cmp(&b.0))
     });
     let mut selected = Vec::<(String, usize)>::new();
+    let mut dedup_samples = HashMap::<usize, Vec<Option<f64>>>::new();
     for (name, idx, _corr_to_metric) in scored {
-        let is_duplicate = dedup_corr_threshold
-            .map(|thr| {
-                selected.iter().any(|(_, prev_idx)| {
-                    let c = corr_between_columns(rows, idx, *prev_idx).abs();
-                    c.is_finite() && c >= thr
-                })
+        let mut candidate_sample: Option<Vec<Option<f64>>> = None;
+        let is_duplicate = if let Some(thr) = dedup_corr_threshold {
+            candidate_sample = Some(numeric_column_sample(rows, idx));
+            let sample = candidate_sample.as_ref().expect("sample is set");
+            selected.iter().any(|(_, prev_idx)| {
+                let prev_sample = dedup_samples
+                    .entry(*prev_idx)
+                    .or_insert_with(|| numeric_column_sample(rows, *prev_idx));
+                let c = corr_between_numeric_samples(sample, prev_sample).abs();
+                c.is_finite() && c >= thr
             })
-            .unwrap_or(false);
+        } else {
+            false
+        };
         if is_duplicate {
             continue;
+        }
+        if let Some(sample) = candidate_sample {
+            dedup_samples.insert(idx, sample);
         }
         selected.push((name, idx));
         if selected.len() >= top_n {
@@ -2899,26 +3054,45 @@ fn auto_select_numeric_drivers(
         }
     }
     selected
-        .into_iter()
-        .map(|(n, i)| (n, i))
+}
+
+fn numeric_column_sample(rows: &[StringRecord], col_idx: usize) -> Vec<Option<f64>> {
+    rows.iter()
+        .take(5000)
+        .map(|rec| parse_numeric(rec.get(col_idx).unwrap_or("").trim()))
         .collect::<Vec<_>>()
 }
 
-fn corr_between_columns(rows: &[StringRecord], a_idx: usize, b_idx: usize) -> f64 {
-    let mut xs = Vec::<f64>::new();
-    let mut ys = Vec::<f64>::new();
-    for rec in rows.iter().take(5000) {
-        let x = parse_numeric(rec.get(a_idx).unwrap_or("").trim());
-        let y = parse_numeric(rec.get(b_idx).unwrap_or("").trim());
+fn corr_between_numeric_samples(a: &[Option<f64>], b: &[Option<f64>]) -> f64 {
+    let mut n: usize = 0;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_x2 = 0.0;
+    let mut sum_y2 = 0.0;
+    let mut sum_xy = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
         if let (Some(x), Some(y)) = (x, y) {
-            xs.push(x);
-            ys.push(y);
+            n += 1;
+            sum_x += *x;
+            sum_y += *y;
+            sum_x2 += *x * *x;
+            sum_y2 += *y * *y;
+            sum_xy += *x * *y;
         }
     }
-    if xs.len() < 20 {
+    if n < 20 {
         0.0
     } else {
-        pearson_corr(&xs, &ys)
+        let n_f = n as f64;
+        let num = (n_f * sum_xy) - (sum_x * sum_y);
+        let den_x = (n_f * sum_x2) - (sum_x * sum_x);
+        let den_y = (n_f * sum_y2) - (sum_y * sum_y);
+        let den = (den_x * den_y).sqrt();
+        if den <= 1e-12 {
+            0.0
+        } else {
+            num / den
+        }
     }
 }
 
@@ -2941,7 +3115,11 @@ fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
         vy += dy * dy;
     }
     let den = (vx * vy).sqrt();
-    if den <= 1e-12 { 0.0 } else { num / den }
+    if den <= 1e-12 {
+        0.0
+    } else {
+        num / den
+    }
 }
 
 fn parse_period_cfg_from_investigate(
@@ -2952,7 +3130,8 @@ fn parse_period_cfg_from_investigate(
         || args.current_end.is_some()
         || args.previous_start.is_some()
         || args.previous_end.is_some();
-    let derived_windows = args.time_grain.is_some() || args.period.is_some() || args.anchor_date.is_some();
+    let derived_windows =
+        args.time_grain.is_some() || args.period.is_some() || args.anchor_date.is_some();
 
     if explicit_windows && derived_windows {
         return Err(anyhow!(
@@ -2960,23 +3139,27 @@ fn parse_period_cfg_from_investigate(
         ));
     }
 
-    let (time_grain, period, current_start, current_end, previous_start, previous_end) = if explicit_windows {
-        let cs = parse_date_arg(args.current_start.as_deref(), "--current-start is required")?;
-        let ce = parse_date_arg(args.current_end.as_deref(), "--current-end is required")?;
-        let ps = parse_date_arg(args.previous_start.as_deref(), "--previous-start is required")?;
-        let pe = parse_date_arg(args.previous_end.as_deref(), "--previous-end is required")?;
-        (None, None, cs, ce, ps, pe)
-    } else {
-        let grain = args.time_grain.unwrap_or(TimeGrain::Month);
-        let p = args.period.unwrap_or(PeriodPreset::Last);
-        let anchor = match args.anchor_date.as_deref() {
-            Some(raw) => chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-                .map_err(|_| anyhow!("invalid date '{}'; expected YYYY-MM-DD", raw))?,
-            None => chrono::Utc::now().date_naive(),
+    let (time_grain, period, current_start, current_end, previous_start, previous_end) =
+        if explicit_windows {
+            let cs = parse_date_arg(args.current_start.as_deref(), "--current-start is required")?;
+            let ce = parse_date_arg(args.current_end.as_deref(), "--current-end is required")?;
+            let ps = parse_date_arg(
+                args.previous_start.as_deref(),
+                "--previous-start is required",
+            )?;
+            let pe = parse_date_arg(args.previous_end.as_deref(), "--previous-end is required")?;
+            (None, None, cs, ce, ps, pe)
+        } else {
+            let grain = args.time_grain.unwrap_or(TimeGrain::Month);
+            let p = args.period.unwrap_or(PeriodPreset::Last);
+            let anchor = match args.anchor_date.as_deref() {
+                Some(raw) => chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                    .map_err(|_| anyhow!("invalid date '{}'; expected YYYY-MM-DD", raw))?,
+                None => chrono::Utc::now().date_naive(),
+            };
+            let ((cs, ce), (ps, pe)) = derive_period_windows(anchor, grain, p);
+            (Some(grain), Some(p), cs, ce, ps, pe)
         };
-        let ((cs, ce), (ps, pe)) = derive_period_windows(anchor, grain, p);
-        (Some(grain), Some(p), cs, ce, ps, pe)
-    };
 
     Ok(PeriodCompareConfig {
         date_column,
@@ -3211,7 +3394,7 @@ fn default_analyze_drivers_out(args: &AnalyzeDriversArgs) -> PathBuf {
     }
 }
 
-fn ensure_parent_dir(path: &PathBuf) -> Result<()> {
+fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -3264,21 +3447,36 @@ fn run_analyze_suggest(args: AnalyzeSuggestArgs) -> Result<()> {
     match args.output_format {
         SuggestOutputFormat::Md => {
             fs::write(&args.out, suggest_report_markdown(&report, &profile_path))?;
-            println!("Analyze suggest report (markdown) written to {}", args.out.display());
+            println!(
+                "Analyze suggest report (markdown) written to {}",
+                args.out.display()
+            );
         }
         SuggestOutputFormat::Json => {
             fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
-            println!("Analyze suggest report (json) written to {}", args.out.display());
+            println!(
+                "Analyze suggest report (json) written to {}",
+                args.out.display()
+            );
         }
         SuggestOutputFormat::Both => {
             fs::write(&args.out, suggest_report_markdown(&report, &profile_path))?;
             let json_path = args.out.with_extension("json");
             fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
-            println!("Analyze suggest report (markdown) written to {}", args.out.display());
-            println!("Analyze suggest report (json) written to {}", json_path.display());
+            println!(
+                "Analyze suggest report (markdown) written to {}",
+                args.out.display()
+            );
+            println!(
+                "Analyze suggest report (json) written to {}",
+                json_path.display()
+            );
         }
     }
-    println!("Suggested profile TOML written to {}", profile_path.display());
+    println!(
+        "Suggested profile TOML written to {}",
+        profile_path.display()
+    );
     Ok(())
 }
 
@@ -3364,7 +3562,8 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
             date_ok[i] as f64 / ne as f64
         };
         let distinct_count = distinct[i].len();
-        let inferred_role = infer_column_role(&name, fill_pct, distinct_count, numeric_ratio, date_ratio);
+        let inferred_role =
+            infer_column_role(&name, fill_pct, distinct_count, numeric_ratio, date_ratio);
         let mut top_values = counts[i]
             .iter()
             .map(|(k, v)| (k.clone(), *v))
@@ -3392,9 +3591,11 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
     suggested_group_by.sort_by(|a, b| {
         let a_penalty = (a.distinct_count as i64 - 12).abs();
         let b_penalty = (b.distinct_count as i64 - 12).abs();
-        a_penalty
-            .cmp(&b_penalty)
-            .then_with(|| b.fill_pct.partial_cmp(&a.fill_pct).unwrap_or(std::cmp::Ordering::Equal))
+        a_penalty.cmp(&b_penalty).then_with(|| {
+            b.fill_pct
+                .partial_cmp(&a.fill_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     let suggested_group_by = suggested_group_by
         .into_iter()
@@ -3422,17 +3623,25 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
     let suggested_date_column = columns
         .iter()
         .filter(|c| c.inferred_role == "date")
-        .max_by(|a, b| a.fill_pct.partial_cmp(&b.fill_pct).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.fill_pct
+                .partial_cmp(&b.fill_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|c| c.name.clone());
 
     let mut warnings = Vec::new();
     if suggested_group_by.is_empty() {
-        warnings.push("No strong dimension columns detected. Pass --group-by manually.".to_string());
+        warnings
+            .push("No strong dimension columns detected. Pass --group-by manually.".to_string());
     }
     if suggested_metrics.is_empty() {
         warnings.push("No strong metric columns detected. Pass --metrics manually.".to_string());
     }
-    for c in columns.iter().filter(|c| c.fill_pct < 30.0 && c.inferred_role == "dimension") {
+    for c in columns
+        .iter()
+        .filter(|c| c.fill_pct < 30.0 && c.inferred_role == "dimension")
+    {
         warnings.push(format!(
             "Dimension '{}' has low fill rate ({:.1}%).",
             c.name, c.fill_pct
@@ -3505,8 +3714,7 @@ fn metric_priority(name: &str) -> i32 {
     if n.contains("cost") || n.contains("profit") || n.contains("margin") {
         return 2;
     }
-    if n.contains("qty") || n.contains("quantity") || n.contains("count") || n.contains("orders")
-    {
+    if n.contains("qty") || n.contains("quantity") || n.contains("count") || n.contains("orders") {
         return 1;
     }
     0
@@ -3552,7 +3760,7 @@ fn build_suggested_profile_toml(
     s
 }
 
-fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf) -> String {
+fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &Path) -> String {
     let mut md = String::new();
     md.push_str("# Analyze Suggest Report\n\n");
     md.push_str(&format!("- Input: {}\n", report.input));
@@ -3561,8 +3769,14 @@ fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf
         "- Sample mode: {} (seed={})\n",
         report.sample_mode, report.sample_seed
     ));
-    md.push_str(&format!("- Suggested profile name: `{}`\n", report.profile_name));
-    md.push_str(&format!("- Suggested profile path: {}\n\n", profile_path.display()));
+    md.push_str(&format!(
+        "- Suggested profile name: `{}`\n",
+        report.profile_name
+    ));
+    md.push_str(&format!(
+        "- Suggested profile path: {}\n\n",
+        profile_path.display()
+    ));
 
     md.push_str("## Suggested Columns\n\n");
     md.push_str(&format!(
@@ -3605,7 +3819,9 @@ fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &PathBuf
     }
 
     md.push_str("## Column Profile\n\n");
-    md.push_str("| Column | Role | Fill % | Distinct | Numeric Ratio | Date Ratio | Top Values |\n");
+    md.push_str(
+        "| Column | Role | Fill % | Distinct | Numeric Ratio | Date Ratio | Top Values |\n",
+    );
     md.push_str("|---|---|---:|---:|---:|---:|---|\n");
     for c in &report.columns {
         let top_vals = c
@@ -3639,13 +3855,8 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
         .map_err(|e| anyhow!("failed to read base json '{}': {}", args.base.display(), e))?;
     let new_txt = fs::read_to_string(&args.new)
         .map_err(|e| anyhow!("failed to read new json '{}': {}", args.new.display(), e))?;
-    let base: serde_json::Value = serde_json::from_str(&base_txt).map_err(|e| {
-        anyhow!(
-            "failed to parse base json '{}': {}",
-            args.base.display(),
-            e
-        )
-    })?;
+    let base: serde_json::Value = serde_json::from_str(&base_txt)
+        .map_err(|e| anyhow!("failed to parse base json '{}': {}", args.base.display(), e))?;
     let new: serde_json::Value = serde_json::from_str(&new_txt)
         .map_err(|e| anyhow!("failed to parse new json '{}': {}", args.new.display(), e))?;
 
@@ -3774,7 +3985,10 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
     match args.output_format {
         CompareOutputFormat::Md => {
             fs::write(&out_path, md)?;
-            println!("Comparison report (markdown) written to {}", out_path.display());
+            println!(
+                "Comparison report (markdown) written to {}",
+                out_path.display()
+            );
         }
         CompareOutputFormat::Html => {
             fs::write(&out_path, markdown_to_html(&md))?;
@@ -3788,8 +4002,14 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
             fs::write(&out_path, md)?;
             let json_path = out_path.with_extension("json");
             fs::write(&json_path, serde_json::to_string_pretty(&json_out)?)?;
-            println!("Comparison report (markdown) written to {}", out_path.display());
-            println!("Comparison report (json) written to {}", json_path.display());
+            println!(
+                "Comparison report (markdown) written to {}",
+                out_path.display()
+            );
+            println!(
+                "Comparison report (json) written to {}",
+                json_path.display()
+            );
         }
     }
     Ok(())
@@ -3819,7 +4039,10 @@ fn groups_to_map(v: &serde_json::Value, primary_metric: &str) -> HashMap<String,
             .unwrap_or("(unknown)")
             .to_string();
         let count = g.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
-        let share = g.get("count_share_pct").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let share = g
+            .get("count_share_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
         let primary = g
             .get(primary_metric)
             .and_then(|x| x.as_f64())
@@ -3959,13 +4182,8 @@ fn connect_postgres(
         })?;
         let mut reader = BufReader::new(file);
         for cert in rustls_pemfile::certs(&mut reader) {
-            let cert = cert.map_err(|e| {
-                anyhow!(
-                    "failed to parse PEM cert in '{}': {}",
-                    path.display(),
-                    e
-                )
-            })?;
+            let cert = cert
+                .map_err(|e| anyhow!("failed to parse PEM cert in '{}': {}", path.display(), e))?;
             if root_store.add(cert).is_err() {
                 // Ignore invalid certs; continue loading others.
             }
@@ -4122,7 +4340,7 @@ fn apply_profile_entry(args: &mut AnalyzeArgs, entry: &AnalyzeProfile) {
 
 fn build_prompt_context(
     summary: &factor_io::ArtifactSummary,
-    artifacts: &PathBuf,
+    artifacts: &Path,
     focus_factors: &[String],
     insight: Option<&AttributionInsight>,
     labels: &FactorLabels,
@@ -4180,7 +4398,7 @@ fn build_prompt_context(
 }
 
 fn attribution_worst_day(
-    artifacts: &PathBuf,
+    artifacts: &Path,
     focus_factors: &[String],
 ) -> Result<Option<AttributionInsight>> {
     let path = artifacts.join("attribution.csv");
@@ -4220,7 +4438,8 @@ fn attribution_worst_day(
         })
         .collect::<Vec<_>>();
 
-    let mut worst: Option<(String, f64, Vec<(String, f64)>)> = None;
+    type WorstAttribution = (String, f64, Vec<(String, f64)>);
+    let mut worst: Option<WorstAttribution> = None;
     for row in rdr.records() {
         let row = row?;
         let date = row_get(&row, date_idx)?.to_string();
@@ -4291,7 +4510,7 @@ fn factor_index(raw: &str) -> Option<usize> {
     s.parse::<usize>().ok()
 }
 
-fn row_get<'a>(row: &'a StringRecord, idx: usize) -> Result<&'a str> {
+fn row_get(row: &StringRecord, idx: usize) -> Result<&str> {
     row.get(idx)
         .ok_or_else(|| anyhow!("invalid csv index {}", idx))
 }
@@ -4365,7 +4584,7 @@ fn auto_factor_labels(summary: &factor_io::ArtifactSummary) -> FactorLabels {
         let high_list = pairs
             .iter()
             .rev()
-            .filter(|(t, _)| !low_list.iter().any(|x| *x == t.as_str()))
+            .filter(|(t, _)| !low_list.contains(&t.as_str()))
             .take(2)
             .map(|(t, _)| t.as_str())
             .collect::<Vec<_>>();
@@ -4683,6 +4902,7 @@ struct AnalyzeProfile {
     auto_group_k: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_table_csv(
     input: &PathBuf,
     profile: Option<&str>,
@@ -4759,18 +4979,18 @@ fn analyze_table_csv(
     };
     if !count_only {
         if let Some(rb) = rank_by {
-        if rank_metric.is_none() {
-            return Err(anyhow!(
-                "rank metric '{}' not found. Available metrics: {}",
-                rb,
-                metric_cols
-                    .iter()
-                    .map(|(m, _)| m.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            if rank_metric.is_none() {
+                return Err(anyhow!(
+                    "rank metric '{}' not found. Available metrics: {}",
+                    rb,
+                    metric_cols
+                        .iter()
+                        .map(|(m, _)| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
-    }
     }
 
     let group_idxs = resolved_groups
@@ -4853,12 +5073,7 @@ fn analyze_table_csv(
         if !matches_where_filters(&rec, &where_filters) {
             continue;
         }
-        let gk = compose_group_key(
-            &rec,
-            &group_idxs,
-            &resolved_groups,
-            normalize_text_groups,
-        );
+        let gk = compose_group_key(&rec, &group_idxs, &resolved_groups, normalize_text_groups);
         if exclude_blank_groups && is_blank_group_key(&gk) {
             continue;
         }
@@ -4915,7 +5130,6 @@ fn analyze_table_csv(
                 }
             }
         }
-
     }
     let total_count_all = by_group.values().map(|(c, _)| *c).sum::<u64>();
     let blank_count_all = by_group
@@ -5011,7 +5225,11 @@ fn analyze_table_csv(
     md.push_str(&format!("- Minimum records per segment: {}\n", min_records));
     md.push_str(&format!(
         "- Metric aggregation: {}\n",
-        if count_only { "Count-only (no numeric metrics)" } else { agg.label() }
+        if count_only {
+            "Count-only (no numeric metrics)"
+        } else {
+            agg.label()
+        }
     ));
     if !percentiles.is_empty() {
         md.push_str(&format!(
@@ -5202,17 +5420,23 @@ fn analyze_table_csv(
                 (g.clone(), *cc, *cv, *pc, *pv, d_metric, d_count)
             })
             .collect::<Vec<_>>();
-        movers.sort_by(|a, b| {
-            a.5.partial_cmp(&b.5)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        movers.sort_by(|a, b| a.5.partial_cmp(&b.5).unwrap_or(std::cmp::Ordering::Equal));
         let mut concentration_movers = period_by_group
             .iter()
             .map(|(g, (cc, cv, pc, pv))| {
                 let base_share = pct(*pc, period_totals.2);
                 let new_share = pct(*cc, period_totals.0);
                 let d_share = new_share - base_share;
-                (g.clone(), *pc, *cc, base_share, new_share, d_share, *pv, *cv)
+                (
+                    g.clone(),
+                    *pc,
+                    *cc,
+                    base_share,
+                    new_share,
+                    d_share,
+                    *pv,
+                    *cv,
+                )
             })
             .collect::<Vec<_>>();
         concentration_movers.sort_by(|a, b| {
@@ -5220,23 +5444,31 @@ fn analyze_table_csv(
                 .partial_cmp(&a.5.abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let prev_seg_count = period_by_group.values().filter(|(_, _, pc, _)| *pc > 0).count();
-        let curr_seg_count = period_by_group.values().filter(|(cc, _, _, _)| *cc > 0).count();
-        let prev_top5_count = concentration_movers.iter().take(5).map(|x| x.1).sum::<u64>();
-        let curr_top5_count = concentration_movers.iter().take(5).map(|x| x.2).sum::<u64>();
+        let prev_seg_count = period_by_group
+            .values()
+            .filter(|(_, _, pc, _)| *pc > 0)
+            .count();
+        let curr_seg_count = period_by_group
+            .values()
+            .filter(|(cc, _, _, _)| *cc > 0)
+            .count();
+        let prev_top5_count = concentration_movers
+            .iter()
+            .take(5)
+            .map(|x| x.1)
+            .sum::<u64>();
+        let curr_top5_count = concentration_movers
+            .iter()
+            .take(5)
+            .map(|x| x.2)
+            .sum::<u64>();
         let prev_top5_pct = pct(prev_top5_count, period_totals.2);
         let curr_top5_pct = pct(curr_top5_count, period_totals.0);
 
         md.push_str("## Period Comparison\n\n");
-        md.push_str(&format!(
-            "- Date column: `{}`\n",
-            cfg.date_column
-        ));
+        md.push_str(&format!("- Date column: `{}`\n", cfg.date_column));
         if let (Some(g), Some(p)) = (cfg.time_grain, cfg.period) {
-            md.push_str(&format!(
-                "- Window mode: {:?} / {:?}\n",
-                g, p
-            ));
+            md.push_str(&format!("- Window mode: {:?} / {:?}\n", g, p));
         }
         md.push_str(&format!(
             "- Current window: {} to {} (records={})\n",
@@ -5262,7 +5494,9 @@ fn analyze_table_csv(
         ));
         md.push('\n');
         md.push_str("### Top Concentration Changes\n\n");
-        for (i, (g, pc, cc, _bs, _ns, d_share, _pv, _cv)) in concentration_movers.iter().take(5).enumerate() {
+        for (i, (g, pc, cc, _bs, _ns, d_share, _pv, _cv)) in
+            concentration_movers.iter().take(5).enumerate()
+        {
             md.push_str(&format!(
                 "{}. `{}`   {} -> {} records ({:+.1} pp)\n",
                 i + 1,
@@ -5436,10 +5670,7 @@ fn analyze_table_csv(
             })
             .collect::<Vec<_>>();
 
-        by_count_share.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        by_count_share.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         for (group, count, count_share, _, primary_share, _) in
             by_count_share.iter().take(top_insights)
         {
@@ -5465,10 +5696,8 @@ fn analyze_table_csv(
 
         if let Some(pm) = &primary_metric {
             let mut by_per_record = by_count_share.clone();
-            by_per_record.sort_by(|a, b| {
-                b.5.partial_cmp(&a.5)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            by_per_record
+                .sort_by(|a, b| b.5.partial_cmp(&a.5).unwrap_or(std::cmp::Ordering::Equal));
             for (group, count, _, _, _, per_record) in by_per_record
                 .iter()
                 .filter(|(g, c, _, _, _, _)| {
@@ -5528,7 +5757,7 @@ fn analyze_table_csv(
     }
 
     md.push_str("## Top Groups\n\n");
-    md.push_str("|");
+    md.push('|');
     for g in &resolved_groups {
         md.push_str(&format!(" {} |", g));
     }
@@ -5541,7 +5770,7 @@ fn analyze_table_csv(
         }
     }
     md.push('\n');
-    md.push_str("|");
+    md.push('|');
     for _ in &resolved_groups {
         md.push_str("---|");
     }
@@ -5577,10 +5806,10 @@ fn analyze_table_csv(
                 && m == primary_metric.as_deref().unwrap_or("")
                 && total_primary.abs() > 1e-12
             {
-                    (v / total_primary) * 100.0
-                } else {
-                    0.0
-                };
+                (v / total_primary) * 100.0
+            } else {
+                0.0
+            };
             if agg == AggKind::Sum && m == primary_metric.as_deref().unwrap_or("") {
                 line.push_str(&format!(" {} | {:.1}% |", fmt_num(v, 2), share));
             } else {
@@ -5857,7 +6086,7 @@ fn auto_detect_numeric_metrics(
 }
 
 fn parse_numeric(v: &str) -> Option<f64> {
-    let s = v.replace(',', "").replace('$', "");
+    let s = v.replace([',', '$'], "");
     s.parse::<f64>().ok()
 }
 
@@ -5905,10 +6134,7 @@ mod tests {
     fn read_csv_rows(path: &PathBuf) -> (StringRecord, Vec<StringRecord>) {
         let mut rdr = csv::Reader::from_path(path).expect("read csv");
         let headers = rdr.headers().expect("headers").clone();
-        let rows = rdr
-            .records()
-            .map(|r| r.expect("row"))
-            .collect::<Vec<_>>();
+        let rows = rdr.records().map(|r| r.expect("row")).collect::<Vec<_>>();
         (headers, rows)
     }
 
@@ -5961,6 +6187,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_driver_filters_matches_column_name_and_expression() {
+        let included = apply_driver_filters(
+            vec![
+                DriverSpec {
+                    label: "sum(revenue_usd)".to_string(),
+                    col_idx: Some(1),
+                    agg: DriverAgg::Sum,
+                },
+                DriverSpec {
+                    label: "count_distinct(channel)".to_string(),
+                    col_idx: Some(2),
+                    agg: DriverAgg::CountDistinct,
+                },
+            ],
+            &["revenue_usd".to_string()],
+            &[],
+        );
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].label, "sum(revenue_usd)");
+
+        let excluded = apply_driver_filters(
+            vec![
+                DriverSpec {
+                    label: "sum(revenue_usd)".to_string(),
+                    col_idx: Some(1),
+                    agg: DriverAgg::Sum,
+                },
+                DriverSpec {
+                    label: "count_distinct(channel)".to_string(),
+                    col_idx: Some(2),
+                    agg: DriverAgg::CountDistinct,
+                },
+            ],
+            &[],
+            &["channel".to_string()],
+        );
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].label, "sum(revenue_usd)");
+    }
+
+    #[test]
     fn auto_select_numeric_drivers_skips_count_like_columns() {
         let headers = StringRecord::from(vec![
             "quote_group_created_at",
@@ -5982,11 +6249,57 @@ mod tests {
             .collect::<Vec<_>>();
 
         let selected = auto_select_numeric_drivers(&headers, &rows, 1, 0, 5, None);
-        let names = selected.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+        let names = selected
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
 
         assert!(names.contains(&"net_gmv".to_string()));
         assert!(!names.contains(&"count_proposal_per_quote_group".to_string()));
         assert!(!names.contains(&"advantage_plan".to_string()));
+    }
+
+    #[test]
+    fn auto_select_numeric_drivers_respects_zero_top_n() {
+        let headers = StringRecord::from(vec!["date", "revenue_usd", "units"]);
+        let rows = (0..40)
+            .map(|i| {
+                StringRecord::from(vec![
+                    format!("2026-03-{:02}", (i % 28) + 1),
+                    format!("{}", 100.0 + (i as f64)),
+                    format!("{}", 10 + i),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        let selected = auto_select_numeric_drivers(&headers, &rows, 1, 0, 0, None);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn auto_select_numeric_drivers_handles_sparse_metric_values() {
+        let headers = StringRecord::from(vec!["date", "revenue_usd", "units"]);
+        let rows = (0..120)
+            .map(|i| {
+                let metric = if i < 24 {
+                    format!("{}", 100.0 + (i as f64))
+                } else {
+                    "".to_string()
+                };
+                StringRecord::from(vec![
+                    format!("2026-03-{:02}", (i % 28) + 1),
+                    metric,
+                    format!("{}", 1000 + i),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        let selected = auto_select_numeric_drivers(&headers, &rows, 1, 0, 3, None);
+        let names = selected
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"units".to_string()));
     }
 
     #[test]
@@ -6054,6 +6367,8 @@ mod tests {
             input: PathBuf::from("data/demo.csv"),
             metric: "revenue".to_string(),
             drivers: vec![],
+            driver_include: vec![],
+            driver_exclude: vec![],
             driver_preset: None,
             auto_drivers: AutoDriversMode::Deterministic,
             dedup_drivers: true,
@@ -6090,7 +6405,12 @@ mod tests {
 
         let actual = aggregate_column(&rows, metric_idx, DriverAgg::Sum);
         let predicted = aggregate_identity_prediction(&rows, &identity);
-        assert!((actual - predicted).abs() < 1e-6, "actual={} predicted={}", actual, predicted);
+        assert!(
+            (actual - predicted).abs() < 1e-6,
+            "actual={} predicted={}",
+            actual,
+            predicted
+        );
     }
 
     #[test]
@@ -6103,13 +6423,7 @@ mod tests {
             .expect("identity found");
 
         let summary = analyze_drivers_residual_summary(
-            &headers,
-            &rows,
-            &rows,
-            metric_idx,
-            &identity,
-            0.1,
-            5_970.47,
+            &headers, &rows, &rows, metric_idx, &identity, 0.1, 5_970.47,
         );
         assert!(summary.signals.is_empty());
     }
@@ -6124,13 +6438,7 @@ mod tests {
             .expect("identity found");
 
         let summary = analyze_drivers_residual_summary(
-            &headers,
-            &rows,
-            &rows,
-            metric_idx,
-            &identity,
-            1.5,
-            77_765.73,
+            &headers, &rows, &rows, metric_idx, &identity, 1.5, 77_765.73,
         );
         assert!(!summary.signals.is_empty());
         assert!(
@@ -6211,7 +6519,7 @@ fn build_analysis_prompt_context(v: &serde_json::Value, evidence: &[String]) -> 
                 .collect::<Vec<_>>()
                 .join("; ")
         })
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
     let evidence_block = if evidence.is_empty() {
         "none".to_string()
     } else {
@@ -6314,8 +6622,8 @@ fn normalize_group_value(s: &str) -> String {
 fn tokenize_words(s: &str) -> Vec<String> {
     let normalized = normalize_group_value(s);
     const STOP: &[&str] = &[
-        "the", "and", "for", "of", "to", "in", "on", "with", "a", "an", "or", "by", "from",
-        "per", "will", "assumes", "assume", "data",
+        "the", "and", "for", "of", "to", "in", "on", "with", "a", "an", "or", "by", "from", "per",
+        "will", "assumes", "assume", "data",
     ];
     normalized
         .split_whitespace()
@@ -6394,9 +6702,7 @@ fn percentile_value(values: &[f64], q: f64) -> f64 {
 
 fn pseudo_rand_below(state: &mut u64, upper_exclusive: u64) -> u64 {
     // Deterministic LCG-based pseudo-random for lightweight sampling.
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1);
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
     if upper_exclusive == 0 {
         0
     } else {

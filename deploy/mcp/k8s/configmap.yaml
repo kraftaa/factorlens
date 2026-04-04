@@ -13,4 +13,3 @@ data:
   FACTORLENS_ALLOWED_WRITE_DIRS: "/artifacts"
   FASTMCP_STATELESS_HTTP: "true"
   AWS_REGION: "eu-central-1"
-

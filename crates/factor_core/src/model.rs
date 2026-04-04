@@ -4,6 +4,8 @@ use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+type PriceReturnMatrix = (Vec<NaiveDate>, Vec<String>, Vec<Vec<f64>>);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricePoint {
     pub date: NaiveDate,
@@ -235,9 +237,7 @@ pub fn compute_outliers(
     out
 }
 
-fn prices_to_return_matrix(
-    prices: &[PricePoint],
-) -> Result<(Vec<NaiveDate>, Vec<String>, Vec<Vec<f64>>)> {
+fn prices_to_return_matrix(prices: &[PricePoint]) -> Result<PriceReturnMatrix> {
     if prices.is_empty() {
         return Err(anyhow!("no prices"));
     }

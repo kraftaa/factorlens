@@ -6,7 +6,7 @@
 # - Python MCP server wrapper
 # - streamable HTTP transport support
 
-docker build -f deploy/mcp/docker/Dockerfile -t ghcr.io/kraftaa/factorlens-mcp:0.2.9 .
+docker build -f deploy/mcp/docker/Dockerfile -t ghcr.io/kraftaa/factorlens-mcp:0.3.8 .
 
 
 ## 1) Run MCP server locally in Docker
@@ -15,18 +15,20 @@ docker build -f deploy/mcp/docker/Dockerfile -t ghcr.io/kraftaa/factorlens-mcp:0
 # - /data: CSV inputs (read-only)
 # - /profiles: profile TOML (read-only)
 # - /artifacts: outputs (read-write)
+# - /certs: CA bundle for TLS DB connections (read-only)
 
 docker run --rm -p 8010:8010 \
   -e MCP_TRANSPORT=streamable-http \
   -e FASTMCP_HOST=0.0.0.0 \
   -e FASTMCP_PORT=8010 \
   -e FASTMCP_STREAMABLE_HTTP_PATH=/mcp \
-  -e FACTORLENS_ALLOWED_READ_DIRS=/data,/profiles,/artifacts \
+  -e FACTORLENS_ALLOWED_READ_DIRS=/data,/profiles,/artifacts,/certs \
   -e FACTORLENS_ALLOWED_WRITE_DIRS=/artifacts \
-  -v /Users/maria/Documents/GitHub/extra/factorlens/data:/data:ro \
-  -v /Users/maria/Documents/GitHub/extra/factorlens/profiles:/profiles:ro \
-  -v /Users/maria/Documents/GitHub/extra/factorlens/artifacts:/artifacts \
-  ghcr.io/kraftaa/factorlens-mcp:0.2.9
+  -v /path/to/factorlens/data:/data:ro \
+  -v /path/to/factorlens/profiles:/profiles:ro \
+  -v /path/to/factorlens/artifacts:/artifacts \
+  -v /path/to/factorlens/certs:/certs:ro \
+  ghcr.io/kraftaa/factorlens-mcp:0.3.8
 
 
 ## 2) Health check the MCP endpoint
@@ -93,8 +95,8 @@ curl -i -X POST http://127.0.0.1:8010/mcp \
 ## 6) Verify generated files on host
 # These paths are on your Mac because /artifacts is volume-mounted.
 
-ls -lh /Users/maria/Documents/GitHub/extra/factorlens/artifacts/demo_sales_mcp.md
-ls -lh /Users/maria/Documents/GitHub/extra/factorlens/artifacts/demo_sales_mcp.json
+ls -lh /path/to/factorlens/artifacts/demo_sales_mcp.md
+ls -lh /path/to/factorlens/artifacts/demo_sales_mcp.json
 
 
 ## 7) Common issues
@@ -193,7 +195,7 @@ curl -i -X POST http://127.0.0.1:8010/mcp \
 
 ## K6) Run full analysis query
 
-export Q_ANALYZE='select discipline, advantage_plan, net_gmv from transform.analytics.sales limit 5000'
+export Q_ANALYZE='select category, customer, date, order_id, retail_amount from public.orders'
 
 cat > /tmp/mcp_analyze.json <<EOF
 {
@@ -207,10 +209,10 @@ cat > /tmp/mcp_analyze.json <<EOF
       "query": $(python3 -c 'import json,os; print(json.dumps(os.environ["Q_ANALYZE"]))'),
       "postgres_ssl_mode": "require",
       "postgres_ca_file": "/certs/rds-global-bundle.pem",
-      "group_by_csv": "discipline,advantage_plan",
-      "metrics_csv": "net_gmv",
-      "rank_by": "net_gmv",
-      "out": "/artifacts/market_mcp.md",
+      "group_by_csv": "category,customer",
+      "metrics_csv": "retail_amount",
+      "rank_by": "retail_amount",
+      "out": "/artifacts/orders_mcp.md",
       "output_format": "both"
     }
   }
@@ -236,7 +238,7 @@ cat > /tmp/mcp_explain.json <<EOF
     "arguments": {
       "backend": "bedrock",
       "model": "anthropic.claude-3-haiku-20240307-v1:0",
-      "analysis_json": "/artifacts/market_mcp.json",
+      "analysis_json": "/artifacts/orders_mcp.json",
       "question": "Top concentration risks and 3 actions?"
     }
   }
@@ -262,16 +264,16 @@ curl -i -X POST http://127.0.0.1:8010/mcp \
 "params":{
 "name":"analyze_query",
 "arguments":{
-"query":"select discipline, advantage_plan, net_gmv from transform.analytics.sales limit 5000",
-"postgres_ssl_mode":"require",
-"postgres_ca_file":"/certs/rds-global-bundle.pem",
-"group_by_csv":"discipline,advantage_plan",
-"metrics_csv":"net_gmv",
-"rank_by":"net_gmv",
-"out":"/artifacts/market_mcp.md",
-"output_format":"both"
-}
-}
+  "query":"select category, customer, date, order_id, retail_amount from public.orders",
+  "postgres_ssl_mode":"require",
+  "postgres_ca_file":"/certs/rds-global-bundle.pem",
+  "group_by_csv":"category,customer",
+  "metrics_csv":"retail_amount",
+  "rank_by":"retail_amount",
+  "out":"/artifacts/orders_mcp.md",
+  "output_format":"both"
+  }
+ }
 }'
 curl -i -X POST http://127.0.0.1:8010/mcp \
 -H "Content-Type: application/json" \
@@ -285,13 +287,13 @@ curl -i -X POST http://127.0.0.1:8010/mcp \
 \"name\":\"analyze_query\",
 \"arguments\":{
 \"postgres_url\":\"$PG_URL\",
-\"query\":\"select discipline, advantage_plan, net_gmv from transform.analytics.sales limit 5000\",
+\"query\":\"select category, customer, date, order_id, retail_amount from public.orders\",
 \"postgres_ssl_mode\":\"require\",
 \"postgres_ca_file\":\"/certs/rds-global-bundle.pem\",
-\"group_by_csv\":\"discipline,advantage_plan\",
-\"metrics_csv\":\"net_gmv\",
-\"rank_by\":\"net_gmv\",
-\"out\":\"/artifacts/market_mcp.md\",
+\"group_by_csv\":\"category,customer\",
+\"metrics_csv\":\"retail_amount\",
+\"rank_by\":\"retail_amount\",
+\"out\":\"/artifacts/orders_mcp.md\",
 \"output_format\":\"both\"
 }
 }
