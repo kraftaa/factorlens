@@ -50,6 +50,14 @@ mcp = FastMCP(
 
 VALID_OUTPUT_FORMATS = {"md", "json", "both", "html"}
 VALID_COMPARE_OUTPUT_FORMATS = {"md", "html", "json", "both"}
+VALID_INVESTIGATE_OUTPUT_FORMATS = {"md", "json", "both"}
+VALID_INVESTIGATE_PLANNERS = {"deterministic", "llm"}
+VALID_INVESTIGATE_MODES = {
+    "change_drivers",
+    "concentration_drivers",
+    "compare_snapshots",
+    "recommend_next",
+}
 VALID_BACKENDS = {"local", "bedrock"}
 VALID_POSTGRES_SSL_MODES = {"disable", "prefer", "require"}
 
@@ -607,17 +615,121 @@ def analyze_compare(
 
 
 @mcp.tool()
+def investigate(
+    question: str,
+    base: str,
+    new: str,
+    out: str,
+    config: str | None = None,
+    mode: str | None = None,
+    metric: str | None = None,
+    dimensions_csv: str | None = None,
+    drill_fields_csv: str | None = None,
+    max_depth: int = 2,
+    max_branches: int = 1,
+    min_contribution: float = 5.0,
+    min_score_improvement: float = 0.0,
+    min_slice_rows: int = 5,
+    top_movers: int = 12,
+    planner: str = "deterministic",
+    planner_backend: str = "local",
+    planner_model: str | None = None,
+    verbose: bool = False,
+    trace: bool = False,
+    output_format: str = "both",
+    timeout_sec: int | None = None,
+) -> str:
+    if not question.strip():
+        raise ValueError("question must not be empty")
+    if output_format not in VALID_INVESTIGATE_OUTPUT_FORMATS:
+        raise ValueError(
+            f"output_format must be one of {sorted(VALID_INVESTIGATE_OUTPUT_FORMATS)}"
+        )
+    if mode is not None and mode not in VALID_INVESTIGATE_MODES:
+        raise ValueError(f"mode must be one of {sorted(VALID_INVESTIGATE_MODES)}")
+    if max_depth < 1:
+        raise ValueError("max_depth must be >= 1")
+    if max_branches < 1:
+        raise ValueError("max_branches must be >= 1")
+    if min_score_improvement < 0.0:
+        raise ValueError("min_score_improvement must be >= 0")
+    if min_slice_rows < 1:
+        raise ValueError("min_slice_rows must be >= 1")
+    if top_movers < 1:
+        raise ValueError("top_movers must be >= 1")
+    if planner not in VALID_INVESTIGATE_PLANNERS:
+        raise ValueError(f"planner must be one of {sorted(VALID_INVESTIGATE_PLANNERS)}")
+    if planner_backend not in VALID_BACKENDS:
+        raise ValueError(f"planner_backend must be one of {sorted(VALID_BACKENDS)}")
+
+    base_path = _validate_read_path(base, "base")
+    new_path = _validate_read_path(new, "new")
+    out_path = _validate_write_path(out, "out")
+    config_path: Path | None = None
+    if config:
+        config_path = _validate_read_path(config, "config")
+
+    cmd = [
+        "investigate",
+        "--question",
+        question,
+        "--base",
+        str(base_path),
+        "--new",
+        str(new_path),
+        "--out",
+        str(out_path),
+        "--output-format",
+        output_format,
+        "--max-depth",
+        str(max_depth),
+        "--max-branches",
+        str(max_branches),
+        "--min-contribution",
+        str(min_contribution),
+        "--min-score-improvement",
+        str(min_score_improvement),
+        "--min-slice-rows",
+        str(min_slice_rows),
+        "--top-movers",
+        str(top_movers),
+        "--planner",
+        planner,
+        "--planner-backend",
+        planner_backend,
+    ]
+
+    _append_optional(cmd, "--metric", metric)
+    if config_path:
+        cmd.extend(["--config", str(config_path)])
+    _append_optional(cmd, "--mode", mode)
+    _append_optional(cmd, "--dimensions", dimensions_csv)
+    _append_optional(cmd, "--drill-fields", drill_fields_csv)
+    _append_optional(cmd, "--planner-model", planner_model)
+    if verbose:
+        cmd.append("--verbose")
+    if trace:
+        cmd.append("--trace")
+
+    return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
 def explain_analyze(
     analysis_json: str,
     question: str,
     backend: str = "bedrock",
     model: str = "anthropic.claude-3-haiku-20240307-v1:0",
+    strict_facts: bool = True,
+    max_bullets: int = 5,
     timeout_sec: int | None = None,
 ) -> str:
     if backend not in VALID_BACKENDS:
         raise ValueError(f"backend must be one of {sorted(VALID_BACKENDS)}")
     if not question.strip():
         raise ValueError("question must not be empty")
+    if max_bullets < 1:
+        raise ValueError("max_bullets must be >= 1")
 
     analysis_path = _validate_read_path(analysis_json, "analysis_json")
 
@@ -631,7 +743,13 @@ def explain_analyze(
         str(analysis_path),
         "--question",
         question,
+        "--max-bullets",
+        str(max_bullets),
     ]
+    if strict_facts:
+        cmd.extend(["--strict-facts", "true"])
+    else:
+        cmd.extend(["--strict-facts", "false"])
 
     return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
 

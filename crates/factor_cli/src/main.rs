@@ -10,7 +10,7 @@ use factor_io::{
     list_artifact_paths, read_artifact_summary, read_holdings_as_weights_csv, read_portfolio_csv,
     read_prices_csv, write_factor_artifacts,
 };
-use llm_local::{build_client, Backend};
+use llm_local::{build_client, Backend, LlmClient};
 use nalgebra::{DMatrix, DVector};
 use postgres::{Client, NoTls};
 use postgres_rustls::MakeTlsConnector;
@@ -63,6 +63,10 @@ enum Commands {
         analysis_json: PathBuf,
         #[arg(long)]
         question: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        strict_facts: bool,
+        #[arg(long, default_value_t = 5)]
+        max_bullets: usize,
     },
     Report {
         #[arg(long)]
@@ -75,10 +79,13 @@ enum Commands {
     Analyze(AnalyzeArgs),
     AnalyzePeriod(AnalyzeArgs),
     AnalyzeValidate(AnalyzeArgs),
+    /// Legacy/specialized numeric-driver decomposition (prefer `investigate` for new workflows).
     AnalyzeInvestigate(InvestigateArgs),
     AnalyzeDrivers(AnalyzeDriversArgs),
     AnalyzeSuggest(AnalyzeSuggestArgs),
     AnalyzeCompare(AnalyzeCompareArgs),
+    /// Guided multi-step change investigation across snapshots/periods.
+    Investigate(InvestigateWorkflowArgs),
 }
 
 #[derive(Subcommand)]
@@ -209,6 +216,78 @@ struct AnalyzeCompareArgs {
 }
 
 #[derive(Args, Clone)]
+struct InvestigateWorkflowArgs {
+    #[arg(long, default_value_t = String::new())]
+    question: String,
+    #[arg(long, value_enum)]
+    mode: Option<InvestigationModeArg>,
+    #[arg(long, visible_alias = "profile")]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    base: Option<PathBuf>,
+    #[arg(long)]
+    new: Option<PathBuf>,
+    #[arg(long)]
+    postgres_url: Option<String>,
+    #[arg(long, value_enum, default_value = "prefer")]
+    postgres_ssl_mode: PostgresSslMode,
+    #[arg(long)]
+    postgres_ca_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "query_file")]
+    query: Option<String>,
+    #[arg(long, conflicts_with = "query")]
+    query_file: Option<PathBuf>,
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(long)]
+    date_column: Option<String>,
+    #[arg(long, value_enum)]
+    time_grain: Option<TimeGrain>,
+    #[arg(long, value_enum)]
+    period: Option<PeriodPreset>,
+    #[arg(long)]
+    anchor_date: Option<String>,
+    #[arg(long)]
+    current_start: Option<String>,
+    #[arg(long)]
+    current_end: Option<String>,
+    #[arg(long)]
+    previous_start: Option<String>,
+    #[arg(long)]
+    previous_end: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    dimensions: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    drill_fields: Vec<String>,
+    #[arg(long, default_value_t = 2)]
+    max_depth: usize,
+    #[arg(long, default_value_t = 1)]
+    max_branches: usize,
+    #[arg(long, default_value_t = 5.0)]
+    min_contribution: f64,
+    #[arg(long, default_value_t = 0.0)]
+    min_score_improvement: f64,
+    #[arg(long, default_value_t = 5)]
+    min_slice_rows: u64,
+    #[arg(long, default_value_t = 12)]
+    top_movers: usize,
+    #[arg(long, value_enum, default_value = "deterministic")]
+    planner: InvestigationPlanner,
+    #[arg(long, value_enum, default_value = "local")]
+    planner_backend: BackendArg,
+    #[arg(long)]
+    planner_model: Option<String>,
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+    #[arg(long, default_value_t = false)]
+    trace: bool,
+    #[arg(long, value_enum, default_value = "both")]
+    output_format: InvestigateOutputFormat,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Clone)]
 struct AnalyzeSuggestArgs {
     #[arg(long)]
     input: PathBuf,
@@ -228,6 +307,8 @@ struct AnalyzeSuggestArgs {
     sample_seed: u64,
     #[arg(long)]
     out_profile: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "toml")]
+    profile_format: SuggestProfileFormat,
     #[arg(long, value_enum, default_value = "both")]
     output_format: SuggestOutputFormat,
 }
@@ -328,6 +409,12 @@ enum SuggestOutputFormat {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum SuggestProfileFormat {
+    Toml,
+    Json,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
 enum SampleMode {
     Head,
     Random,
@@ -345,6 +432,32 @@ enum DriverPreset {
     Amount,
     Category,
     Mixed,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
+enum InvestigationMode {
+    ChangeDrivers,
+    ConcentrationDrivers,
+    CompareSnapshots,
+    RecommendNext,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum InvestigationPlanner {
+    Deterministic,
+    Llm,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+enum InvestigationModeArg {
+    #[value(name = "change_drivers", alias = "change-drivers")]
+    ChangeDrivers,
+    #[value(name = "concentration_drivers", alias = "concentration-drivers")]
+    ConcentrationDrivers,
+    #[value(name = "compare_snapshots", alias = "compare-snapshots")]
+    CompareSnapshots,
+    #[value(name = "recommend_next", alias = "recommend-next")]
+    RecommendNext,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -598,6 +711,8 @@ fn main() -> Result<()> {
             model,
             analysis_json,
             question,
+            strict_facts,
+            max_bullets,
         } => {
             let analysis = fs::read_to_string(&analysis_json).map_err(|e| {
                 anyhow!(
@@ -621,9 +736,15 @@ fn main() -> Result<()> {
             let client = build_client(backend, model);
             let evidence = build_analysis_evidence(&v);
             let context = build_analysis_prompt_context(&v, &evidence);
-            let system = "You are an analytics assistant. Use only provided analysis context. If missing, say unknown. Respond in plain text with concise bullets and concrete actions. Cite evidence IDs like [E1], [E2] for each claim.";
+            let system = "You are an analytics assistant. Use only provided analysis context. If missing, say unknown. Respond in plain text bullets only. Cite evidence IDs like [E1], [E2] for each factual claim. Use at most 2 decimal places.";
             let user = format!("Question: {}\n\nAnalysis context:\n{}", question, context);
-            let answer = client.answer(system, &user)?;
+            let raw = client.answer(system, &user)?;
+            let max_bullets = max_bullets.max(1);
+            let mut answer = sanitize_explain_analyze_answer(&raw, max_bullets);
+            if strict_facts && !explain_analyze_answer_is_usable(&answer, &evidence) {
+                answer =
+                    deterministic_explain_analyze_from_evidence(&question, &evidence, max_bullets);
+            }
             println!("{}", answer.trim());
             if !evidence.is_empty() {
                 println!("\nEvidence:");
@@ -665,6 +786,9 @@ fn main() -> Result<()> {
         }
         Commands::AnalyzeCompare(args) => {
             run_analyze_compare(args)?;
+        }
+        Commands::Investigate(args) => {
+            run_investigate_workflow(args)?;
         }
     }
 
@@ -3432,17 +3556,18 @@ struct AnalyzeSuggestReport {
 
 fn run_analyze_suggest(args: AnalyzeSuggestArgs) -> Result<()> {
     let report = analyze_suggest_csv(&args)?;
-    let profile_toml = build_suggested_profile_toml(
+    let profile_body = build_suggested_profile_config(
         &report,
         &args.profile_name,
         args.auto_group_k,
         args.max_metrics,
+        args.profile_format,
     );
     let profile_path = args
         .out_profile
         .clone()
-        .unwrap_or_else(|| args.out.with_extension("toml"));
-    fs::write(&profile_path, profile_toml)?;
+        .unwrap_or_else(|| default_suggest_profile_path(&args.out, args.profile_format));
+    fs::write(&profile_path, profile_body)?;
 
     match args.output_format {
         SuggestOutputFormat::Md => {
@@ -3474,7 +3599,8 @@ fn run_analyze_suggest(args: AnalyzeSuggestArgs) -> Result<()> {
         }
     }
     println!(
-        "Suggested profile TOML written to {}",
+        "Suggested profile {} written to {}",
+        suggest_profile_format_label(args.profile_format),
         profile_path.display()
     );
     Ok(())
@@ -3640,6 +3766,15 @@ fn analyze_suggest_csv(args: &AnalyzeSuggestArgs) -> Result<AnalyzeSuggestReport
     }
     for c in columns
         .iter()
+        .filter(|c| looks_like_identifier_column(&c.name) && c.fill_pct >= 20.0)
+    {
+        warnings.push(format!(
+            "Identifier-like column '{}' was excluded from suggestions.",
+            c.name
+        ));
+    }
+    for c in columns
+        .iter()
         .filter(|c| c.fill_pct < 30.0 && c.inferred_role == "dimension")
     {
         warnings.push(format!(
@@ -3689,11 +3824,11 @@ fn infer_column_role(
     {
         return "dimension".to_string();
     }
-    let id_like = n == "id"
-        || n.ends_with("_id")
-        || n.ends_with("_uuid")
+    let id_like = looks_like_identifier_column(&n)
         || n.contains("uuid")
-        || n.ends_with("_url");
+        || n.contains("guid")
+        || n.ends_with("_url")
+        || n.ends_with("_uri");
     if numeric_ratio >= 0.85 && !id_like {
         return "metric".to_string();
     }
@@ -3758,6 +3893,70 @@ fn build_suggested_profile_toml(
     s.push_str("min_records = 10\n");
     s.push_str(&format!("auto_group_k = {}\n", auto_group_k));
     s
+}
+
+fn build_suggested_profile_json(
+    report: &AnalyzeSuggestReport,
+    profile_name: &str,
+    auto_group_k: usize,
+    max_metrics: usize,
+) -> String {
+    let group_by = report.suggested_group_by.clone();
+    let metrics = report
+        .suggested_metrics
+        .iter()
+        .take(max_metrics)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rank_by = report.suggested_rank_by.clone();
+    serde_json::json!({
+        "profiles": {
+            profile_name: {
+                "group_by": group_by,
+                "metrics": metrics,
+                "rank_by": rank_by,
+                "top": 15,
+                "min_records": 10,
+                "auto_group_k": auto_group_k,
+            }
+        }
+    })
+    .to_string()
+}
+
+fn build_suggested_profile_config(
+    report: &AnalyzeSuggestReport,
+    profile_name: &str,
+    auto_group_k: usize,
+    max_metrics: usize,
+    format: SuggestProfileFormat,
+) -> String {
+    match format {
+        SuggestProfileFormat::Toml => {
+            build_suggested_profile_toml(report, profile_name, auto_group_k, max_metrics)
+        }
+        SuggestProfileFormat::Json => {
+            build_suggested_profile_json(report, profile_name, auto_group_k, max_metrics)
+        }
+    }
+}
+
+fn suggest_profile_format_extension(format: SuggestProfileFormat) -> &'static str {
+    match format {
+        SuggestProfileFormat::Toml => "toml",
+        SuggestProfileFormat::Json => "json",
+    }
+}
+
+fn suggest_profile_format_label(format: SuggestProfileFormat) -> &'static str {
+    match format {
+        SuggestProfileFormat::Toml => "TOML",
+        SuggestProfileFormat::Json => "JSON",
+    }
+}
+
+fn default_suggest_profile_path(report_out: &Path, format: SuggestProfileFormat) -> PathBuf {
+    report_out.with_extension(suggest_profile_format_extension(format))
 }
 
 fn suggest_report_markdown(report: &AnalyzeSuggestReport, profile_path: &Path) -> String {
@@ -4015,6 +4214,3088 @@ fn run_analyze_compare(args: AnalyzeCompareArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum InvestigateInputKind {
+    JsonArtifacts,
+    CsvDatasets,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationMover {
+    segment: String,
+    base_records: u64,
+    new_records: u64,
+    base_share_pct: f64,
+    new_share_pct: f64,
+    delta_share_pp: f64,
+    base_primary_metric_value: f64,
+    new_primary_metric_value: f64,
+    delta_primary_metric_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationStep {
+    depth: usize,
+    dimension: String,
+    scope: Vec<(String, String)>,
+    primary_metric: String,
+    base_records: u64,
+    new_records: u64,
+    segment_count: usize,
+    top5_concentration_base_pct: f64,
+    top5_concentration_new_pct: f64,
+    top5_concentration_delta_pp: f64,
+    top1_concentration_base_pct: f64,
+    top1_concentration_new_pct: f64,
+    top1_concentration_delta_pp: f64,
+    movers: Vec<InvestigationMover>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationTraceStep {
+    depth: usize,
+    action: String,
+    decision: String,
+    scope: Vec<(String, String)>,
+    stopping_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationMajorChange {
+    dimension: String,
+    segment: String,
+    primary_metric: String,
+    delta_primary_metric_value: f64,
+    delta_share_pp: f64,
+    score: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmPlannerAction {
+    action: String,
+    reason: Option<String>,
+    params: Option<LlmPlannerParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmPlannerParams {
+    metric: Option<String>,
+    group_by: Option<Vec<String>>,
+    filters: Option<HashMap<String, String>>,
+}
+
+enum InvestigationExecAction {
+    AnalyzeCompare {
+        group_by: String,
+        scope: Vec<(String, String)>,
+        reason: String,
+    },
+    DrillDown {
+        group_by: String,
+        scope: Vec<(String, String)>,
+        reason: String,
+    },
+    Stop {
+        reason: String,
+    },
+}
+
+struct ResolvedInvestigateInputs {
+    base: PathBuf,
+    new: PathBuf,
+    base_label: String,
+    new_label: String,
+}
+
+fn resolve_investigate_inputs(args: &InvestigateWorkflowArgs) -> Result<ResolvedInvestigateInputs> {
+    let has_pair = args.base.is_some() || args.new.is_some();
+    let has_query =
+        args.query.is_some() || args.query_file.is_some() || args.postgres_url.is_some();
+    if has_pair && has_query {
+        return Err(anyhow!(
+            "choose one input mode: (--base and --new) OR (--postgres-url + --query/--query-file)"
+        ));
+    }
+
+    if has_pair {
+        let base = args
+            .base
+            .clone()
+            .ok_or_else(|| anyhow!("--base is required when using file input mode"))?;
+        let new = args
+            .new
+            .clone()
+            .ok_or_else(|| anyhow!("--new is required when using file input mode"))?;
+        return Ok(ResolvedInvestigateInputs {
+            base_label: base.display().to_string(),
+            new_label: new.display().to_string(),
+            base,
+            new,
+        });
+    }
+
+    let postgres_url = args
+        .postgres_url
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "missing input: provide --base/--new OR --postgres-url (or DATABASE_URL) + --query/--query-file"
+            )
+        })?;
+    let query = match (&args.query, &args.query_file) {
+        (Some(q), None) => q.clone(),
+        (None, Some(path)) => fs::read_to_string(path)
+            .map_err(|e| anyhow!("failed to read query file '{}': {}", path.display(), e))?,
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("use only one of --query or --query-file"));
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "postgres investigate requires one of --query or --query-file"
+            ));
+        }
+    };
+
+    let raw_csv = postgres_query_to_temp_csv(
+        &postgres_url,
+        &query,
+        args.postgres_ssl_mode,
+        args.postgres_ca_file.as_ref(),
+    )?;
+    let (headers, sample_rows) = read_csv_headers_and_sample(&raw_csv, 2000)?;
+    let date_col = if let Some(dc) = &args.date_column {
+        resolve_group_name(dc, &headers)?
+    } else {
+        auto_detect_date_column(&headers, &sample_rows).ok_or_else(|| {
+            anyhow!(
+                "failed to auto-detect date column from postgres query output; pass --date-column"
+            )
+        })?
+    };
+    let period_cfg = parse_period_cfg_from_investigate_workflow(args, date_col.clone())?;
+    let (base_csv, new_csv, base_rows, new_rows) =
+        split_csv_into_period_windows(&raw_csv, &period_cfg)?;
+    if base_rows == 0 || new_rows == 0 {
+        return Err(anyhow!(
+            "period windows contain no comparable rows from postgres query (previous={}, current={})",
+            base_rows,
+            new_rows
+        ));
+    }
+
+    Ok(ResolvedInvestigateInputs {
+        base: base_csv,
+        new: new_csv,
+        base_label: format!(
+            "postgres query ({}) previous window {}..{}",
+            period_cfg.date_column, period_cfg.previous_start, period_cfg.previous_end
+        ),
+        new_label: format!(
+            "postgres query ({}) current window {}..{}",
+            period_cfg.date_column, period_cfg.current_start, period_cfg.current_end
+        ),
+    })
+}
+
+fn parse_period_cfg_from_investigate_workflow(
+    args: &InvestigateWorkflowArgs,
+    date_column: String,
+) -> Result<PeriodCompareConfig> {
+    let explicit_windows = args.current_start.is_some()
+        || args.current_end.is_some()
+        || args.previous_start.is_some()
+        || args.previous_end.is_some();
+    let derived_windows =
+        args.time_grain.is_some() || args.period.is_some() || args.anchor_date.is_some();
+
+    if explicit_windows && derived_windows {
+        return Err(anyhow!(
+            "use either explicit windows (--current-start/--current-end/--previous-start/--previous-end) OR derived windows (--time-grain/--period/--anchor-date), not both"
+        ));
+    }
+
+    let (time_grain, period, current_start, current_end, previous_start, previous_end) =
+        if explicit_windows {
+            let cs = parse_date_arg(args.current_start.as_deref(), "--current-start is required")?;
+            let ce = parse_date_arg(args.current_end.as_deref(), "--current-end is required")?;
+            let ps = parse_date_arg(
+                args.previous_start.as_deref(),
+                "--previous-start is required",
+            )?;
+            let pe = parse_date_arg(args.previous_end.as_deref(), "--previous-end is required")?;
+            (None, None, cs, ce, ps, pe)
+        } else {
+            let grain = args.time_grain.unwrap_or(TimeGrain::Month);
+            let p = args.period.unwrap_or(PeriodPreset::Last);
+            let anchor = match args.anchor_date.as_deref() {
+                Some(raw) => chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                    .map_err(|_| anyhow!("invalid date '{}'; expected YYYY-MM-DD", raw))?,
+                None => chrono::Utc::now().date_naive(),
+            };
+            let ((cs, ce), (ps, pe)) = derive_period_windows(anchor, grain, p);
+            (Some(grain), Some(p), cs, ce, ps, pe)
+        };
+
+    Ok(PeriodCompareConfig {
+        date_column,
+        time_grain,
+        period,
+        current_start,
+        current_end,
+        previous_start,
+        previous_end,
+    })
+}
+
+fn split_csv_into_period_windows(
+    input_csv: &Path,
+    cfg: &PeriodCompareConfig,
+) -> Result<(PathBuf, PathBuf, usize, usize)> {
+    let mut rdr = csv::Reader::from_path(input_csv)
+        .map_err(|e| anyhow!("failed to read csv '{}': {}", input_csv.display(), e))?;
+    let headers = rdr
+        .headers()
+        .map_err(|e| {
+            anyhow!(
+                "failed to read headers from '{}': {}",
+                input_csv.display(),
+                e
+            )
+        })?
+        .clone();
+    let date_col = resolve_group_name(&cfg.date_column, &headers)?;
+    let date_idx = headers
+        .iter()
+        .position(|h| h == date_col)
+        .ok_or_else(|| anyhow!("date column '{}' not found in query output", date_col))?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base_out = std::env::temp_dir().join(format!("factorlens_investigate_base_{}.csv", ts));
+    let new_out = std::env::temp_dir().join(format!("factorlens_investigate_new_{}.csv", ts));
+    let mut base_w = csv::Writer::from_path(&base_out)
+        .map_err(|e| anyhow!("failed to create '{}': {}", base_out.display(), e))?;
+    let mut new_w = csv::Writer::from_path(&new_out)
+        .map_err(|e| anyhow!("failed to create '{}': {}", new_out.display(), e))?;
+    base_w.write_record(&headers)?;
+    new_w.write_record(&headers)?;
+
+    let mut prev_count = 0usize;
+    let mut curr_count = 0usize;
+    for rec in rdr.records() {
+        let rec = rec?;
+        let Some(d) = parse_date_like(rec.get(date_idx).unwrap_or("").trim()) else {
+            continue;
+        };
+        if d >= cfg.previous_start && d <= cfg.previous_end {
+            base_w.write_record(&rec)?;
+            prev_count += 1;
+        } else if d >= cfg.current_start && d <= cfg.current_end {
+            new_w.write_record(&rec)?;
+            curr_count += 1;
+        }
+    }
+    base_w.flush()?;
+    new_w.flush()?;
+    Ok((base_out, new_out, prev_count, curr_count))
+}
+
+fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
+    let args = apply_investigate_config(args)?;
+    if args.question.trim().is_empty() {
+        return Err(anyhow!(
+            "investigate requires --question (or set question in --config/--profile)"
+        ));
+    }
+    if args.planner == InvestigationPlanner::Llm {
+        return run_investigate_workflow_llm(args);
+    }
+
+    if args.max_depth < 1 {
+        return Err(anyhow!("--max-depth must be >= 1"));
+    }
+    if args.max_branches < 1 {
+        return Err(anyhow!("--max-branches must be >= 1"));
+    }
+    if args.top_movers < 1 {
+        return Err(anyhow!("--top-movers must be >= 1"));
+    }
+    if args.min_score_improvement < 0.0 {
+        return Err(anyhow!("--min-score-improvement must be >= 0"));
+    }
+    let planned_branch_nodes = args
+        .max_branches
+        .saturating_pow(args.max_depth.saturating_sub(1) as u32);
+    if planned_branch_nodes > 256 {
+        return Err(anyhow!(
+            "investigation search is too large (max_branches^depth={}): reduce --max-branches or --max-depth",
+            planned_branch_nodes
+        ));
+    }
+
+    let mode = resolve_investigation_mode(&args);
+    let resolved_inputs = resolve_investigate_inputs(&args)?;
+    let base_path = &resolved_inputs.base;
+    let new_path = &resolved_inputs.new;
+    let input_kind = detect_investigate_input_kind(base_path, new_path)?;
+    let mode_label = investigation_mode_label(mode);
+
+    let base_json_artifact = if input_kind == InvestigateInputKind::JsonArtifacts {
+        Some(read_json_file(base_path, "base")?)
+    } else {
+        None
+    };
+    let new_json_artifact = if input_kind == InvestigateInputKind::JsonArtifacts {
+        Some(read_json_file(new_path, "new")?)
+    } else {
+        None
+    };
+    let input_refs = InvestigationInputRefs {
+        base_path,
+        new_path,
+        input_kind,
+        base_artifact: base_json_artifact.as_ref(),
+        new_artifact: new_json_artifact.as_ref(),
+    };
+
+    let (top_dimension, drill_dimensions) = resolve_investigation_dimensions(
+        &args,
+        base_path,
+        new_path,
+        input_kind,
+        base_json_artifact.as_ref(),
+        new_json_artifact.as_ref(),
+    )?;
+    let available_dimensions = investigate_available_dimensions(&top_dimension, &drill_dimensions);
+    let major_global_changes =
+        identify_major_global_changes(&args, &input_refs, mode, &available_dimensions, 3)?;
+
+    if args.verbose {
+        println!("[route] Question classified as {}", mode_label);
+        println!(
+            "[config] input_mode={} top_dimension={} max_depth={} max_branches={}",
+            investigate_input_kind_label(input_kind),
+            top_dimension,
+            args.max_depth,
+            args.max_branches
+        );
+    }
+
+    let mut steps = Vec::<InvestigationStep>::new();
+    let mut trace = Vec::<InvestigationTraceStep>::new();
+    let mut stop_reason: Option<String> = None;
+    let root_scope = Vec::<(String, String)>::new();
+    let root_step =
+        investigation_step_from_inputs(&args, &input_refs, &top_dimension, &root_scope, mode)?;
+    if args.verbose {
+        println!("[step 0] compared on dimension '{}'", top_dimension);
+    }
+    trace.push(InvestigationTraceStep {
+        depth: 0,
+        action: "top_level_compare".to_string(),
+        decision: format!("ran base/new comparison grouped by {}", top_dimension),
+        scope: root_scope.clone(),
+        stopping_reason: None,
+    });
+    steps.push(root_step.clone());
+    let mut frontier = vec![root_step];
+
+    for depth in 1..args.max_depth {
+        if input_kind == InvestigateInputKind::JsonArtifacts {
+            stop_reason = Some(
+                "stopped after top-level analysis: drill-down requires CSV datasets, but --base/--new are JSON artifacts"
+                    .to_string(),
+            );
+            break;
+        }
+
+        let mut next_frontier = Vec::<InvestigationStep>::new();
+        let mut expanded = false;
+        let mut saw_next_dimension = false;
+        let mut saw_eligible_candidate = false;
+        let mut saw_composite_segment = false;
+        let mut saw_low_improvement = false;
+
+        for parent_step in &frontier {
+            let used_dims = used_dimensions_for_step(parent_step);
+            let remaining_dimensions = remaining_drill_dimensions(&drill_dimensions, &used_dims);
+            if remaining_dimensions.is_empty() {
+                continue;
+            }
+            saw_next_dimension = true;
+
+            let candidates = select_drill_candidates(
+                parent_step,
+                mode,
+                args.min_contribution,
+                args.min_slice_rows,
+                args.max_branches,
+            );
+            if candidates.is_empty() {
+                continue;
+            }
+            saw_eligible_candidate = true;
+
+            for mover in candidates {
+                if mover.segment.contains(" | ") {
+                    saw_composite_segment = true;
+                    continue;
+                }
+
+                let mut child_scope = parent_step.scope.clone();
+                child_scope.push((parent_step.dimension.clone(), mover.segment.clone()));
+                let mut best_next: Option<(String, InvestigationStep, f64)> = None;
+                for next_dimension in &remaining_dimensions {
+                    let step = investigation_step_from_inputs(
+                        &args,
+                        &input_refs,
+                        next_dimension,
+                        &child_scope,
+                        mode,
+                    )?;
+                    let score = step
+                        .movers
+                        .first()
+                        .map(|m| mover_score(m, mode))
+                        .unwrap_or(0.0);
+                    let replace = match &best_next {
+                        None => true,
+                        Some((best_dim, _, best_score)) => {
+                            score > *best_score
+                                || ((score - *best_score).abs() <= f64::EPSILON
+                                    && next_dimension < best_dim)
+                        }
+                    };
+                    if replace {
+                        best_next = Some((next_dimension.clone(), step, score));
+                    }
+                }
+                let Some((next_dimension, child_step, _)) = best_next else {
+                    continue;
+                };
+                let parent_score = mover_score(mover, mode);
+                let child_score = top_step_score(&child_step, mode);
+                if args.min_score_improvement > 0.0
+                    && child_score + f64::EPSILON < parent_score + args.min_score_improvement
+                {
+                    saw_low_improvement = true;
+                    continue;
+                }
+
+                let decision =
+                    deterministic_drill_decision(parent_step, mover, mode, &next_dimension);
+                if args.verbose {
+                    println!("[decision] {}", decision);
+                }
+                if args.verbose {
+                    println!(
+                        "[step {}] scope={} group_by={}",
+                        depth,
+                        child_scope
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        next_dimension
+                    );
+                }
+                trace.push(InvestigationTraceStep {
+                    depth,
+                    action: "drill_down".to_string(),
+                    decision,
+                    scope: child_scope.clone(),
+                    stopping_reason: None,
+                });
+                steps.push(child_step.clone());
+                next_frontier.push(child_step);
+                expanded = true;
+            }
+        }
+
+        if !expanded {
+            if !saw_next_dimension {
+                stop_reason = Some("no remaining drill dimension was available".to_string());
+            } else if saw_low_improvement {
+                stop_reason = Some(format!(
+                    "no drill candidate met score-improvement threshold (min_score_improvement={})",
+                    fmt_num(args.min_score_improvement, 2)
+                ));
+            } else if !saw_eligible_candidate {
+                stop_reason = Some(format!(
+                    "no drill candidate met thresholds (min_contribution={}, min_slice_rows={})",
+                    fmt_num(args.min_contribution, 2),
+                    args.min_slice_rows
+                ));
+            } else if saw_composite_segment {
+                stop_reason = Some(
+                    "top drill candidates were composite groups; use one dimension per step in v1"
+                        .to_string(),
+                );
+            } else {
+                stop_reason = Some("no drill-down branch could be expanded".to_string());
+            }
+            break;
+        }
+        frontier = next_frontier;
+    }
+
+    if stop_reason.is_none() {
+        stop_reason = Some(format!("reached max depth {}", args.max_depth));
+    }
+    if let Some(last) = trace.last_mut() {
+        last.stopping_reason = stop_reason.clone();
+    }
+    if args.verbose {
+        println!("[stop] {}", stop_reason.clone().unwrap_or_default());
+    }
+
+    let recommended_next_question = recommended_next_question(mode, steps.last());
+    let input_labels = InvestigationInputLabels {
+        base: &resolved_inputs.base_label,
+        new: &resolved_inputs.new_label,
+    };
+    let markdown = render_investigation_workflow_markdown(
+        &args,
+        &input_labels,
+        mode,
+        &InvestigationRenderData {
+            major_global_changes: &major_global_changes,
+            steps: &steps,
+            trace: &trace,
+            stop_reason: stop_reason.as_deref().unwrap_or("stopped"),
+            recommended_next_question: &recommended_next_question,
+        },
+    );
+    let json_out = serde_json::json!({
+        "question": args.question,
+        "mode": mode_label,
+        "input": {
+            "kind": investigate_input_kind_label(input_kind),
+            "base": resolved_inputs.base_label,
+            "new": resolved_inputs.new_label
+        },
+        "config": {
+            "dimensions": args.dimensions,
+            "drill_fields": args.drill_fields,
+            "max_depth": args.max_depth,
+            "max_branches": args.max_branches,
+            "min_contribution": args.min_contribution,
+            "min_score_improvement": args.min_score_improvement,
+            "min_slice_rows": args.min_slice_rows,
+            "top_movers": args.top_movers,
+            "metric": args.metric
+        },
+        "steps": steps,
+        "major_global_changes": major_global_changes,
+        "trace": trace,
+        "stopping_reason": stop_reason,
+        "recommended_next_question": recommended_next_question
+    });
+
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_investigate_workflow_out(&args));
+    ensure_parent_dir(&out_path)?;
+    match args.output_format {
+        InvestigateOutputFormat::Md => {
+            fs::write(&out_path, markdown)?;
+            println!(
+                "Investigate report (markdown) written to {}",
+                out_path.display()
+            );
+        }
+        InvestigateOutputFormat::Json => {
+            fs::write(&out_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!(
+                "Investigate report (json) written to {}",
+                out_path.display()
+            );
+        }
+        InvestigateOutputFormat::Both => {
+            let (md_path, json_path) = investigate_both_paths(&out_path);
+            ensure_parent_dir(&md_path)?;
+            ensure_parent_dir(&json_path)?;
+            fs::write(&md_path, markdown)?;
+            fs::write(&json_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!("Investigate report written to {}", md_path.display());
+            println!("Investigate JSON written to {}", json_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
+    if args.max_depth < 1 {
+        return Err(anyhow!("--max-depth must be >= 1"));
+    }
+    if args.max_branches < 1 {
+        return Err(anyhow!("--max-branches must be >= 1"));
+    }
+    if args.top_movers < 1 {
+        return Err(anyhow!("--top-movers must be >= 1"));
+    }
+    if args.min_score_improvement < 0.0 {
+        return Err(anyhow!("--min-score-improvement must be >= 0"));
+    }
+
+    let trace_enabled = args.verbose || args.trace;
+    let mode = resolve_investigation_mode(&args);
+    let resolved_inputs = resolve_investigate_inputs(&args)?;
+    let base_path = &resolved_inputs.base;
+    let new_path = &resolved_inputs.new;
+    let input_kind = detect_investigate_input_kind(base_path, new_path)?;
+
+    let base_json_artifact = if input_kind == InvestigateInputKind::JsonArtifacts {
+        Some(read_json_file(base_path, "base")?)
+    } else {
+        None
+    };
+    let new_json_artifact = if input_kind == InvestigateInputKind::JsonArtifacts {
+        Some(read_json_file(new_path, "new")?)
+    } else {
+        None
+    };
+    let input_refs = InvestigationInputRefs {
+        base_path,
+        new_path,
+        input_kind,
+        base_artifact: base_json_artifact.as_ref(),
+        new_artifact: new_json_artifact.as_ref(),
+    };
+
+    let (top_dimension, drill_dimensions) = resolve_investigation_dimensions(
+        &args,
+        base_path,
+        new_path,
+        input_kind,
+        base_json_artifact.as_ref(),
+        new_json_artifact.as_ref(),
+    )?;
+    let available_dimensions = investigate_available_dimensions(&top_dimension, &drill_dimensions);
+    let major_global_changes =
+        identify_major_global_changes(&args, &input_refs, mode, &available_dimensions, 3)?;
+
+    let planner_backend = match args.planner_backend {
+        BackendArg::Local => Backend::Local,
+        BackendArg::Bedrock => Backend::Bedrock,
+    };
+    let planner_model = resolve_planner_model(&args)?;
+    let planner = build_client(planner_backend, planner_model);
+    let local_fallback_planner = build_local_fallback_planner(&args);
+
+    if trace_enabled {
+        println!(
+            "[planner] llm backend={} input_mode={} dimensions={}",
+            planner_backend_label(args.planner_backend),
+            investigate_input_kind_label(input_kind),
+            available_dimensions.join(",")
+        );
+        if let Some(model) = local_fallback_planner_model_name(&args) {
+            println!("[planner] local fallback enabled model={}", model);
+        }
+    }
+
+    let mut steps = Vec::<InvestigationStep>::new();
+    let mut trace = Vec::<InvestigationTraceStep>::new();
+    let mut stop_reason: Option<String> = None;
+
+    for depth in 0..args.max_depth {
+        let planned = llm_plan_next_action_with_fallback(
+            planner.as_ref(),
+            local_fallback_planner.as_deref(),
+            &args,
+            &available_dimensions,
+            &steps,
+            depth,
+            input_kind,
+        );
+        let exec_action = match planned {
+            Ok((action, source)) => {
+                if trace_enabled && source == "local_fallback" {
+                    println!(
+                        "[planner] primary backend failed at depth={}, local fallback produced action",
+                        depth
+                    );
+                }
+                action
+            }
+            Err(err) => {
+                let err_text = compact_error_message(&err.to_string());
+                let fallback = deterministic_fallback_action(
+                    &args,
+                    mode,
+                    input_kind,
+                    &top_dimension,
+                    &drill_dimensions,
+                    &steps,
+                );
+                if trace_enabled {
+                    println!("[planner] fallback due to invalid LLM action: {}", err_text);
+                }
+                match fallback {
+                    InvestigationExecAction::AnalyzeCompare {
+                        group_by,
+                        scope,
+                        reason,
+                    } => InvestigationExecAction::AnalyzeCompare {
+                        group_by,
+                        scope,
+                        reason: format!("{} (fallback: {})", reason, err_text),
+                    },
+                    InvestigationExecAction::DrillDown {
+                        group_by,
+                        scope,
+                        reason,
+                    } => InvestigationExecAction::DrillDown {
+                        group_by,
+                        scope,
+                        reason: format!("{} (fallback: {})", reason, err_text),
+                    },
+                    InvestigationExecAction::Stop { reason } => InvestigationExecAction::Stop {
+                        reason: format!("{} (fallback: {})", reason, err_text),
+                    },
+                }
+            }
+        };
+
+        match exec_action {
+            InvestigationExecAction::Stop { reason } => {
+                stop_reason = Some(reason.clone());
+                trace.push(InvestigationTraceStep {
+                    depth,
+                    action: "stop".to_string(),
+                    decision: reason,
+                    scope: steps.last().map(|s| s.scope.clone()).unwrap_or_default(),
+                    stopping_reason: stop_reason.clone(),
+                });
+                break;
+            }
+            InvestigationExecAction::AnalyzeCompare {
+                group_by,
+                scope,
+                reason,
+            } => {
+                let step =
+                    investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
+                if args.min_score_improvement > 0.0 {
+                    if let Some(prev_step) = steps.last() {
+                        let prev_score = top_step_score(prev_step, mode);
+                        let current_score = top_step_score(&step, mode);
+                        if current_score + f64::EPSILON < prev_score + args.min_score_improvement {
+                            stop_reason = Some(format!(
+                                "no planned step met score-improvement threshold (min_score_improvement={})",
+                                fmt_num(args.min_score_improvement, 2)
+                            ));
+                            trace.push(InvestigationTraceStep {
+                                depth,
+                                action: "stop".to_string(),
+                                decision: format!(
+                                    "planned analyze_compare did not improve score enough (prev={}, current={}, required +{})",
+                                    fmt_num(prev_score, 2),
+                                    fmt_num(current_score, 2),
+                                    fmt_num(args.min_score_improvement, 2)
+                                ),
+                                scope,
+                                stopping_reason: stop_reason.clone(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if trace_enabled {
+                    println!(
+                        "[planner] analyze_compare depth={} group_by={} scope={} reason={}",
+                        depth,
+                        group_by,
+                        format_scope(&scope),
+                        reason
+                    );
+                }
+                trace.push(InvestigationTraceStep {
+                    depth,
+                    action: "analyze_compare".to_string(),
+                    decision: reason,
+                    scope,
+                    stopping_reason: None,
+                });
+                steps.push(step);
+            }
+            InvestigationExecAction::DrillDown {
+                group_by,
+                scope,
+                reason,
+            } => {
+                let step =
+                    investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
+                if args.min_score_improvement > 0.0 {
+                    if let Some(prev_step) = steps.last() {
+                        let prev_score = top_step_score(prev_step, mode);
+                        let current_score = top_step_score(&step, mode);
+                        if current_score + f64::EPSILON < prev_score + args.min_score_improvement {
+                            stop_reason = Some(format!(
+                                "no planned step met score-improvement threshold (min_score_improvement={})",
+                                fmt_num(args.min_score_improvement, 2)
+                            ));
+                            trace.push(InvestigationTraceStep {
+                                depth,
+                                action: "stop".to_string(),
+                                decision: format!(
+                                    "planned drill_down did not improve score enough (prev={}, current={}, required +{})",
+                                    fmt_num(prev_score, 2),
+                                    fmt_num(current_score, 2),
+                                    fmt_num(args.min_score_improvement, 2)
+                                ),
+                                scope,
+                                stopping_reason: stop_reason.clone(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if trace_enabled {
+                    println!(
+                        "[planner] drill_down depth={} group_by={} scope={} reason={}",
+                        depth,
+                        group_by,
+                        format_scope(&scope),
+                        reason
+                    );
+                }
+                trace.push(InvestigationTraceStep {
+                    depth,
+                    action: "drill_down".to_string(),
+                    decision: reason,
+                    scope,
+                    stopping_reason: None,
+                });
+                steps.push(step);
+            }
+        }
+    }
+
+    if stop_reason.is_none() {
+        stop_reason = Some(format!("reached max depth {}", args.max_depth));
+    }
+    if let Some(last) = trace.last_mut() {
+        last.stopping_reason = stop_reason.clone();
+    }
+
+    let recommended_next_question = recommended_next_question(mode, steps.last());
+    let llm_summary = llm_finalize_summary_with_fallback(
+        planner.as_ref(),
+        local_fallback_planner.as_deref(),
+        &args.question,
+        &steps,
+        &trace,
+        stop_reason.as_deref().unwrap_or("stopped"),
+    )
+    .unwrap_or_else(|_| {
+        deterministic_summary_from_steps(
+            &steps,
+            stop_reason.as_deref().unwrap_or("stopped"),
+            &recommended_next_question,
+        )
+    });
+
+    let mut markdown = render_investigation_workflow_markdown(
+        &args,
+        &InvestigationInputLabels {
+            base: &resolved_inputs.base_label,
+            new: &resolved_inputs.new_label,
+        },
+        mode,
+        &InvestigationRenderData {
+            major_global_changes: &major_global_changes,
+            steps: &steps,
+            trace: &trace,
+            stop_reason: stop_reason.as_deref().unwrap_or("stopped"),
+            recommended_next_question: &recommended_next_question,
+        },
+    );
+    markdown.push_str("\n## Final summary\n\n");
+    for line in llm_summary.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            markdown.push_str(&format!("- {}\n", trimmed));
+        }
+    }
+
+    let json_out = serde_json::json!({
+        "question": args.question,
+        "mode": investigation_mode_label(mode),
+        "planner": "llm",
+        "planner_backend": planner_backend_label(args.planner_backend),
+        "input": {
+            "kind": investigate_input_kind_label(input_kind),
+            "base": resolved_inputs.base_label,
+            "new": resolved_inputs.new_label
+        },
+        "config": {
+            "dimensions": args.dimensions,
+            "drill_fields": args.drill_fields,
+            "max_depth": args.max_depth,
+            "max_branches": args.max_branches,
+            "min_contribution": args.min_contribution,
+            "min_score_improvement": args.min_score_improvement,
+            "min_slice_rows": args.min_slice_rows,
+            "top_movers": args.top_movers,
+            "metric": args.metric
+        },
+        "steps": steps,
+        "major_global_changes": major_global_changes,
+        "trace": trace,
+        "stopping_reason": stop_reason,
+        "recommended_next_question": recommended_next_question,
+        "final_summary": llm_summary,
+    });
+
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_investigate_workflow_out(&args));
+    ensure_parent_dir(&out_path)?;
+    match args.output_format {
+        InvestigateOutputFormat::Md => {
+            fs::write(&out_path, markdown)?;
+            println!(
+                "Investigate report (markdown) written to {}",
+                out_path.display()
+            );
+        }
+        InvestigateOutputFormat::Json => {
+            fs::write(&out_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!(
+                "Investigate report (json) written to {}",
+                out_path.display()
+            );
+        }
+        InvestigateOutputFormat::Both => {
+            let (md_path, json_path) = investigate_both_paths(&out_path);
+            ensure_parent_dir(&md_path)?;
+            ensure_parent_dir(&json_path)?;
+            fs::write(&md_path, markdown)?;
+            fs::write(&json_path, serde_json::to_string_pretty(&json_out)?)?;
+            println!("Investigate report written to {}", md_path.display());
+            println!("Investigate JSON written to {}", json_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn llm_plan_next_action_with_fallback(
+    planner: &dyn LlmClient,
+    local_fallback: Option<&dyn LlmClient>,
+    args: &InvestigateWorkflowArgs,
+    available_dimensions: &[String],
+    steps: &[InvestigationStep],
+    depth: usize,
+    input_kind: InvestigateInputKind,
+) -> Result<(InvestigationExecAction, &'static str)> {
+    match llm_plan_next_action(
+        planner,
+        args,
+        available_dimensions,
+        steps,
+        depth,
+        input_kind,
+        "primary",
+    ) {
+        Ok(action) => Ok((action, "primary")),
+        Err(primary_err) => {
+            if let Some(local) = local_fallback {
+                match llm_plan_next_action(
+                    local,
+                    args,
+                    available_dimensions,
+                    steps,
+                    depth,
+                    input_kind,
+                    "local_fallback",
+                ) {
+                    Ok(action) => Ok((action, "local_fallback")),
+                    Err(local_err) => Err(anyhow!(
+                        "primary planner failed: {}; local fallback failed: {}",
+                        primary_err,
+                        local_err
+                    )),
+                }
+            } else {
+                Err(primary_err)
+            }
+        }
+    }
+}
+
+fn llm_plan_next_action(
+    planner: &dyn LlmClient,
+    args: &InvestigateWorkflowArgs,
+    available_dimensions: &[String],
+    steps: &[InvestigationStep],
+    depth: usize,
+    input_kind: InvestigateInputKind,
+    source: &str,
+) -> Result<InvestigationExecAction> {
+    let history = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let top = s.movers.first();
+            serde_json::json!({
+                "index": i,
+                "depth": s.depth,
+                "dimension": s.dimension,
+                "scope": s.scope,
+                "top_mover": top.map(|m| serde_json::json!({
+                    "segment": m.segment,
+                    "delta_metric": m.delta_primary_metric_value,
+                    "delta_share_pp": m.delta_share_pp,
+                }))
+            })
+        })
+        .collect::<Vec<_>>();
+    let last_result = steps.last().and_then(|s| s.movers.first()).map(|m| {
+        serde_json::json!({
+            "dimension": steps.last().map(|x| x.dimension.clone()).unwrap_or_default(),
+            "value": m.segment,
+            "contribution": m.delta_primary_metric_value.abs(),
+            "delta_share_pp": m.delta_share_pp,
+        })
+    });
+    let user_payload = serde_json::json!({
+        "question": args.question,
+        "available_dimensions": available_dimensions,
+        "history": history,
+        "last_result": last_result,
+        "constraints": {
+            "current_depth": depth,
+            "max_depth": args.max_depth,
+            "input_kind": investigate_input_kind_label(input_kind),
+            "min_contribution": args.min_contribution,
+            "min_score_improvement": args.min_score_improvement,
+            "min_slice_rows": args.min_slice_rows,
+            "required_metric": args.metric
+        }
+    });
+    let system_prompt = "You are an analysis planner for FactorLens. Choose exactly one action: analyze_compare, drill_down, or stop. Return only valid JSON. Never invent dimensions or metrics. If required_metric is present, use exactly that metric name or omit params.metric. Do not abbreviate metric names (for example revenue is not revenue_usd). Use previous results and prefer the strongest valid driver.";
+    let user_prompt = format!(
+        "Return ONLY one JSON object (no markdown, no prose).\nRequired keys:\n- action: analyze_compare | drill_down | stop\n- reason: short string\n- params: object (optional for stop) with optional metric, group_by (array), filters (object)\nRules:\n- Use only available_dimensions.\n- For drill_down include non-empty filters.\n- If required_metric is set, params.metric must be exactly that value (or omitted).\n- Do not echo this prompt.\nInput payload:\n{}",
+        serde_json::to_string_pretty(&user_payload)?
+    );
+    let raw = planner.answer(system_prompt, &user_prompt)?;
+    if args.trace || args.verbose {
+        println!(
+            "[planner] raw {} action={}",
+            source,
+            compact_trace_preview(&raw, 320)
+        );
+    }
+    let parsed_candidates = parse_llm_planner_actions(&raw)?;
+    let mut validation_errors = Vec::<String>::new();
+    for candidate in parsed_candidates.iter().rev() {
+        match validate_llm_planner_action(candidate, args, available_dimensions, steps, input_kind)
+        {
+            Ok(valid) => return Ok(valid),
+            Err(err) => validation_errors.push(compact_error_message(&err.to_string())),
+        }
+    }
+    let preview = validation_errors
+        .into_iter()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Err(anyhow!("no valid llm action candidate: {}", preview))
+}
+
+#[cfg(test)]
+fn parse_llm_planner_action(raw: &str) -> Result<LlmPlannerAction> {
+    let mut parsed = parse_llm_planner_actions(raw)?;
+    parsed
+        .pop()
+        .ok_or_else(|| anyhow!("llm output missing parseable JSON object"))
+}
+
+fn parse_llm_planner_actions(raw: &str) -> Result<Vec<LlmPlannerAction>> {
+    if let Ok(v) = serde_json::from_str::<LlmPlannerAction>(raw.trim()) {
+        return Ok(vec![v]);
+    }
+    let mut parsed = Vec::<LlmPlannerAction>::new();
+    let mut last_err: Option<serde_json::Error> = None;
+    for (start, ch) in raw.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let Some(slice) = extract_json_object_from(raw, start) else {
+            continue;
+        };
+        match serde_json::from_str::<LlmPlannerAction>(slice) {
+            Ok(v) => parsed.push(v),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    if !parsed.is_empty() {
+        return Ok(parsed);
+    }
+    if let Some(err) = last_err {
+        return Err(anyhow!("failed to parse llm planner JSON: {}", err));
+    }
+    Err(anyhow!("llm output missing parseable JSON object"))
+}
+
+fn extract_json_object_from(raw: &str, start: usize) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'{' {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in raw[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&raw[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn validate_llm_planner_action(
+    proposed: &LlmPlannerAction,
+    args: &InvestigateWorkflowArgs,
+    available_dimensions: &[String],
+    steps: &[InvestigationStep],
+    input_kind: InvestigateInputKind,
+) -> Result<InvestigationExecAction> {
+    let action = proposed.action.trim().to_ascii_lowercase();
+    let reason_raw = proposed
+        .reason
+        .clone()
+        .unwrap_or_else(|| "llm planner decision".to_string());
+    let reason = normalize_planner_reason(action.as_str(), &reason_raw);
+    let params = proposed.params.as_ref();
+
+    if let Some(metric) = params.and_then(|p| p.metric.as_deref()) {
+        match args.metric.as_deref() {
+            Some(expected) if metric_matches_expected(metric, expected) => {}
+            Some(_expected) => {
+                // Ignore planner metric overrides in investigate v1.
+                // We always execute with the CLI metric for deterministic grounding.
+            }
+            None => {
+                return Err(anyhow!(
+                    "llm requested metric '{}' but metric override is not supported in v1",
+                    metric
+                ));
+            }
+        }
+    }
+
+    let group_by_raw = params
+        .and_then(|p| p.group_by.as_ref())
+        .and_then(|xs| xs.first())
+        .map(|s| s.as_str())
+        .unwrap_or_default();
+    let mut scope = ordered_scope_from_filters(
+        params.and_then(|p| p.filters.as_ref()),
+        available_dimensions,
+    )?;
+
+    match action.as_str() {
+        "stop" => {
+            if steps.is_empty() {
+                return Err(anyhow!("first llm action cannot be stop"));
+            }
+            if input_kind == InvestigateInputKind::CsvDatasets && args.max_depth > 1 {
+                if let Some(scope) = infer_scope_from_last_step(steps) {
+                    if let Some(group_by) = infer_group_by_from_context(
+                        "drill_down",
+                        steps,
+                        available_dimensions,
+                        &scope,
+                    ) {
+                        if !is_repeated_path(steps, &group_by, &scope) {
+                            return Ok(InvestigationExecAction::DrillDown {
+                                group_by,
+                                scope,
+                                reason: "auto-follow drill-down from prior top mover".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(InvestigationExecAction::Stop { reason })
+        }
+        "analyze_compare" | "drill_down" => {
+            let mut drill_mode = action == "drill_down";
+            if steps.is_empty() && drill_mode {
+                return Err(anyhow!("first llm action must be analyze_compare"));
+            }
+            let mut group_by = if group_by_raw.trim().is_empty() {
+                infer_group_by_from_context(action.as_str(), steps, available_dimensions, &scope)
+                    .ok_or_else(|| anyhow!("llm action requires params.group_by[0]"))?
+            } else {
+                resolve_dimension_name(group_by_raw, available_dimensions)
+                    .ok_or_else(|| anyhow!("llm requested unknown dimension '{}'", group_by_raw))?
+            };
+
+            if drill_mode {
+                if input_kind == InvestigateInputKind::JsonArtifacts {
+                    return Err(anyhow!("drill_down is unsupported for JSON artifact mode"));
+                }
+                if scope.is_empty() {
+                    scope = infer_scope_from_last_step(steps)
+                        .ok_or_else(|| anyhow!("drill_down requires non-empty params.filters"))?;
+                }
+            } else if steps.is_empty() {
+                scope.clear();
+            }
+
+            if let Some(last) = steps.last() {
+                if !last.scope.is_empty() && !scope.is_empty() {
+                    if let Some((dim, prev, next)) = conflicting_scope_binding(&last.scope, &scope)
+                    {
+                        return Err(anyhow!(
+                            "llm scope conflicts with prior scope on {} ('{}' vs '{}')",
+                            dim,
+                            prev,
+                            next
+                        ));
+                    }
+                    if !scope_is_superset_of(&scope, &last.scope) {
+                        scope = merge_scope(&last.scope, &scope);
+                    }
+                }
+            }
+
+            if scope_has_dimension(&scope, &group_by) {
+                let adjusted =
+                    infer_group_by_from_context("drill_down", steps, available_dimensions, &scope)
+                        .or_else(|| {
+                            available_dimensions
+                                .iter()
+                                .find(|d| !scope_has_dimension(&scope, d))
+                                .cloned()
+                        });
+                let Some(next_group_by) = adjusted else {
+                    return Err(anyhow!(
+                        "llm selected group_by '{}' which is already fixed by scope={}",
+                        group_by,
+                        format_scope(&scope)
+                    ));
+                };
+                if is_repeated_path(steps, &next_group_by, &scope) {
+                    return Err(anyhow!(
+                        "llm repeated a previously executed path (dimension='{}' scope={})",
+                        next_group_by,
+                        format_scope(&scope)
+                    ));
+                }
+                group_by = next_group_by;
+            }
+
+            if !drill_mode
+                && !steps.is_empty()
+                && scope.is_empty()
+                && input_kind != InvestigateInputKind::JsonArtifacts
+            {
+                let inferred_scope = infer_scope_from_last_step(steps).ok_or_else(|| {
+                    anyhow!("analyze_compare after first step requires a drillable prior result")
+                })?;
+                let next_group_by = infer_group_by_from_context(
+                    "drill_down",
+                    steps,
+                    available_dimensions,
+                    &inferred_scope,
+                )
+                .ok_or_else(|| anyhow!("could not infer next drill dimension"))?;
+                if is_repeated_path(steps, &next_group_by, &inferred_scope) {
+                    return Err(anyhow!(
+                        "llm repeated a previously executed path (dimension='{}' scope={})",
+                        next_group_by,
+                        format_scope(&inferred_scope)
+                    ));
+                }
+                drill_mode = true;
+                scope = inferred_scope;
+                group_by = next_group_by;
+            }
+
+            if is_repeated_path(steps, &group_by, &scope) {
+                // Local models often repeat the previous top-level path. Auto-pivot to a
+                // valid drill-down path when possible instead of hard-failing.
+                if !drill_mode && input_kind != InvestigateInputKind::JsonArtifacts {
+                    if let Some(inferred_scope) = infer_scope_from_last_step(steps) {
+                        if let Some(next_group_by) = infer_group_by_from_context(
+                            "drill_down",
+                            steps,
+                            available_dimensions,
+                            &inferred_scope,
+                        ) {
+                            if !is_repeated_path(steps, &next_group_by, &inferred_scope) {
+                                drill_mode = true;
+                                scope = inferred_scope;
+                                group_by = next_group_by;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_repeated_path(steps, &group_by, &scope) {
+                let adjusted = infer_group_by_from_context(
+                    action.as_str(),
+                    steps,
+                    available_dimensions,
+                    &scope,
+                );
+                if let Some(next_group_by) = adjusted {
+                    if !next_group_by.eq_ignore_ascii_case(&group_by)
+                        && !is_repeated_path(steps, &next_group_by, &scope)
+                    {
+                        group_by = next_group_by;
+                    } else {
+                        return Err(anyhow!(
+                            "llm repeated a previously executed path (dimension='{}' scope={})",
+                            group_by,
+                            format_scope(&scope)
+                        ));
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "llm repeated a previously executed path (dimension='{}' scope={})",
+                        group_by,
+                        format_scope(&scope)
+                    ));
+                }
+            }
+
+            if drill_mode {
+                Ok(InvestigationExecAction::DrillDown {
+                    group_by,
+                    scope,
+                    reason,
+                })
+            } else {
+                Ok(InvestigationExecAction::AnalyzeCompare {
+                    group_by,
+                    scope,
+                    reason,
+                })
+            }
+        }
+        _ => Err(anyhow!("invalid llm action '{}'", proposed.action)),
+    }
+}
+
+fn normalize_planner_reason(action: &str, raw_reason: &str) -> String {
+    let trimmed = raw_reason.trim();
+    if trimmed.is_empty() {
+        return default_planner_reason(action).to_string();
+    }
+
+    let collapsed = trimmed
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = collapsed.to_ascii_lowercase();
+    if collapsed.len() < 8 || planner_reason_is_low_signal(&lower) {
+        return default_planner_reason(action).to_string();
+    }
+
+    collapsed
+}
+
+fn planner_reason_is_low_signal(lower: &str) -> bool {
+    if matches!(
+        lower,
+        "previous result" | "previous results" | "previousresult" | "n/a" | "none" | "unknown"
+    ) {
+        return true;
+    }
+
+    lower.starts_with("previous result")
+        || lower.starts_with("previous results")
+        || lower.contains("not strong enough")
+        || lower.contains("too shallow")
+        || lower.contains("at max depth")
+        || lower.contains("results are weak")
+        || lower.contains("result is weak")
+        || lower.contains("result is null")
+        || lower.contains("results are empty")
+        || lower.contains("no strong drivers")
+        || lower == "strongest valid driver"
+}
+
+fn default_planner_reason(action: &str) -> &'static str {
+    match action {
+        "analyze_compare" => "planner selected top-level comparison",
+        "drill_down" => "planner selected drill-down from prior top mover",
+        "stop" => "planner selected stop",
+        _ => "planner decision",
+    }
+}
+
+fn is_repeated_path(
+    steps: &[InvestigationStep],
+    group_by: &str,
+    scope: &[(String, String)],
+) -> bool {
+    steps
+        .iter()
+        .any(|s| s.dimension.eq_ignore_ascii_case(group_by) && s.scope == scope)
+}
+
+fn infer_scope_from_last_step(steps: &[InvestigationStep]) -> Option<Vec<(String, String)>> {
+    let last = steps.last()?;
+    let mover = last.movers.iter().find(|m| {
+        !m.segment.trim().is_empty() && m.segment != "(blank)" && m.segment != "(unknown)"
+    })?;
+    let mut scope = last.scope.clone();
+    scope.push((last.dimension.clone(), mover.segment.clone()));
+    Some(scope)
+}
+
+fn infer_group_by_from_context(
+    action: &str,
+    steps: &[InvestigationStep],
+    available_dimensions: &[String],
+    scope: &[(String, String)],
+) -> Option<String> {
+    if available_dimensions.is_empty() {
+        return None;
+    }
+    if steps.is_empty() {
+        return available_dimensions.first().cloned();
+    }
+
+    let mut used = scope
+        .iter()
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    if let Some(last) = steps.last() {
+        used.insert(last.dimension.to_ascii_lowercase());
+    }
+
+    if action == "drill_down" || !scope.is_empty() {
+        if let Some(next) = available_dimensions
+            .iter()
+            .find(|d| !used.contains(&d.to_ascii_lowercase()))
+        {
+            return Some(next.clone());
+        }
+    }
+
+    available_dimensions.first().cloned()
+}
+
+fn metric_matches_expected(requested: &str, expected: &str) -> bool {
+    let requested_norm = normalize_metric_name(requested);
+    if requested_norm.is_empty() {
+        return false;
+    }
+    metric_aliases(expected).contains(&requested_norm)
+}
+
+fn scope_has_dimension(scope: &[(String, String)], dimension: &str) -> bool {
+    scope.iter().any(|(k, _)| k.eq_ignore_ascii_case(dimension))
+}
+
+fn scope_value<'a>(scope: &'a [(String, String)], dimension: &str) -> Option<&'a str> {
+    scope
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(dimension))
+        .map(|(_, v)| v.as_str())
+}
+
+fn conflicting_scope_binding(
+    prior_scope: &[(String, String)],
+    next_scope: &[(String, String)],
+) -> Option<(String, String, String)> {
+    for (dim, prev) in prior_scope {
+        if let Some(next) = scope_value(next_scope, dim) {
+            if next != prev {
+                return Some((dim.clone(), prev.clone(), next.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn scope_is_superset_of(
+    candidate_scope: &[(String, String)],
+    required_scope: &[(String, String)],
+) -> bool {
+    required_scope.iter().all(|(dim, value)| {
+        scope_value(candidate_scope, dim)
+            .map(|v| v == value)
+            .unwrap_or(false)
+    })
+}
+
+fn merge_scope(
+    required_scope: &[(String, String)],
+    candidate_scope: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = required_scope.to_vec();
+    for (dim, value) in candidate_scope {
+        if !scope_has_dimension(&merged, dim) {
+            merged.push((dim.clone(), value.clone()));
+        }
+    }
+    merged
+}
+
+fn normalize_metric_name(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+}
+
+fn metric_aliases(expected: &str) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let expected_norm = normalize_metric_name(expected);
+    if !expected_norm.is_empty() {
+        out.push(expected_norm);
+    }
+
+    let lower = expected.to_ascii_lowercase();
+    if let Some(base) = lower.strip_suffix("_usd") {
+        let a = normalize_metric_name(base);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+    if let Some(base) = lower.strip_suffix("_amount") {
+        let a = normalize_metric_name(base);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+    if let Some(base) = lower.strip_suffix("_pct") {
+        let a = normalize_metric_name(base);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+    if let Some(base) = lower.strip_suffix("_rate") {
+        let a = normalize_metric_name(base);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+    if let Some(base) = lower.strip_suffix("_ratio") {
+        let a = normalize_metric_name(base);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+
+    if let Some((first, _)) = lower.split_once('_') {
+        let a = normalize_metric_name(first);
+        if !a.is_empty() {
+            out.push(a);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn deterministic_fallback_action(
+    args: &InvestigateWorkflowArgs,
+    mode: InvestigationMode,
+    input_kind: InvestigateInputKind,
+    top_dimension: &str,
+    drill_dimensions: &[String],
+    steps: &[InvestigationStep],
+) -> InvestigationExecAction {
+    if steps.is_empty() {
+        return InvestigationExecAction::AnalyzeCompare {
+            group_by: top_dimension.to_string(),
+            scope: vec![],
+            reason: "fallback to top-level compare".to_string(),
+        };
+    }
+    if input_kind == InvestigateInputKind::JsonArtifacts {
+        return InvestigationExecAction::Stop {
+            reason: "fallback stop: JSON artifact mode cannot drill down".to_string(),
+        };
+    }
+    let last = match steps.last() {
+        Some(s) => s,
+        None => {
+            return InvestigationExecAction::Stop {
+                reason: "fallback stop: missing previous step".to_string(),
+            };
+        }
+    };
+    let used_dims = used_dimensions_for_step(last);
+    let next_dimension = match choose_next_dimension(drill_dimensions, &used_dims) {
+        Some(d) => d,
+        None => {
+            return InvestigationExecAction::Stop {
+                reason: "fallback stop: no remaining drill dimension".to_string(),
+            };
+        }
+    };
+    let candidate =
+        select_drill_candidates(last, mode, args.min_contribution, args.min_slice_rows, 1)
+            .into_iter()
+            .find(|m| !m.segment.contains(" | ") && m.segment != "(blank)");
+    let Some(mover) = candidate else {
+        return InvestigationExecAction::Stop {
+            reason: "fallback stop: no eligible drill candidate".to_string(),
+        };
+    };
+
+    let mut scope = last.scope.clone();
+    scope.push((last.dimension.clone(), mover.segment.clone()));
+    InvestigationExecAction::DrillDown {
+        group_by: next_dimension,
+        scope,
+        reason: format!("fallback drill on {}='{}'", last.dimension, mover.segment),
+    }
+}
+
+fn investigate_available_dimensions(
+    top_dimension: &str,
+    drill_dimensions: &[String],
+) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    out.push(top_dimension.to_string());
+    for d in drill_dimensions {
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+fn identify_major_global_changes(
+    args: &InvestigateWorkflowArgs,
+    input: &InvestigationInputRefs<'_>,
+    mode: InvestigationMode,
+    available_dimensions: &[String],
+    limit: usize,
+) -> Result<Vec<InvestigationMajorChange>> {
+    let mut changes = Vec::<InvestigationMajorChange>::new();
+    let mut seen = HashSet::<String>::new();
+    let root_scope = Vec::<(String, String)>::new();
+
+    for dimension in available_dimensions {
+        let key = dimension.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        let step = investigation_step_from_inputs(args, input, dimension, &root_scope, mode)?;
+        let Some(top) = step.movers.iter().find(|m| {
+            !m.segment.trim().is_empty() && m.segment != "(blank)" && m.segment != "(unknown)"
+        }) else {
+            continue;
+        };
+        let score = mover_score(top, mode);
+        changes.push(InvestigationMajorChange {
+            dimension: step.dimension.clone(),
+            segment: top.segment.clone(),
+            primary_metric: step.primary_metric.clone(),
+            delta_primary_metric_value: top.delta_primary_metric_value,
+            delta_share_pp: top.delta_share_pp,
+            score,
+        });
+    }
+
+    changes.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.dimension.cmp(&b.dimension))
+            .then_with(|| a.segment.cmp(&b.segment))
+    });
+    changes.truncate(limit.max(1));
+    Ok(changes)
+}
+
+fn resolve_dimension_name(requested: &str, available_dimensions: &[String]) -> Option<String> {
+    available_dimensions
+        .iter()
+        .find(|d| d.eq_ignore_ascii_case(requested))
+        .cloned()
+}
+
+fn ordered_scope_from_filters(
+    filters: Option<&HashMap<String, String>>,
+    available_dimensions: &[String],
+) -> Result<Vec<(String, String)>> {
+    let Some(filters) = filters else {
+        return Ok(vec![]);
+    };
+    for key in filters.keys() {
+        if resolve_dimension_name(key, available_dimensions).is_none() {
+            return Err(anyhow!("llm filter uses unknown dimension '{}'", key));
+        }
+    }
+    let mut scope = Vec::<(String, String)>::new();
+    for dim in available_dimensions {
+        let value = filters
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(dim))
+            .map(|(_, v)| v.as_str());
+        if let Some(v) = value {
+            if v.trim().is_empty() {
+                return Err(anyhow!("llm filter for '{}' is blank", dim));
+            }
+            scope.push((dim.clone(), v.trim().to_string()));
+        }
+    }
+    Ok(scope)
+}
+
+fn format_scope(scope: &[(String, String)]) -> String {
+    if scope.is_empty() {
+        "global".to_string()
+    } else {
+        scope
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn compact_error_message(msg: &str) -> String {
+    let lines = msg
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+
+    let preferred = lines
+        .iter()
+        .copied()
+        .find(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("invalid")
+                || lower.contains("unknown")
+        })
+        .or_else(|| {
+            lines.iter().copied().find(|l| {
+                !(l.starts_with("load_backend:")
+                    || l.starts_with("print_info:")
+                    || l.starts_with("llama_model_loader:")
+                    || l.starts_with("llama_context:")
+                    || l.starts_with("sched_reserve:")
+                    || l.starts_with("system_info:")
+                    || l.starts_with("sampler ")
+                    || l.starts_with("generate:"))
+            })
+        })
+        .or_else(|| lines.last().copied())
+        .unwrap_or("unknown error");
+
+    let mut out = preferred.to_string();
+    let max_len = 180usize;
+    if out.len() > max_len {
+        out.truncate(max_len.saturating_sub(3));
+        out.push_str("...");
+    }
+    out
+}
+
+fn compact_trace_preview(text: &str, max_len: usize) -> String {
+    let mut out = text.replace('\r', " ").replace('\n', "\\n");
+    if out.len() > max_len {
+        out.truncate(max_len.saturating_sub(3));
+        out.push_str("...");
+    }
+    out
+}
+
+fn resolve_planner_model(args: &InvestigateWorkflowArgs) -> Result<String> {
+    if let Some(model) = args.planner_model.clone() {
+        if !model.trim().is_empty() {
+            return Ok(model);
+        }
+    }
+    match args.planner_backend {
+        BackendArg::Bedrock => Ok("anthropic.claude-3-haiku-20240307-v1:0".to_string()),
+        BackendArg::Local => local_planner_model_from_env().ok_or_else(|| {
+            anyhow!(
+                "--planner-model is required when --planner llm --planner-backend local (or set FACTORLENS_PLANNER_LOCAL_MODEL / FACTORLENS_LOCAL_MODEL)"
+            )
+        }),
+    }
+}
+
+fn local_planner_model_from_env() -> Option<String> {
+    for key in ["FACTORLENS_PLANNER_LOCAL_MODEL", "FACTORLENS_LOCAL_MODEL"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn local_fallback_planner_model_name(args: &InvestigateWorkflowArgs) -> Option<String> {
+    if args.planner_backend == BackendArg::Bedrock {
+        return local_planner_model_from_env();
+    }
+    None
+}
+
+fn build_local_fallback_planner(args: &InvestigateWorkflowArgs) -> Option<Box<dyn LlmClient>> {
+    if args.planner_backend != BackendArg::Bedrock {
+        return None;
+    }
+    let model = local_planner_model_from_env()?;
+    Some(build_client(Backend::Local, model))
+}
+
+fn planner_backend_label(backend: BackendArg) -> &'static str {
+    match backend {
+        BackendArg::Local => "local",
+        BackendArg::Bedrock => "bedrock",
+    }
+}
+
+fn llm_finalize_summary(
+    planner: &dyn LlmClient,
+    question: &str,
+    steps: &[InvestigationStep],
+    trace: &[InvestigationTraceStep],
+    stop_reason: &str,
+) -> Result<String> {
+    let summary_input = serde_json::json!({
+        "question": question,
+        "steps": steps,
+        "trace": trace,
+        "stop_reason": stop_reason
+    });
+    let system_prompt =
+        "Summarize investigation findings. Use only provided facts. Do not invent numbers. Use at most 2 decimal places. Do not output commands or code.";
+    let user_prompt = format!(
+        "Provide 2-4 short lines. Keep it concise and grounded. Do not output JSON.\n{}",
+        serde_json::to_string_pretty(&summary_input)?
+    );
+    let raw = planner.answer(system_prompt, &user_prompt)?;
+    let cleaned = sanitize_llm_summary(&raw, question);
+    if cleaned.is_empty() {
+        return Err(anyhow!("llm final summary was empty"));
+    }
+    if !llm_summary_is_usable(&cleaned, steps, stop_reason) {
+        return Err(anyhow!("llm final summary failed quality checks"));
+    }
+    Ok(cleaned)
+}
+
+fn sanitize_llm_summary(raw: &str, question: &str) -> String {
+    let mut text = raw.trim();
+    if let Some((_, tail)) = raw.rsplit_once("assistant") {
+        let trimmed = tail.trim();
+        if !trimmed.is_empty() {
+            text = trimmed;
+        }
+    }
+
+    let mut out = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let mut seen_prefix = HashSet::<String>::new();
+    for line in text.lines() {
+        let trimmed = line.trim().trim_start_matches('-').trim();
+        let trimmed = trimmed.trim_end_matches('|').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case(question.trim()) {
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("provide 2-4 short lines")
+            || lower.starts_with("here is a concise summary")
+            || lower.starts_with("summarize investigation findings")
+            || lower.starts_with("note:")
+            || lower.starts_with("the final answer is")
+            || lower == "assistant"
+            || lower.starts_with("input:")
+        {
+            continue;
+        }
+        if lower.starts_with("|")
+            || lower.starts_with("$ ")
+            || lower.starts_with("jq ")
+            || lower.contains("| jq")
+            || lower.contains("cargo run")
+            || lower.contains("python3 ")
+        {
+            continue;
+        }
+        if lower.starts_with("\"question\"")
+            || lower.starts_with("\"steps\"")
+            || lower.starts_with("\"trace\"")
+            || lower.starts_with("\"stop_reason\"")
+            || lower.starts_with("\"action\"")
+            || lower.starts_with("\"decision\"")
+            || lower.starts_with("\"depth\"")
+        {
+            continue;
+        }
+        if trimmed.starts_with('{')
+            || trimmed.starts_with('}')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with(']')
+            || trimmed.starts_with('"')
+        {
+            continue;
+        }
+        let alpha_count = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        if alpha_count < 8 {
+            continue;
+        }
+        let punctuation = trimmed
+            .chars()
+            .filter(|c| matches!(c, '{' | '}' | '[' | ']' | '"' | ':' | ','))
+            .count();
+        if punctuation * 2 >= trimmed.len() {
+            continue;
+        }
+        let canonical = trimmed.to_ascii_lowercase();
+        let canonical_ws = canonical.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prefix = canonical_ws.chars().take(64).collect::<String>();
+        if seen.insert(canonical) && seen_prefix.insert(prefix) {
+            out.push(trimmed.to_string());
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+fn llm_summary_is_usable(summary: &str, steps: &[InvestigationStep], stop_reason: &str) -> bool {
+    if summary.trim().is_empty() {
+        return false;
+    }
+    if summary_looks_truncated(summary) {
+        return false;
+    }
+    let lower = summary.to_ascii_lowercase();
+    if lower.contains("[user]")
+        || lower.contains("[system]")
+        || lower.contains("```")
+        || lower.contains("| jq")
+        || lower.contains("the final answer is")
+    {
+        return false;
+    }
+    if contains_long_decimal(summary, 2) {
+        return false;
+    }
+
+    summary_numbers_are_grounded(
+        summary,
+        &collect_allowed_summary_numbers(steps, stop_reason),
+    )
+}
+
+fn summary_looks_truncated(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(last_line) = trimmed.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let tail = last_line.trim().trim_end_matches('|').trim_end();
+    if tail.is_empty() {
+        return true;
+    }
+    let Some(last_char) = tail.chars().last() else {
+        return true;
+    };
+    if matches!(last_char, '.' | '!' | '?' | ')' | ']' | '"' | '\'') {
+        return false;
+    }
+    if !last_char.is_ascii_alphanumeric() {
+        return false;
+    }
+    let alpha_count = tail.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    alpha_count >= 10
+}
+
+fn contains_long_decimal(text: &str, max_decimals: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            let mut dec = 0usize;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                dec += 1;
+                i += 1;
+            }
+            if dec > max_decimals {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_allowed_summary_numbers(steps: &[InvestigationStep], stop_reason: &str) -> Vec<f64> {
+    let mut out = Vec::<f64>::new();
+    for step in steps {
+        out.push(step.depth as f64);
+        out.push(step.base_records as f64);
+        out.push(step.new_records as f64);
+        out.push(step.segment_count as f64);
+        out.push(step.top5_concentration_base_pct);
+        out.push(step.top5_concentration_new_pct);
+        out.push(step.top5_concentration_delta_pp);
+        out.push(step.top1_concentration_base_pct);
+        out.push(step.top1_concentration_new_pct);
+        out.push(step.top1_concentration_delta_pp);
+        for mover in &step.movers {
+            out.push(mover.base_records as f64);
+            out.push(mover.new_records as f64);
+            out.push(mover.base_share_pct);
+            out.push(mover.new_share_pct);
+            out.push(mover.delta_share_pp);
+            out.push(mover.base_primary_metric_value);
+            out.push(mover.new_primary_metric_value);
+            out.push(mover.delta_primary_metric_value);
+        }
+    }
+    out.extend(extract_numeric_values(stop_reason));
+    out.push(1.0);
+    out.push(5.0);
+    out
+}
+
+fn summary_numbers_are_grounded(summary: &str, allowed: &[f64]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    extract_numeric_values(summary)
+        .into_iter()
+        .all(|v| allowed.iter().any(|a| approx_number_match(v, *a)))
+}
+
+fn approx_number_match(a: f64, b: f64) -> bool {
+    let scale = a.abs().max(b.abs());
+    let tol = if scale >= 1_000_000.0 {
+        1.0
+    } else if scale >= 1_000.0 {
+        0.5
+    } else {
+        0.05
+    };
+    (a - b).abs() <= tol
+}
+
+fn extract_numeric_values(text: &str) -> Vec<f64> {
+    let mut out = Vec::<f64>::new();
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if !(c.is_ascii_digit() || c == '-') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch.is_ascii_digit() || ch == '.' || ch == ',' || ch == '_' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let token = chars[start..i].iter().collect::<String>();
+        let normalized = token.replace([',', '_'], "");
+        if normalized == "-" || normalized == "." || normalized == "-." {
+            continue;
+        }
+        if let Ok(v) = normalized.parse::<f64>() {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn llm_finalize_summary_with_fallback(
+    planner: &dyn LlmClient,
+    local_fallback: Option<&dyn LlmClient>,
+    question: &str,
+    steps: &[InvestigationStep],
+    trace: &[InvestigationTraceStep],
+    stop_reason: &str,
+) -> Result<String> {
+    match llm_finalize_summary(planner, question, steps, trace, stop_reason) {
+        Ok(s) => Ok(s),
+        Err(primary_err) => {
+            if let Some(local) = local_fallback {
+                llm_finalize_summary(local, question, steps, trace, stop_reason).map_err(
+                    |local_err| {
+                        anyhow!(
+                            "primary summary planner failed: {}; local fallback failed: {}",
+                            primary_err,
+                            local_err
+                        )
+                    },
+                )
+            } else {
+                Err(primary_err)
+            }
+        }
+    }
+}
+
+fn deterministic_summary_from_steps(
+    steps: &[InvestigationStep],
+    stop_reason: &str,
+    recommended_next_question: &str,
+) -> String {
+    if let Some(step0) = steps.first() {
+        if let Some(top) = step0.movers.first() {
+            return format!(
+                "Largest shift is '{}' ({:+.2} delta metric, {:+.2} pp share).\nStop reason: {}.\nNext: {}",
+                top.segment,
+                top.delta_primary_metric_value,
+                top.delta_share_pp,
+                stop_reason,
+                recommended_next_question
+            );
+        }
+    }
+    format!(
+        "No significant mover was identified.\nStop reason: {}.\nNext: {}",
+        stop_reason, recommended_next_question
+    )
+}
+
+fn resolve_investigation_dimensions(
+    args: &InvestigateWorkflowArgs,
+    base_path: &Path,
+    new_path: &Path,
+    input_kind: InvestigateInputKind,
+    base_artifact: Option<&serde_json::Value>,
+    new_artifact: Option<&serde_json::Value>,
+) -> Result<(String, Vec<String>)> {
+    if input_kind == InvestigateInputKind::JsonArtifacts {
+        let inferred = infer_artifact_group_dimension(base_artifact, new_artifact)?;
+        if let Some(requested) = args.dimensions.first() {
+            if !requested.eq_ignore_ascii_case(&inferred) {
+                return Err(anyhow!(
+                    "for JSON artifacts, --dimensions must match artifact grouping '{}' (got '{}')",
+                    inferred,
+                    requested
+                ));
+            }
+        }
+        let drill_dimensions = if args.drill_fields.is_empty() {
+            args.dimensions.iter().skip(1).cloned().collect::<Vec<_>>()
+        } else {
+            args.drill_fields.clone()
+        };
+        return Ok((inferred, drill_dimensions));
+    }
+
+    if !args.dimensions.is_empty() {
+        let top_dimension = args
+            .dimensions
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("expected at least one dimension"))?;
+        let drill_dimensions = if args.drill_fields.is_empty() {
+            args.dimensions.iter().skip(1).cloned().collect::<Vec<_>>()
+        } else {
+            args.drill_fields.clone()
+        };
+        return Ok((top_dimension, drill_dimensions));
+    }
+
+    let inferred = infer_csv_investigation_dimensions(base_path, new_path, args.metric.as_deref())?;
+    let top_dimension = inferred
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("failed to infer top dimension for investigate"))?;
+    let drill_dimensions = if args.drill_fields.is_empty() {
+        inferred.iter().skip(1).cloned().collect::<Vec<_>>()
+    } else {
+        args.drill_fields.clone()
+    };
+    Ok((top_dimension, drill_dimensions))
+}
+
+fn infer_csv_investigation_dimensions(
+    base_path: &Path,
+    new_path: &Path,
+    metric: Option<&str>,
+) -> Result<Vec<String>> {
+    let sample_rows = 300usize;
+    let (base_headers, base_rows) = read_csv_headers_and_sample(base_path, sample_rows)?;
+    let (new_headers, new_rows) = read_csv_headers_and_sample(new_path, sample_rows)?;
+
+    let mut out = Vec::<String>::new();
+    for base_name in &base_headers {
+        if metric.is_some_and(|m| base_name.eq_ignore_ascii_case(m)) {
+            continue;
+        }
+        if looks_like_identifier_column(base_name) {
+            continue;
+        }
+        let Some(base_idx) = header_index_case_insensitive(&base_headers, base_name) else {
+            continue;
+        };
+        let Some(new_idx) = header_index_case_insensitive(&new_headers, base_name) else {
+            continue;
+        };
+
+        let mut non_empty = 0usize;
+        let mut numeric_like = 0usize;
+        let mut date_like = 0usize;
+        let mut unique_values = HashSet::<String>::new();
+        for rec in &base_rows {
+            let v = rec.get(base_idx).unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            non_empty += 1;
+            if parse_numeric(v).is_some() {
+                numeric_like += 1;
+            }
+            if parse_date_like(v).is_some() {
+                date_like += 1;
+            }
+            if unique_values.len() < 256 {
+                unique_values.insert(v.to_string());
+            }
+        }
+        for rec in &new_rows {
+            let v = rec.get(new_idx).unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            non_empty += 1;
+            if parse_numeric(v).is_some() {
+                numeric_like += 1;
+            }
+            if parse_date_like(v).is_some() {
+                date_like += 1;
+            }
+            if unique_values.len() < 256 {
+                unique_values.insert(v.to_string());
+            }
+        }
+        if non_empty == 0 {
+            continue;
+        }
+
+        let numeric_ratio = numeric_like as f64 / non_empty as f64;
+        let date_ratio = date_like as f64 / non_empty as f64;
+        let unique_count = unique_values.len();
+        let unique_ratio = unique_count as f64 / non_empty as f64;
+        let low_cardinality_code = unique_count > 0
+            && unique_count <= 20
+            && (unique_count as f64 / non_empty as f64) <= 0.2;
+        // High-cardinality text-like columns are usually IDs/keys and make poor drill dimensions.
+        let high_cardinality_text =
+            numeric_ratio < 0.9 && unique_count >= 64 && unique_ratio >= 0.35;
+        if date_ratio >= 0.8
+            || (numeric_ratio >= 0.9 && !low_cardinality_code)
+            || high_cardinality_text
+        {
+            continue;
+        }
+        out.push(base_name.to_string());
+    }
+
+    if out.is_empty() {
+        return Err(anyhow!(
+            "could not auto-detect categorical dimensions from CSVs; pass --dimensions explicitly"
+        ));
+    }
+    Ok(out)
+}
+
+fn looks_like_identifier_column(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "id"
+        || n.ends_with("_id")
+        || n.ends_with("_identifier")
+        || n.ends_with("_uuid")
+        || n.ends_with("_guid")
+        || n.ends_with("_key")
+        || n.ends_with("_hash")
+}
+
+fn read_csv_headers_and_sample(
+    path: &Path,
+    sample_rows: usize,
+) -> Result<(StringRecord, Vec<StringRecord>)> {
+    let mut rdr = csv::Reader::from_path(path)
+        .map_err(|e| anyhow!("failed to read csv '{}': {}", path.display(), e))?;
+    let headers = rdr
+        .headers()
+        .map_err(|e| anyhow!("failed to read headers from '{}': {}", path.display(), e))?
+        .clone();
+    let mut rows = Vec::<StringRecord>::new();
+    for rec in rdr.records().take(sample_rows) {
+        rows.push(
+            rec.map_err(|e| anyhow!("failed to read rows from '{}': {}", path.display(), e))?,
+        );
+    }
+    Ok((headers, rows))
+}
+
+fn header_index_case_insensitive(headers: &StringRecord, name: &str) -> Option<usize> {
+    headers.iter().position(|h| h.eq_ignore_ascii_case(name))
+}
+
+fn detect_investigate_input_kind(base: &Path, new: &Path) -> Result<InvestigateInputKind> {
+    let base_json = base
+        .extension()
+        .map(|x| x.to_string_lossy().to_ascii_lowercase() == "json")
+        .unwrap_or(false);
+    let new_json = new
+        .extension()
+        .map(|x| x.to_string_lossy().to_ascii_lowercase() == "json")
+        .unwrap_or(false);
+    match (base_json, new_json) {
+        (true, true) => Ok(InvestigateInputKind::JsonArtifacts),
+        (false, false) => Ok(InvestigateInputKind::CsvDatasets),
+        _ => Err(anyhow!(
+            "--base/--new must both be JSON artifacts or both be CSV datasets"
+        )),
+    }
+}
+
+fn read_json_file(path: &Path, label: &str) -> Result<serde_json::Value> {
+    let txt = fs::read_to_string(path)
+        .map_err(|e| anyhow!("failed to read {} json '{}': {}", label, path.display(), e))?;
+    serde_json::from_str(&txt)
+        .map_err(|e| anyhow!("failed to parse {} json '{}': {}", label, path.display(), e))
+}
+
+fn infer_artifact_group_dimension(
+    base_artifact: Option<&serde_json::Value>,
+    new_artifact: Option<&serde_json::Value>,
+) -> Result<String> {
+    let base_dim = base_artifact
+        .and_then(|v| v.get("group_by"))
+        .and_then(|x| x.as_array())
+        .and_then(|xs| xs.first())
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
+    let new_dim = new_artifact
+        .and_then(|v| v.get("group_by"))
+        .and_then(|x| x.as_array())
+        .and_then(|xs| xs.first())
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
+
+    if let (Some(b), Some(n)) = (&base_dim, &new_dim) {
+        if b != n {
+            return Err(anyhow!(
+                "base/new artifacts use different group_by dimensions ('{}' vs '{}')",
+                b,
+                n
+            ));
+        }
+    }
+
+    new_dim.or(base_dim).ok_or_else(|| {
+        anyhow!(
+            "could not infer grouping dimension from artifact JSON; pass --dimensions explicitly"
+        )
+    })
+}
+
+fn artifact_has_metric(v: &serde_json::Value, metric: &str) -> bool {
+    let metric_in_declared = v
+        .get("metrics")
+        .and_then(|x| x.as_array())
+        .map(|xs| {
+            xs.iter().filter_map(|x| x.as_str()).any(|m| {
+                m == metric
+                    || m.eq_ignore_ascii_case(metric)
+                    || m.strip_suffix("_p25")
+                        .or_else(|| m.strip_suffix("_p50"))
+                        .or_else(|| m.strip_suffix("_p75"))
+                        .is_some_and(|base| base.eq_ignore_ascii_case(metric))
+            })
+        })
+        .unwrap_or(false);
+    if metric_in_declared {
+        return true;
+    }
+    v.get("groups")
+        .and_then(|x| x.as_array())
+        .and_then(|xs| xs.first())
+        .and_then(|g| value_by_key_case_insensitive(g, metric))
+        .is_some()
+}
+
+fn validate_metric_in_artifact(v: &serde_json::Value, metric: &str, label: &str) -> Result<()> {
+    if artifact_has_metric(v, metric) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} artifact does not contain metric '{}' in groups/metrics",
+        label,
+        metric
+    ))
+}
+
+fn artifact_primary_metric(v: &serde_json::Value) -> Option<String> {
+    v.get("primary_metric")
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string())
+}
+
+fn resolve_metric_for_json_artifacts(
+    base: &serde_json::Value,
+    new: &serde_json::Value,
+    requested_metric: Option<&str>,
+) -> Result<String> {
+    if let Some(metric) = requested_metric {
+        validate_metric_in_artifact(base, metric, "base")?;
+        validate_metric_in_artifact(new, metric, "new")?;
+        return Ok(metric.to_string());
+    }
+
+    let base_primary = artifact_primary_metric(base)
+        .ok_or_else(|| anyhow!("base artifact missing primary_metric; pass --metric explicitly"))?;
+    let new_primary = artifact_primary_metric(new)
+        .ok_or_else(|| anyhow!("new artifact missing primary_metric; pass --metric explicitly"))?;
+    if base_primary != new_primary {
+        return Err(anyhow!(
+            "base/new artifacts have different primary_metric values ('{}' vs '{}'); pass --metric that exists in both artifacts",
+            base_primary,
+            new_primary
+        ));
+    }
+    validate_metric_in_artifact(base, &new_primary, "base")?;
+    validate_metric_in_artifact(new, &new_primary, "new")?;
+    Ok(new_primary)
+}
+
+struct InvestigationInputRefs<'a> {
+    base_path: &'a Path,
+    new_path: &'a Path,
+    input_kind: InvestigateInputKind,
+    base_artifact: Option<&'a serde_json::Value>,
+    new_artifact: Option<&'a serde_json::Value>,
+}
+
+fn investigation_step_from_inputs(
+    args: &InvestigateWorkflowArgs,
+    input: &InvestigationInputRefs<'_>,
+    dimension: &str,
+    scope: &[(String, String)],
+    mode: InvestigationMode,
+) -> Result<InvestigationStep> {
+    let top_n = args.top_movers.max(args.max_branches).max(1);
+    let (base_report, new_report, metric_override) = match input.input_kind {
+        InvestigateInputKind::JsonArtifacts => {
+            let base = input
+                .base_artifact
+                .cloned()
+                .ok_or_else(|| anyhow!("missing base artifact payload"))?;
+            let new = input
+                .new_artifact
+                .cloned()
+                .ok_or_else(|| anyhow!("missing new artifact payload"))?;
+            let metric = resolve_metric_for_json_artifacts(&base, &new, args.metric.as_deref())?;
+            (base, new, Some(metric))
+        }
+        InvestigateInputKind::CsvDatasets => {
+            let metric = args.metric.clone().ok_or_else(|| {
+                anyhow!("--metric is required when --base/--new point to CSV datasets")
+            })?;
+            let base_json = analyze_csv_for_investigate(
+                input.base_path,
+                dimension,
+                &metric,
+                scope,
+                top_n.saturating_mul(4),
+            )?;
+            let new_json = analyze_csv_for_investigate(
+                input.new_path,
+                dimension,
+                &metric,
+                scope,
+                top_n.saturating_mul(4),
+            )?;
+            (base_json, new_json, Some(metric))
+        }
+    };
+    build_investigation_step(
+        dimension,
+        scope,
+        mode,
+        &base_report,
+        &new_report,
+        metric_override.as_deref(),
+        top_n,
+    )
+}
+
+fn analyze_csv_for_investigate(
+    input: &Path,
+    dimension: &str,
+    metric: &str,
+    scope: &[(String, String)],
+    top_n: usize,
+) -> Result<serde_json::Value> {
+    let input_buf = input.to_path_buf();
+    let where_clauses = scope
+        .iter()
+        .map(|(col, val)| format!("{}={}", col, val))
+        .collect::<Vec<_>>();
+    let report = analyze_table_csv(
+        &input_buf,
+        None,
+        &[dimension.to_string()],
+        3,
+        &[metric.to_string()],
+        false,
+        AggKind::Sum,
+        &[],
+        false,
+        false,
+        None,
+        &where_clauses,
+        false,
+        Some(metric),
+        top_n.max(10),
+        0,
+        2,
+        1,
+        None,
+        None,
+        &[],
+    )?;
+    Ok(report.json)
+}
+
+fn build_investigation_step(
+    dimension: &str,
+    scope: &[(String, String)],
+    mode: InvestigationMode,
+    base: &serde_json::Value,
+    new: &serde_json::Value,
+    metric_hint: Option<&str>,
+    top_movers: usize,
+) -> Result<InvestigationStep> {
+    let base_records = base.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
+    let new_records = new.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
+    let base_top5_count = base.get("top5_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    let new_top5_count = new.get("top5_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    let base_top5_pct = pct(base_top5_count, base_records);
+    let new_top5_pct = pct(new_top5_count, new_records);
+
+    let primary_metric = metric_hint
+        .map(|m| m.to_string())
+        .or_else(|| {
+            new.get("primary_metric")
+                .and_then(|x| x.as_str())
+                .map(|x| x.to_string())
+        })
+        .or_else(|| {
+            base.get("primary_metric")
+                .and_then(|x| x.as_str())
+                .map(|x| x.to_string())
+        })
+        .ok_or_else(|| anyhow!("primary metric missing in reports; pass --metric explicitly"))?;
+
+    let base_map = groups_to_map(base, &primary_metric);
+    let new_map = groups_to_map(new, &primary_metric);
+    let mut keys = base_map.keys().cloned().collect::<HashSet<_>>();
+    keys.extend(new_map.keys().cloned());
+    let segment_count = keys.len();
+    let base_top1_pct = base_map
+        .values()
+        .map(|(_, share, _)| *share)
+        .fold(0.0, f64::max);
+    let new_top1_pct = new_map
+        .values()
+        .map(|(_, share, _)| *share)
+        .fold(0.0, f64::max);
+
+    let mut movers = keys
+        .into_iter()
+        .map(|k| {
+            let (bc, bs, bp) = base_map.get(&k).copied().unwrap_or((0, 0.0, 0.0));
+            let (nc, ns, np) = new_map.get(&k).copied().unwrap_or((0, 0.0, 0.0));
+            InvestigationMover {
+                segment: k,
+                base_records: bc,
+                new_records: nc,
+                base_share_pct: bs,
+                new_share_pct: ns,
+                delta_share_pp: ns - bs,
+                base_primary_metric_value: bp,
+                new_primary_metric_value: np,
+                delta_primary_metric_value: np - bp,
+            }
+        })
+        .collect::<Vec<_>>();
+    movers.sort_by(|a, b| {
+        mover_score(b, mode)
+            .partial_cmp(&mover_score(a, mode))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.segment.cmp(&b.segment))
+    });
+    movers.truncate(top_movers.max(1));
+
+    Ok(InvestigationStep {
+        depth: scope.len(),
+        dimension: dimension.to_string(),
+        scope: scope.to_vec(),
+        primary_metric,
+        base_records,
+        new_records,
+        segment_count,
+        top5_concentration_base_pct: base_top5_pct,
+        top5_concentration_new_pct: new_top5_pct,
+        top5_concentration_delta_pp: new_top5_pct - base_top5_pct,
+        top1_concentration_base_pct: base_top1_pct,
+        top1_concentration_new_pct: new_top1_pct,
+        top1_concentration_delta_pp: new_top1_pct - base_top1_pct,
+        movers,
+    })
+}
+
+fn select_drill_candidates(
+    step: &InvestigationStep,
+    mode: InvestigationMode,
+    min_contribution: f64,
+    min_slice_rows: u64,
+    branch_limit: usize,
+) -> Vec<&InvestigationMover> {
+    let mut candidates = step
+        .movers
+        .iter()
+        .filter(|m| {
+            !m.segment.trim().is_empty()
+                && m.segment != "(blank)"
+                && m.segment != "(unknown)"
+                && m.base_records.max(m.new_records) >= min_slice_rows
+                && mover_score(m, mode) >= min_contribution
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        mover_score(b, mode)
+            .partial_cmp(&mover_score(a, mode))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.segment.cmp(&b.segment))
+    });
+    candidates.truncate(branch_limit.max(1));
+    candidates
+}
+
+fn used_dimensions_for_step(step: &InvestigationStep) -> Vec<String> {
+    let mut used = Vec::<String>::new();
+    for (dim, _) in &step.scope {
+        if !used.iter().any(|x| x == dim) {
+            used.push(dim.clone());
+        }
+    }
+    if !used.iter().any(|x| x == &step.dimension) {
+        used.push(step.dimension.clone());
+    }
+    used
+}
+
+fn mover_score(mover: &InvestigationMover, mode: InvestigationMode) -> f64 {
+    match mode {
+        InvestigationMode::ConcentrationDrivers => mover.delta_share_pp.abs(),
+        InvestigationMode::ChangeDrivers
+        | InvestigationMode::CompareSnapshots
+        | InvestigationMode::RecommendNext => mover.delta_primary_metric_value.abs(),
+    }
+}
+
+fn top_step_score(step: &InvestigationStep, mode: InvestigationMode) -> f64 {
+    step.movers
+        .first()
+        .map(|m| mover_score(m, mode))
+        .unwrap_or(0.0)
+}
+
+fn deterministic_drill_decision(
+    parent_step: &InvestigationStep,
+    mover: &InvestigationMover,
+    mode: InvestigationMode,
+    next_dimension: &str,
+) -> String {
+    let detail = match mode {
+        InvestigationMode::ConcentrationDrivers => format!(
+            "delta share {} pp, score {}",
+            signed_fmt_num(mover.delta_share_pp, 2),
+            fmt_num(mover_score(mover, mode), 2)
+        ),
+        InvestigationMode::ChangeDrivers
+        | InvestigationMode::CompareSnapshots
+        | InvestigationMode::RecommendNext => format!(
+            "delta {} {}, score {}",
+            parent_step.primary_metric,
+            signed_fmt_num(mover.delta_primary_metric_value, 2),
+            fmt_num(mover_score(mover, mode), 2)
+        ),
+    };
+    format!(
+        "selected {}='{}' ({}) and drilled by {}",
+        parent_step.dimension, mover.segment, detail, next_dimension
+    )
+}
+
+fn choose_next_dimension(
+    drill_dimensions: &[String],
+    used_dimensions: &[String],
+) -> Option<String> {
+    drill_dimensions
+        .iter()
+        .find(|d| !used_dimensions.iter().any(|u| u == *d))
+        .cloned()
+}
+
+fn remaining_drill_dimensions(
+    drill_dimensions: &[String],
+    used_dimensions: &[String],
+) -> Vec<String> {
+    drill_dimensions
+        .iter()
+        .filter(|d| !used_dimensions.iter().any(|u| u == *d))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn investigation_mode_label(mode: InvestigationMode) -> &'static str {
+    match mode {
+        InvestigationMode::ChangeDrivers => "change_drivers",
+        InvestigationMode::ConcentrationDrivers => "concentration_drivers",
+        InvestigationMode::CompareSnapshots => "compare_snapshots",
+        InvestigationMode::RecommendNext => "recommend_next",
+    }
+}
+
+fn mode_from_arg(mode: InvestigationModeArg) -> InvestigationMode {
+    match mode {
+        InvestigationModeArg::ChangeDrivers => InvestigationMode::ChangeDrivers,
+        InvestigationModeArg::ConcentrationDrivers => InvestigationMode::ConcentrationDrivers,
+        InvestigationModeArg::CompareSnapshots => InvestigationMode::CompareSnapshots,
+        InvestigationModeArg::RecommendNext => InvestigationMode::RecommendNext,
+    }
+}
+
+fn resolve_investigation_mode(args: &InvestigateWorkflowArgs) -> InvestigationMode {
+    if let Some(mode) = args.mode {
+        return mode_from_arg(mode);
+    }
+    route_investigation_mode(&args.question)
+}
+
+fn route_investigation_mode(question: &str) -> InvestigationMode {
+    let q = question.to_lowercase();
+    if q.contains("concentration") || q.contains("concentrated") {
+        return InvestigationMode::ConcentrationDrivers;
+    }
+    if q.contains("what should i inspect")
+        || q.contains("what should we inspect")
+        || q.contains("what next")
+        || q.contains("inspect next")
+    {
+        return InvestigationMode::RecommendNext;
+    }
+    if q.contains("compare")
+        || q.contains("biggest shift")
+        || q.contains("biggest change")
+        || q.contains("largest change")
+    {
+        return InvestigationMode::CompareSnapshots;
+    }
+    InvestigationMode::ChangeDrivers
+}
+
+fn investigate_input_kind_label(kind: InvestigateInputKind) -> &'static str {
+    match kind {
+        InvestigateInputKind::JsonArtifacts => "artifacts_json",
+        InvestigateInputKind::CsvDatasets => "datasets_csv",
+    }
+}
+
+fn default_investigate_workflow_out(args: &InvestigateWorkflowArgs) -> PathBuf {
+    let base = PathBuf::from("artifacts/investigate_workflow");
+    match args.output_format {
+        InvestigateOutputFormat::Md | InvestigateOutputFormat::Both => base.with_extension("md"),
+        InvestigateOutputFormat::Json => base.with_extension("json"),
+    }
+}
+
+fn recommended_next_question(
+    mode: InvestigationMode,
+    last_step: Option<&InvestigationStep>,
+) -> String {
+    match (mode, last_step, last_step.and_then(|s| s.movers.first())) {
+        (_, Some(step), Some(mover))
+            if mover.segment != "(blank)" && mover_score(mover, mode).abs() > 0.005 =>
+        {
+            let scope_prefix = if step.scope.is_empty() {
+                String::new()
+            } else {
+                format!("within scope [{}], ", format_scope(&step.scope))
+            };
+            let delta_detail = match mode {
+                InvestigationMode::ConcentrationDrivers => {
+                    format!("delta share {} pp", signed_fmt_num(mover.delta_share_pp, 2))
+                }
+                InvestigationMode::ChangeDrivers
+                | InvestigationMode::CompareSnapshots
+                | InvestigationMode::RecommendNext => format!(
+                    "delta {} {}",
+                    step.primary_metric,
+                    signed_fmt_num(mover.delta_primary_metric_value, 2)
+                ),
+            };
+            format!(
+                "Drill deeper {}on {}='{}' to explain {} and whether it is persistent.",
+                scope_prefix, step.dimension, mover.segment, delta_detail
+            )
+        }
+        (InvestigationMode::ConcentrationDrivers, _, _) => {
+            "Which segment-level policy or pricing action can reduce top-5 concentration next period?"
+                .to_string()
+        }
+        (InvestigationMode::CompareSnapshots, _, _) => {
+            "Which of these movers is expected to remain material in the next snapshot?".to_string()
+        }
+        (InvestigationMode::RecommendNext, _, _) | (InvestigationMode::ChangeDrivers, _, _) => {
+            "Which segment should we test first to reverse the observed change?".to_string()
+        }
+    }
+}
+
+struct InvestigationInputLabels<'a> {
+    base: &'a str,
+    new: &'a str,
+}
+
+struct InvestigationRenderData<'a> {
+    major_global_changes: &'a [InvestigationMajorChange],
+    steps: &'a [InvestigationStep],
+    trace: &'a [InvestigationTraceStep],
+    stop_reason: &'a str,
+    recommended_next_question: &'a str,
+}
+
+fn render_investigation_workflow_markdown(
+    args: &InvestigateWorkflowArgs,
+    input_labels: &InvestigationInputLabels<'_>,
+    mode: InvestigationMode,
+    data: &InvestigationRenderData<'_>,
+) -> String {
+    let mut md = String::new();
+    md.push_str("# Investigation Report\n\n");
+    md.push_str(&format!("- Question: {}\n", args.question));
+    md.push_str(&format!("- Mode: {}\n", investigation_mode_label(mode)));
+    md.push_str(&format!("- Base input: {}\n", input_labels.base));
+    md.push_str(&format!("- New input: {}\n", input_labels.new));
+    md.push('\n');
+
+    if let Some(step0) = data.steps.first() {
+        md.push_str("## Top-level finding\n\n");
+        let base_total = step0
+            .movers
+            .iter()
+            .map(|m| m.base_primary_metric_value)
+            .sum::<f64>();
+        let new_total = step0
+            .movers
+            .iter()
+            .map(|m| m.new_primary_metric_value)
+            .sum::<f64>();
+        let delta_total = new_total - base_total;
+        if step0.movers.len() == step0.segment_count {
+            md.push_str(&format!(
+                "- Between compared periods, total `{}` changed from {} to {} (delta = {}).\n",
+                step0.primary_metric,
+                fmt_num(base_total, 2),
+                fmt_num(new_total, 2),
+                signed_fmt_num(delta_total, 2)
+            ));
+        } else {
+            md.push_str(&format!(
+                "- Across reported movers only ({} of {} segments), subtotal `{}` changed from {} to {} (delta = {}); increase `--top-movers` for full-period total.\n",
+                step0.movers.len(),
+                step0.segment_count,
+                step0.primary_metric,
+                fmt_num(base_total, 2),
+                fmt_num(new_total, 2),
+                signed_fmt_num(delta_total, 2)
+            ));
+        }
+        if let Some(top) = step0.movers.first() {
+            md.push_str(&format!(
+                "- On `{}` the strongest mover is `{}` (delta {} = {}, delta share = {:+.2} pp).\n",
+                step0.dimension,
+                top.segment,
+                step0.primary_metric,
+                fmt_num(top.delta_primary_metric_value, 2),
+                top.delta_share_pp
+            ));
+        } else {
+            md.push_str("- No movers were available at top level.\n");
+        }
+        if step0.segment_count <= 5 {
+            md.push_str(&format!(
+                "- Top-5 concentration is saturated at 100.00% because only {} segments exist; top-1 concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
+                step0.segment_count,
+                step0.top1_concentration_base_pct,
+                step0.top1_concentration_new_pct,
+                step0.top1_concentration_delta_pp
+            ));
+        } else {
+            md.push_str(&format!(
+                "- Top-5 concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
+                step0.top5_concentration_base_pct,
+                step0.top5_concentration_new_pct,
+                step0.top5_concentration_delta_pp
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !data.major_global_changes.is_empty() {
+        md.push_str("## Major global changes\n\n");
+        for (idx, change) in data.major_global_changes.iter().enumerate() {
+            md.push_str(&format!(
+                "- {}. `{}` strongest mover `{}` (delta {} = {}, delta share = {:+.2} pp, score {}).\n",
+                idx + 1,
+                change.dimension,
+                change.segment,
+                change.primary_metric,
+                fmt_num(change.delta_primary_metric_value, 2),
+                change.delta_share_pp,
+                fmt_num(change.score, 2)
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Follow-up findings\n\n");
+    if data.steps.len() <= 1 {
+        md.push_str("- No follow-up step executed.\n");
+    } else {
+        for step in data.steps.iter().skip(1) {
+            if let Some(top) = step.movers.first() {
+                let scope_txt = if step.scope.is_empty() {
+                    "global".to_string()
+                } else {
+                    step.scope
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if step.scope.is_empty() {
+                    md.push_str(&format!(
+                        "- Global follow-up grouped by `{}`: strongest mover `{}` (delta {} = {}, delta share = {:+.2} pp).\n",
+                        step.dimension,
+                        top.segment,
+                        step.primary_metric,
+                        fmt_num(top.delta_primary_metric_value, 2),
+                        top.delta_share_pp
+                    ));
+                } else {
+                    md.push_str(&format!(
+                        "- Depth {} scope [{}] grouped by `{}`: strongest mover `{}` (delta {} = {}, delta share = {:+.2} pp).\n",
+                        step.depth,
+                        scope_txt,
+                        step.dimension,
+                        top.segment,
+                        step.primary_metric,
+                        fmt_num(top.delta_primary_metric_value, 2),
+                        top.delta_share_pp
+                    ));
+                }
+            }
+        }
+    }
+    md.push('\n');
+
+    md.push_str("## Why it stopped\n\n");
+    md.push_str(&format!("- {}\n\n", data.stop_reason));
+
+    md.push_str("## Recommended next question\n\n");
+    md.push_str(&format!("- {}\n\n", data.recommended_next_question));
+
+    md.push_str("## Decision trace\n\n");
+    for t in data.trace {
+        let scope_txt = if t.scope.is_empty() {
+            "global".to_string()
+        } else {
+            t.scope
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        md.push_str(&format!(
+            "- depth={} action={} scope=[{}] decision={}\n",
+            t.depth, t.action, scope_txt, t.decision
+        ));
+    }
+    md
+}
+
 fn default_analyze_compare_out(format: CompareOutputFormat) -> PathBuf {
     match format {
         CompareOutputFormat::Md | CompareOutputFormat::Both => {
@@ -4043,13 +7324,29 @@ fn groups_to_map(v: &serde_json::Value, primary_metric: &str) -> HashMap<String,
             .get("count_share_pct")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0);
-        let primary = g
-            .get(primary_metric)
+        let primary = value_by_key_case_insensitive(&g, primary_metric)
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0);
         out.insert(name, (count, share, primary));
     }
     out
+}
+
+fn value_by_key_case_insensitive<'a>(
+    v: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(exact) = v.get(key) {
+        return Some(exact);
+    }
+    let obj = v.as_object()?;
+    obj.iter().find_map(|(k, val)| {
+        if k.eq_ignore_ascii_case(key) {
+            Some(val)
+        } else {
+            None
+        }
+    })
 }
 
 fn pct(num: u64, den: u64) -> f64 {
@@ -4298,6 +7595,297 @@ fn apply_analyze_profile(mut args: AnalyzeArgs) -> Result<AnalyzeArgs> {
     }
 
     Ok(args)
+}
+
+fn load_investigate_config(path: &Path) -> Result<InvestigateConfigEntry> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        anyhow!(
+            "failed to read investigate config '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    let raw: toml::Value = toml::from_str(&text).map_err(|e| {
+        anyhow!(
+            "failed to parse investigate config '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    let section = raw
+        .get("investigate")
+        .cloned()
+        .unwrap_or_else(|| raw.clone());
+    if !section.is_table() {
+        return Err(anyhow!(
+            "investigate config '{}' must be a TOML table or contain [investigate] table",
+            path.display()
+        ));
+    }
+    section.try_into().map_err(|e| {
+        anyhow!(
+            "failed to decode investigate config '{}': {}",
+            path.display(),
+            e
+        )
+    })
+}
+
+fn parse_mode_arg_from_str(raw: &str) -> Result<InvestigationModeArg> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "change_drivers" => Ok(InvestigationModeArg::ChangeDrivers),
+        "concentration_drivers" => Ok(InvestigationModeArg::ConcentrationDrivers),
+        "compare_snapshots" => Ok(InvestigationModeArg::CompareSnapshots),
+        "recommend_next" => Ok(InvestigationModeArg::RecommendNext),
+        _ => Err(anyhow!(
+            "invalid investigate mode '{}'; expected one of: change_drivers, concentration_drivers, compare_snapshots, recommend_next",
+            raw
+        )),
+    }
+}
+
+fn parse_planner_from_str(raw: &str) -> Result<InvestigationPlanner> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "deterministic" => Ok(InvestigationPlanner::Deterministic),
+        "llm" => Ok(InvestigationPlanner::Llm),
+        _ => Err(anyhow!(
+            "invalid planner '{}'; expected deterministic or llm",
+            raw
+        )),
+    }
+}
+
+fn parse_backend_arg_from_str(raw: &str) -> Result<BackendArg> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "local" => Ok(BackendArg::Local),
+        "bedrock" => Ok(BackendArg::Bedrock),
+        _ => Err(anyhow!(
+            "invalid planner backend '{}'; expected local or bedrock",
+            raw
+        )),
+    }
+}
+
+fn parse_investigate_output_format_from_str(raw: &str) -> Result<InvestigateOutputFormat> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "md" => Ok(InvestigateOutputFormat::Md),
+        "json" => Ok(InvestigateOutputFormat::Json),
+        "both" => Ok(InvestigateOutputFormat::Both),
+        _ => Err(anyhow!(
+            "invalid investigate output format '{}'; expected md, json, or both",
+            raw
+        )),
+    }
+}
+
+fn parse_postgres_ssl_mode_from_str(raw: &str) -> Result<PostgresSslMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "disable" => Ok(PostgresSslMode::Disable),
+        "prefer" => Ok(PostgresSslMode::Prefer),
+        "require" => Ok(PostgresSslMode::Require),
+        _ => Err(anyhow!(
+            "invalid postgres ssl mode '{}'; expected disable, prefer, or require",
+            raw
+        )),
+    }
+}
+
+fn parse_time_grain_from_str(raw: &str) -> Result<TimeGrain> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "day" => Ok(TimeGrain::Day),
+        "week" => Ok(TimeGrain::Week),
+        "month" => Ok(TimeGrain::Month),
+        "year" => Ok(TimeGrain::Year),
+        _ => Err(anyhow!(
+            "invalid time grain '{}'; expected day, week, month, or year",
+            raw
+        )),
+    }
+}
+
+fn parse_period_preset_from_str(raw: &str) -> Result<PeriodPreset> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "current" => Ok(PeriodPreset::Current),
+        "previous" => Ok(PeriodPreset::Previous),
+        "last" => Ok(PeriodPreset::Last),
+        _ => Err(anyhow!(
+            "invalid period '{}'; expected current, previous, or last",
+            raw
+        )),
+    }
+}
+
+fn apply_investigate_config(mut args: InvestigateWorkflowArgs) -> Result<InvestigateWorkflowArgs> {
+    if let Some(cfg_path) = args.config.clone() {
+        let cfg = load_investigate_config(&cfg_path)?;
+
+        if args.question.trim().is_empty() {
+            if let Some(v) = cfg.question {
+                args.question = v;
+            }
+        }
+        if args.mode.is_none() {
+            if let Some(v) = cfg.mode.as_deref() {
+                args.mode = Some(parse_mode_arg_from_str(v)?);
+            }
+        }
+        if args.base.is_none() {
+            if let Some(v) = cfg.base {
+                args.base = Some(PathBuf::from(v));
+            }
+        }
+        if args.new.is_none() {
+            if let Some(v) = cfg.new {
+                args.new = Some(PathBuf::from(v));
+            }
+        }
+        if args.postgres_url.is_none() {
+            args.postgres_url = cfg.postgres_url;
+        }
+        if args.postgres_ssl_mode == PostgresSslMode::Prefer {
+            if let Some(v) = cfg.postgres_ssl_mode.as_deref() {
+                args.postgres_ssl_mode = parse_postgres_ssl_mode_from_str(v)?;
+            }
+        }
+        if args.postgres_ca_file.is_none() {
+            if let Some(v) = cfg.postgres_ca_file {
+                args.postgres_ca_file = Some(PathBuf::from(v));
+            }
+        }
+        if args.query.is_none() {
+            args.query = cfg.query;
+        }
+        if args.query_file.is_none() {
+            if let Some(v) = cfg.query_file {
+                args.query_file = Some(PathBuf::from(v));
+            }
+        }
+        if args.metric.is_none() {
+            args.metric = cfg.metric;
+        }
+        if args.date_column.is_none() {
+            args.date_column = cfg.date_column;
+        }
+        if args.time_grain.is_none() {
+            if let Some(v) = cfg.time_grain.as_deref() {
+                args.time_grain = Some(parse_time_grain_from_str(v)?);
+            }
+        }
+        if args.period.is_none() {
+            if let Some(v) = cfg.period.as_deref() {
+                args.period = Some(parse_period_preset_from_str(v)?);
+            }
+        }
+        if args.anchor_date.is_none() {
+            args.anchor_date = cfg.anchor_date;
+        }
+        if args.current_start.is_none() {
+            args.current_start = cfg.current_start;
+        }
+        if args.current_end.is_none() {
+            args.current_end = cfg.current_end;
+        }
+        if args.previous_start.is_none() {
+            args.previous_start = cfg.previous_start;
+        }
+        if args.previous_end.is_none() {
+            args.previous_end = cfg.previous_end;
+        }
+        if args.dimensions.is_empty() {
+            if let Some(v) = cfg.dimensions {
+                args.dimensions = v;
+            }
+        }
+        if args.drill_fields.is_empty() {
+            if let Some(v) = cfg.drill_fields {
+                args.drill_fields = v;
+            }
+        }
+        if args.max_depth == 2 {
+            if let Some(v) = cfg.max_depth {
+                args.max_depth = v;
+            }
+        }
+        if args.max_branches == 1 {
+            if let Some(v) = cfg.max_branches {
+                args.max_branches = v;
+            }
+        }
+        if (args.min_contribution - 5.0).abs() <= f64::EPSILON {
+            if let Some(v) = cfg.min_contribution {
+                args.min_contribution = v;
+            }
+        }
+        if args.min_score_improvement.abs() <= f64::EPSILON {
+            if let Some(v) = cfg.min_score_improvement {
+                args.min_score_improvement = v;
+            }
+        }
+        if args.min_slice_rows == 5 {
+            if let Some(v) = cfg.min_slice_rows {
+                args.min_slice_rows = v;
+            }
+        }
+        if args.top_movers == 12 {
+            if let Some(v) = cfg.top_movers {
+                args.top_movers = v;
+            }
+        }
+        if args.planner == InvestigationPlanner::Deterministic {
+            if let Some(v) = cfg.planner.as_deref() {
+                args.planner = parse_planner_from_str(v)?;
+            }
+        }
+        if args.planner_backend == BackendArg::Local {
+            if let Some(v) = cfg.planner_backend.as_deref() {
+                args.planner_backend = parse_backend_arg_from_str(v)?;
+            }
+        }
+        if args.planner_model.is_none() {
+            args.planner_model = cfg.planner_model;
+        }
+        if !args.verbose {
+            if let Some(v) = cfg.verbose {
+                args.verbose = v;
+            }
+        }
+        if !args.trace {
+            if let Some(v) = cfg.trace {
+                args.trace = v;
+            }
+        }
+        if args.output_format == InvestigateOutputFormat::Both {
+            if let Some(v) = cfg.output_format.as_deref() {
+                args.output_format = parse_investigate_output_format_from_str(v)?;
+            }
+        }
+        if args.out.is_none() {
+            if let Some(v) = cfg.out {
+                args.out = Some(PathBuf::from(v));
+            }
+        }
+    }
+
+    args.dimensions = dedup_csv_fields(&args.dimensions);
+    args.drill_fields = dedup_csv_fields(&args.drill_fields);
+
+    Ok(args)
+}
+
+fn dedup_csv_fields(values: &[String]) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for raw in values {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 fn apply_profile_entry(args: &mut AnalyzeArgs, entry: &AnalyzeProfile) {
@@ -4889,6 +8477,43 @@ struct RegressionResult {
 #[derive(Debug, Deserialize)]
 struct ProfileConfigFile {
     profiles: HashMap<String, AnalyzeProfile>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct InvestigateConfigEntry {
+    question: Option<String>,
+    mode: Option<String>,
+    base: Option<String>,
+    new: Option<String>,
+    postgres_url: Option<String>,
+    postgres_ssl_mode: Option<String>,
+    postgres_ca_file: Option<String>,
+    query: Option<String>,
+    query_file: Option<String>,
+    metric: Option<String>,
+    date_column: Option<String>,
+    time_grain: Option<String>,
+    period: Option<String>,
+    anchor_date: Option<String>,
+    current_start: Option<String>,
+    current_end: Option<String>,
+    previous_start: Option<String>,
+    previous_end: Option<String>,
+    dimensions: Option<Vec<String>>,
+    drill_fields: Option<Vec<String>>,
+    max_depth: Option<usize>,
+    max_branches: Option<usize>,
+    min_contribution: Option<f64>,
+    min_score_improvement: Option<f64>,
+    min_slice_rows: Option<u64>,
+    top_movers: Option<usize>,
+    planner: Option<String>,
+    planner_backend: Option<String>,
+    planner_model: Option<String>,
+    verbose: Option<bool>,
+    trace: Option<bool>,
+    output_format: Option<String>,
+    out: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -5981,7 +9606,11 @@ fn auto_detect_groups(headers: &StringRecord, input: &PathBuf, k: usize) -> Resu
             } else {
                 fill as f64 / rows as f64
             };
-            if (2..=60).contains(&card) && fill_ratio > 0.2 && !selected.iter().any(|x| x == &h) {
+            if (2..=60).contains(&card)
+                && fill_ratio > 0.2
+                && !looks_like_identifier_column(&h)
+                && !selected.iter().any(|x| x == &h)
+            {
                 Some((h, card))
             } else {
                 None
@@ -6046,11 +9675,7 @@ fn auto_detect_numeric_metrics(
             if group_set.contains(name) {
                 return None;
             }
-            if name.eq_ignore_ascii_case("date")
-                || name.ends_with("_id")
-                || name.ends_with("_uuid")
-                || name.ends_with("_url")
-            {
+            if name.eq_ignore_ascii_case("date") || looks_like_identifier_column(name) {
                 return None;
             }
             let ne = non_empty[i];
@@ -6136,6 +9761,45 @@ mod tests {
         let headers = rdr.headers().expect("headers").clone();
         let rows = rdr.records().map(|r| r.expect("row")).collect::<Vec<_>>();
         (headers, rows)
+    }
+
+    fn investigate_workflow_args() -> InvestigateWorkflowArgs {
+        InvestigateWorkflowArgs {
+            question: "why did revenue change".to_string(),
+            mode: None,
+            config: None,
+            base: Some(PathBuf::from("artifacts/base.json")),
+            new: Some(PathBuf::from("artifacts/new.json")),
+            postgres_url: None,
+            postgres_ssl_mode: PostgresSslMode::Prefer,
+            postgres_ca_file: None,
+            query: None,
+            query_file: None,
+            metric: None,
+            date_column: None,
+            time_grain: None,
+            period: None,
+            anchor_date: None,
+            current_start: None,
+            current_end: None,
+            previous_start: None,
+            previous_end: None,
+            dimensions: vec!["region".to_string()],
+            drill_fields: vec!["channel".to_string()],
+            max_depth: 2,
+            max_branches: 2,
+            min_contribution: 5.0,
+            min_score_improvement: 0.0,
+            min_slice_rows: 5,
+            top_movers: 2,
+            planner: InvestigationPlanner::Deterministic,
+            planner_backend: BackendArg::Local,
+            planner_model: None,
+            verbose: false,
+            trace: false,
+            output_format: InvestigateOutputFormat::Json,
+            out: None,
+        }
     }
 
     #[test]
@@ -6395,6 +10059,40 @@ mod tests {
     }
 
     #[test]
+    fn default_suggest_profile_path_uses_selected_format() {
+        let base = Path::new("artifacts/demo_suggest.md");
+        assert_eq!(
+            default_suggest_profile_path(base, SuggestProfileFormat::Toml),
+            PathBuf::from("artifacts/demo_suggest.toml")
+        );
+        assert_eq!(
+            default_suggest_profile_path(base, SuggestProfileFormat::Json),
+            PathBuf::from("artifacts/demo_suggest.json")
+        );
+    }
+
+    #[test]
+    fn build_suggested_profile_config_supports_json() {
+        let report = AnalyzeSuggestReport {
+            input: "data/demo.csv".to_string(),
+            sampled_rows: 10,
+            sample_mode: "head".to_string(),
+            sample_seed: 42,
+            profile_name: "demo".to_string(),
+            suggested_group_by: vec!["region".to_string()],
+            suggested_metrics: vec!["revenue_usd".to_string()],
+            suggested_rank_by: Some("revenue_usd".to_string()),
+            suggested_date_column: Some("order_date".to_string()),
+            warnings: vec![],
+            columns: vec![],
+        };
+        let raw = build_suggested_profile_config(&report, "demo", 3, 3, SuggestProfileFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["profiles"]["demo"]["group_by"][0], "region");
+        assert_eq!(v["profiles"]["demo"]["metrics"][0], "revenue_usd");
+    }
+
+    #[test]
     fn analyze_drivers_identity_prediction_matches_demo_metric_total() {
         let path = test_data_path("demo_revenue.csv");
         let (headers, rows) = read_csv_rows(&path);
@@ -6484,6 +10182,1203 @@ mod tests {
         );
         assert_eq!(model.decomposition_mode, "heuristic");
         assert!(model.driver_contributions.is_empty());
+    }
+
+    #[test]
+    fn route_investigation_mode_uses_expected_keywords() {
+        assert_eq!(
+            route_investigation_mode("Why did concentration increase last month?"),
+            InvestigationMode::ConcentrationDrivers
+        );
+        assert_eq!(
+            route_investigation_mode("Compare current vs baseline and list biggest shifts"),
+            InvestigationMode::CompareSnapshots
+        );
+        assert_eq!(
+            route_investigation_mode("What should I inspect next?"),
+            InvestigationMode::RecommendNext
+        );
+        assert_eq!(
+            route_investigation_mode("Why did revenue change?"),
+            InvestigationMode::ChangeDrivers
+        );
+    }
+
+    #[test]
+    fn resolve_investigation_mode_prefers_explicit_mode_over_question() {
+        let mut args = investigate_workflow_args();
+        args.question = "What should I inspect next?".to_string();
+        args.mode = Some(InvestigationModeArg::ChangeDrivers);
+        assert_eq!(
+            resolve_investigation_mode(&args),
+            InvestigationMode::ChangeDrivers
+        );
+    }
+
+    #[test]
+    fn investigate_config_applies_defaults_when_cli_not_set() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let cfg_path = std::env::temp_dir().join(format!("factorlens_investigate_cfg_{}.toml", ts));
+        fs::write(
+            &cfg_path,
+            r#"
+[investigate]
+question = "Why did config question apply?"
+mode = "compare_snapshots"
+metric = "revenue_usd"
+dimensions = ["region", "channel"]
+drill_fields = ["channel"]
+max_depth = 5
+planner = "llm"
+planner_backend = "local"
+planner_model = "/models/llama.gguf"
+"#,
+        )
+        .expect("write config");
+
+        let mut args = investigate_workflow_args();
+        args.config = Some(cfg_path.clone());
+        args.question = String::new();
+        args.metric = None;
+        args.dimensions = vec![];
+        args.drill_fields = vec![];
+        args.max_depth = 2;
+        args.planner = InvestigationPlanner::Deterministic;
+        args.planner_backend = BackendArg::Local;
+        args.planner_model = None;
+
+        let out = apply_investigate_config(args).expect("apply config");
+        assert_eq!(out.question, "Why did config question apply?");
+        assert_eq!(out.mode, Some(InvestigationModeArg::CompareSnapshots));
+        assert_eq!(out.metric.as_deref(), Some("revenue_usd"));
+        assert_eq!(
+            out.dimensions,
+            vec!["region".to_string(), "channel".to_string()]
+        );
+        assert_eq!(out.drill_fields, vec!["channel".to_string()]);
+        assert_eq!(out.max_depth, 5);
+        assert_eq!(out.planner, InvestigationPlanner::Llm);
+        assert!(matches!(out.planner_backend, BackendArg::Local));
+        assert_eq!(out.planner_model.as_deref(), Some("/models/llama.gguf"));
+
+        let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn investigate_config_does_not_override_non_default_cli_values() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let cfg_path =
+            std::env::temp_dir().join(format!("factorlens_investigate_cfg_override_{}.toml", ts));
+        fs::write(
+            &cfg_path,
+            r#"
+[investigate]
+max_depth = 3
+min_contribution = 2.0
+"#,
+        )
+        .expect("write config");
+
+        let mut args = investigate_workflow_args();
+        args.config = Some(cfg_path.clone());
+        args.max_depth = 7;
+        args.min_contribution = 9.0;
+        let out = apply_investigate_config(args).expect("apply config");
+        assert_eq!(out.max_depth, 7);
+        assert_eq!(out.min_contribution, 9.0);
+
+        let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn investigate_config_dedups_dimensions_and_drill_fields() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let cfg_path =
+            std::env::temp_dir().join(format!("factorlens_investigate_cfg_dedup_{}.toml", ts));
+        fs::write(
+            &cfg_path,
+            r#"
+[investigate]
+dimensions = ["region", "Region", "channel", "region"]
+drill_fields = ["channel", "channel", "product_line", "CHANNEL"]
+"#,
+        )
+        .expect("write config");
+
+        let mut args = investigate_workflow_args();
+        args.config = Some(cfg_path.clone());
+        args.dimensions = vec![];
+        args.drill_fields = vec![];
+        let out = apply_investigate_config(args).expect("apply config");
+        assert_eq!(
+            out.dimensions,
+            vec!["region".to_string(), "channel".to_string()]
+        );
+        assert_eq!(
+            out.drill_fields,
+            vec!["channel".to_string(), "product_line".to_string()]
+        );
+
+        let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn detect_investigate_input_kind_rejects_mixed_extensions() {
+        let err = detect_investigate_input_kind(
+            Path::new("artifacts/base.json"),
+            Path::new("data/new.csv"),
+        )
+        .expect_err("expected extension mismatch error");
+        assert!(
+            err.to_string()
+                .contains("both be JSON artifacts or both be CSV datasets"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn select_drill_candidates_respect_thresholds_and_branch_limit() {
+        let step = InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 100,
+            segment_count: 2,
+            top5_concentration_base_pct: 60.0,
+            top5_concentration_new_pct: 67.0,
+            top5_concentration_delta_pp: 7.0,
+            top1_concentration_base_pct: 60.0,
+            top1_concentration_new_pct: 67.0,
+            top1_concentration_delta_pp: 7.0,
+            movers: vec![
+                InvestigationMover {
+                    segment: "West".to_string(),
+                    base_records: 60,
+                    new_records: 64,
+                    base_share_pct: 60.0,
+                    new_share_pct: 64.0,
+                    delta_share_pp: 4.0,
+                    base_primary_metric_value: 1_000.0,
+                    new_primary_metric_value: 1_080.0,
+                    delta_primary_metric_value: 80.0,
+                },
+                InvestigationMover {
+                    segment: "(blank)".to_string(),
+                    base_records: 20,
+                    new_records: 20,
+                    base_share_pct: 20.0,
+                    new_share_pct: 20.0,
+                    delta_share_pp: 0.0,
+                    base_primary_metric_value: 300.0,
+                    new_primary_metric_value: 300.0,
+                    delta_primary_metric_value: 0.0,
+                },
+            ],
+        };
+
+        let picked = select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 50.0, 10, 2);
+        assert_eq!(picked.len(), 1, "expected one eligible mover");
+        assert_eq!(picked[0].segment, "West");
+
+        let none = select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 120.0, 10, 2);
+        assert!(none.is_empty(), "expected threshold to block selection");
+    }
+
+    #[test]
+    fn resolve_investigation_dimensions_rejects_json_dimension_mismatch() {
+        let mut args = investigate_workflow_args();
+        args.dimensions = vec!["channel".to_string()];
+        let base = serde_json::json!({
+            "group_by": ["region"]
+        });
+        let new = serde_json::json!({
+            "group_by": ["region"]
+        });
+        let err = resolve_investigation_dimensions(
+            &args,
+            Path::new("base.json"),
+            Path::new("new.json"),
+            InvestigateInputKind::JsonArtifacts,
+            Some(&base),
+            Some(&new),
+        )
+        .expect_err("expected mismatch to fail");
+        assert!(
+            err.to_string()
+                .contains("--dimensions must match artifact grouping"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_investigation_dimensions_rejects_artifact_group_mismatch() {
+        let mut args = investigate_workflow_args();
+        args.dimensions = vec![];
+        let base = serde_json::json!({
+            "group_by": ["region"]
+        });
+        let new = serde_json::json!({
+            "group_by": ["channel"]
+        });
+        let err = resolve_investigation_dimensions(
+            &args,
+            Path::new("base.json"),
+            Path::new("new.json"),
+            InvestigateInputKind::JsonArtifacts,
+            Some(&base),
+            Some(&new),
+        )
+        .expect_err("expected artifact mismatch to fail");
+        assert!(
+            err.to_string()
+                .contains("base/new artifacts use different group_by dimensions"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_investigation_dimensions_autodetects_csv_dimensions() {
+        let mut args = investigate_workflow_args();
+        args.base = Some(test_data_path("factorlens_demo_sales_100.csv"));
+        args.new = Some(test_data_path("factorlens_demo_sales_150.csv"));
+        args.metric = Some("revenue_usd".to_string());
+        args.dimensions = vec![];
+        args.drill_fields = vec![];
+
+        let base = args.base.clone().expect("base");
+        let new = args.new.clone().expect("new");
+        let (top, drills) = resolve_investigation_dimensions(
+            &args,
+            &base,
+            &new,
+            InvestigateInputKind::CsvDatasets,
+            None,
+            None,
+        )
+        .expect("expected csv dimension inference to succeed");
+        assert_eq!(top, "region");
+        assert_eq!(
+            drills,
+            vec![
+                "channel".to_string(),
+                "product_line".to_string(),
+                "plan_tier".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn infer_csv_dimensions_excludes_identifier_columns() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let base_path = std::env::temp_dir().join(format!("factorlens_base_{}.csv", ts));
+        let new_path = std::env::temp_dir().join(format!("factorlens_new_{}.csv", ts));
+
+        let csv = "\
+export_country,quote_group_identifier,revenue_usd\n\
+US export,QG-1,100\n\
+US export,QG-2,200\n\
+CN export,QG-3,300\n\
+DE export,QG-4,400\n\
+Other export,QG-5,500\n";
+        fs::write(&base_path, csv).expect("write base");
+        fs::write(&new_path, csv).expect("write new");
+
+        let inferred =
+            infer_csv_investigation_dimensions(&base_path, &new_path, Some("revenue_usd"))
+                .expect("infer dimensions");
+        assert!(
+            inferred.iter().any(|d| d == "export_country"),
+            "expected export_country to be inferred"
+        );
+        assert!(
+            !inferred.iter().any(|d| d == "quote_group_identifier"),
+            "identifier columns should be excluded from inferred dimensions"
+        );
+
+        let _ = fs::remove_file(&base_path);
+        let _ = fs::remove_file(&new_path);
+    }
+
+    #[test]
+    fn infer_column_role_excludes_identifier_like_dimension_candidates() {
+        let role = infer_column_role("quote_group_identifier", 95.0, 35, 0.05, 0.0);
+        assert_ne!(
+            role, "dimension",
+            "identifier-like columns should not be inferred as dimensions"
+        );
+    }
+
+    #[test]
+    fn auto_detect_groups_excludes_identifier_columns() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let csv_path = std::env::temp_dir().join(format!("factorlens_groups_{}.csv", ts));
+        let csv = "\
+export_country,quote_group_identifier,category\n\
+US export,QG-1,A\n\
+US export,QG-2,A\n\
+CN export,QG-3,B\n\
+CN export,QG-4,B\n\
+DE export,QG-5,C\n";
+        fs::write(&csv_path, csv).expect("write csv");
+        let headers =
+            StringRecord::from(vec!["export_country", "quote_group_identifier", "category"]);
+        let groups = auto_detect_groups(&headers, &csv_path, 3).expect("auto groups");
+        assert!(
+            groups.iter().any(|g| g == "export_country") || groups.iter().any(|g| g == "category")
+        );
+        assert!(
+            !groups.iter().any(|g| g == "quote_group_identifier"),
+            "identifier columns should be excluded from auto group suggestions"
+        );
+        let _ = fs::remove_file(&csv_path);
+    }
+
+    #[test]
+    fn investigate_step_json_mode_errors_when_metric_missing() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let base = serde_json::json!({
+            "records": 10,
+            "top5_count": 5,
+            "primary_metric": "profit_usd",
+            "metrics": ["profit_usd"],
+            "group_by": ["region"],
+            "groups": [{"group":"US", "count":5, "count_share_pct":50.0, "profit_usd":100.0}]
+        });
+        let new = serde_json::json!({
+            "records": 10,
+            "top5_count": 5,
+            "primary_metric": "profit_usd",
+            "metrics": ["profit_usd"],
+            "group_by": ["region"],
+            "groups": [{"group":"US", "count":5, "count_share_pct":50.0, "profit_usd":130.0}]
+        });
+
+        let input = InvestigationInputRefs {
+            base_path: Path::new("base.json"),
+            new_path: Path::new("new.json"),
+            input_kind: InvestigateInputKind::JsonArtifacts,
+            base_artifact: Some(&base),
+            new_artifact: Some(&new),
+        };
+        let err = investigation_step_from_inputs(
+            &args,
+            &input,
+            "region",
+            &[],
+            InvestigationMode::ChangeDrivers,
+        )
+        .expect_err("expected missing metric to fail");
+        assert!(
+            err.to_string()
+                .contains("does not contain metric 'revenue_usd'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn investigate_step_json_mode_errors_when_primary_metric_mismatch_without_metric() {
+        let mut args = investigate_workflow_args();
+        args.metric = None;
+        let base = serde_json::json!({
+            "records": 10,
+            "top5_count": 5,
+            "primary_metric": "revenue_usd",
+            "metrics": ["revenue_usd"],
+            "group_by": ["region"],
+            "groups": [{"group":"US", "count":5, "count_share_pct":50.0, "revenue_usd":100.0}]
+        });
+        let new = serde_json::json!({
+            "records": 10,
+            "top5_count": 5,
+            "primary_metric": "profit_usd",
+            "metrics": ["profit_usd"],
+            "group_by": ["region"],
+            "groups": [{"group":"US", "count":5, "count_share_pct":50.0, "profit_usd":130.0}]
+        });
+
+        let input = InvestigationInputRefs {
+            base_path: Path::new("base.json"),
+            new_path: Path::new("new.json"),
+            input_kind: InvestigateInputKind::JsonArtifacts,
+            base_artifact: Some(&base),
+            new_artifact: Some(&new),
+        };
+        let err = investigation_step_from_inputs(
+            &args,
+            &input,
+            "region",
+            &[],
+            InvestigationMode::ChangeDrivers,
+        )
+        .expect_err("expected primary metric mismatch to fail");
+        assert!(
+            err.to_string()
+                .contains("base/new artifacts have different primary_metric values"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn investigation_step_uses_max_branches_for_candidate_capacity() {
+        let mut args = investigate_workflow_args();
+        args.top_movers = 1;
+        args.max_branches = 3;
+        let base = serde_json::json!({
+            "records": 100,
+            "top5_count": 50,
+            "primary_metric": "revenue_usd",
+            "metrics": ["revenue_usd"],
+            "group_by": ["region"],
+            "groups": [
+                {"group":"A", "count":34, "count_share_pct":34.0, "revenue_usd":100.0},
+                {"group":"B", "count":33, "count_share_pct":33.0, "revenue_usd":90.0},
+                {"group":"C", "count":33, "count_share_pct":33.0, "revenue_usd":80.0}
+            ]
+        });
+        let new = serde_json::json!({
+            "records": 100,
+            "top5_count": 60,
+            "primary_metric": "revenue_usd",
+            "metrics": ["revenue_usd"],
+            "group_by": ["region"],
+            "groups": [
+                {"group":"A", "count":30, "count_share_pct":30.0, "revenue_usd":210.0},
+                {"group":"B", "count":30, "count_share_pct":30.0, "revenue_usd":180.0},
+                {"group":"C", "count":40, "count_share_pct":40.0, "revenue_usd":120.0}
+            ]
+        });
+
+        let input = InvestigationInputRefs {
+            base_path: Path::new("base.json"),
+            new_path: Path::new("new.json"),
+            input_kind: InvestigateInputKind::JsonArtifacts,
+            base_artifact: Some(&base),
+            new_artifact: Some(&new),
+        };
+        let step = investigation_step_from_inputs(
+            &args,
+            &input,
+            "region",
+            &[],
+            InvestigationMode::ChangeDrivers,
+        )
+        .expect("step");
+        assert_eq!(
+            step.movers.len(),
+            3,
+            "movers should cover max_branches candidates even when top_movers is lower"
+        );
+    }
+
+    #[test]
+    fn metric_matches_expected_accepts_common_aliases() {
+        assert!(metric_matches_expected("revenue_usd", "revenue_usd"));
+        assert!(metric_matches_expected("Revenue_USD", "revenue_usd"));
+        assert!(metric_matches_expected("revenue", "revenue_usd"));
+        assert!(metric_matches_expected("conversion", "conversion_rate"));
+        assert!(!metric_matches_expected("cost", "revenue_usd"));
+    }
+
+    #[test]
+    fn validate_llm_planner_action_accepts_metric_alias_and_normalizes_dimension() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let proposed = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue".to_string()),
+                group_by: Some(vec!["REGION".to_string()]),
+                filters: Some(HashMap::new()),
+            }),
+        };
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &["region".to_string(), "channel".to_string()],
+            &[],
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("alias metric should pass");
+        match out {
+            InvestigationExecAction::AnalyzeCompare { group_by, .. } => {
+                assert_eq!(group_by, "region")
+            }
+            _ => panic!("expected analyze_compare"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_ignores_mismatched_metric_override() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let proposed = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_concentration".to_string()),
+                group_by: Some(vec!["region".to_string()]),
+                filters: Some(HashMap::new()),
+            }),
+        };
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &["region".to_string(), "channel".to_string()],
+            &[],
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("mismatched metric should be ignored");
+        match out {
+            InvestigationExecAction::AnalyzeCompare { group_by, .. } => {
+                assert_eq!(group_by, "region")
+            }
+            _ => panic!("expected analyze_compare"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_infers_group_by_when_missing() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+
+        let top_level = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: None,
+                filters: Some(HashMap::new()),
+            }),
+        };
+        let out0 = validate_llm_planner_action(
+            &top_level,
+            &args,
+            &[
+                "region".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
+            ],
+            &[],
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("top-level should infer region");
+        match out0 {
+            InvestigationExecAction::AnalyzeCompare { group_by, .. } => {
+                assert_eq!(group_by, "region")
+            }
+            _ => panic!("expected analyze_compare"),
+        }
+
+        let steps = vec![InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 150,
+            segment_count: 4,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 29.0,
+            top1_concentration_new_pct: 47.33,
+            top1_concentration_delta_pp: 18.33,
+            movers: vec![],
+        }];
+        let drill = LlmPlannerAction {
+            action: "drill_down".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: None,
+                filters: Some(HashMap::from([("region".to_string(), "US".to_string())])),
+            }),
+        };
+        let out1 = validate_llm_planner_action(
+            &drill,
+            &args,
+            &[
+                "region".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
+            ],
+            &steps,
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("drill should infer next dimension");
+        match out1 {
+            InvestigationExecAction::DrillDown { group_by, .. } => assert_eq!(group_by, "channel"),
+            _ => panic!("expected drill_down"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_rejects_first_step_drill_down() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let proposed = LlmPlannerAction {
+            action: "drill_down".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: Some(vec!["region".to_string()]),
+                filters: Some(HashMap::from([("region".to_string(), "US".to_string())])),
+            }),
+        };
+        let err = match validate_llm_planner_action(
+            &proposed,
+            &args,
+            &["region".to_string(), "channel".to_string()],
+            &[],
+            InvestigateInputKind::CsvDatasets,
+        ) {
+            Ok(_) => panic!("first step drill_down should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("first llm action must be analyze_compare"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_llm_planner_action_stop_autofollows_drilldown_when_possible() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        args.max_depth = 3;
+
+        let steps = vec![InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 150,
+            segment_count: 4,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 29.0,
+            top1_concentration_new_pct: 47.33,
+            top1_concentration_delta_pp: 18.33,
+            movers: vec![InvestigationMover {
+                segment: "US".to_string(),
+                base_records: 29,
+                new_records: 71,
+                base_share_pct: 29.0,
+                new_share_pct: 47.33,
+                delta_share_pp: 18.33,
+                base_primary_metric_value: 1.0,
+                new_primary_metric_value: 2.0,
+                delta_primary_metric_value: 1.0,
+            }],
+        }];
+
+        let proposed = LlmPlannerAction {
+            action: "stop".to_string(),
+            reason: Some("previous result indicates a significant change".to_string()),
+            params: None,
+        };
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &[
+                "region".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
+            ],
+            &steps,
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("stop should auto-follow into one drill-down");
+        match out {
+            InvestigationExecAction::DrillDown {
+                group_by,
+                scope,
+                reason,
+            } => {
+                assert_eq!(group_by, "channel");
+                assert_eq!(scope, vec![("region".to_string(), "US".to_string())]);
+                assert!(
+                    reason.contains("auto-follow"),
+                    "unexpected reason: {}",
+                    reason
+                );
+            }
+            _ => panic!("expected auto drill_down"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_auto_pivots_repeated_analyze_to_drilldown() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+
+        let steps = vec![InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 150,
+            segment_count: 4,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 29.0,
+            top1_concentration_new_pct: 47.33,
+            top1_concentration_delta_pp: 18.33,
+            movers: vec![InvestigationMover {
+                segment: "US".to_string(),
+                base_records: 29,
+                new_records: 71,
+                base_share_pct: 29.0,
+                new_share_pct: 47.33,
+                delta_share_pp: 18.33,
+                base_primary_metric_value: 1.0,
+                new_primary_metric_value: 2.0,
+                delta_primary_metric_value: 1.0,
+            }],
+        }];
+
+        let proposed = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("retry top level".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: Some(vec!["region".to_string()]),
+                filters: Some(HashMap::new()),
+            }),
+        };
+
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &[
+                "region".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
+            ],
+            &steps,
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("should auto-pivot to drilldown");
+        match out {
+            InvestigationExecAction::DrillDown {
+                group_by, scope, ..
+            } => {
+                assert_eq!(group_by, "channel");
+                assert_eq!(scope, vec![("region".to_string(), "US".to_string())]);
+            }
+            _ => panic!("expected drill_down"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_avoids_grouping_by_scoped_dimension() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let steps = vec![InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 150,
+            segment_count: 4,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 29.0,
+            top1_concentration_new_pct: 47.33,
+            top1_concentration_delta_pp: 18.33,
+            movers: vec![InvestigationMover {
+                segment: "US".to_string(),
+                base_records: 29,
+                new_records: 71,
+                base_share_pct: 29.0,
+                new_share_pct: 47.33,
+                delta_share_pp: 18.33,
+                base_primary_metric_value: 4_020_509.65,
+                new_primary_metric_value: 13_561_697.76,
+                delta_primary_metric_value: 9_541_188.11,
+            }],
+        }];
+
+        let proposed = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("test".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: Some(vec!["region".to_string()]),
+                filters: Some(
+                    [("region".to_string(), "US".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            }),
+        };
+
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &[
+                "region".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
+            ],
+            &steps,
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("should auto-adjust scoped group_by");
+        match out {
+            InvestigationExecAction::AnalyzeCompare {
+                group_by, scope, ..
+            } => {
+                assert_eq!(scope, vec![("region".to_string(), "US".to_string())]);
+                assert_ne!(group_by, "region");
+                assert_eq!(group_by, "channel");
+            }
+            _ => panic!("expected analyze_compare"),
+        }
+    }
+
+    #[test]
+    fn validate_llm_planner_action_preserves_prior_scope_chain() {
+        let mut args = investigate_workflow_args();
+        args.metric = Some("revenue_usd".to_string());
+        let steps = vec![
+            InvestigationStep {
+                depth: 0,
+                dimension: "export_country".to_string(),
+                scope: vec![],
+                primary_metric: "revenue_usd".to_string(),
+                base_records: 100,
+                new_records: 120,
+                segment_count: 4,
+                top5_concentration_base_pct: 80.0,
+                top5_concentration_new_pct: 82.0,
+                top5_concentration_delta_pp: 2.0,
+                top1_concentration_base_pct: 30.0,
+                top1_concentration_new_pct: 34.0,
+                top1_concentration_delta_pp: 4.0,
+                movers: vec![InvestigationMover {
+                    segment: "GB export".to_string(),
+                    base_records: 20,
+                    new_records: 35,
+                    base_share_pct: 20.0,
+                    new_share_pct: 29.0,
+                    delta_share_pp: 9.0,
+                    base_primary_metric_value: 200.0,
+                    new_primary_metric_value: 500.0,
+                    delta_primary_metric_value: 300.0,
+                }],
+            },
+            InvestigationStep {
+                depth: 1,
+                dimension: "discipline".to_string(),
+                scope: vec![("export_country".to_string(), "GB export".to_string())],
+                primary_metric: "revenue_usd".to_string(),
+                base_records: 50,
+                new_records: 60,
+                segment_count: 3,
+                top5_concentration_base_pct: 100.0,
+                top5_concentration_new_pct: 100.0,
+                top5_concentration_delta_pp: 0.0,
+                top1_concentration_base_pct: 45.0,
+                top1_concentration_new_pct: 55.0,
+                top1_concentration_delta_pp: 10.0,
+                movers: vec![InvestigationMover {
+                    segment: "Medical/Commercial".to_string(),
+                    base_records: 30,
+                    new_records: 40,
+                    base_share_pct: 45.0,
+                    new_share_pct: 55.0,
+                    delta_share_pp: 10.0,
+                    base_primary_metric_value: 300.0,
+                    new_primary_metric_value: 700.0,
+                    delta_primary_metric_value: 400.0,
+                }],
+            },
+        ];
+
+        let proposed = LlmPlannerAction {
+            action: "analyze_compare".to_string(),
+            reason: Some("Strongest driver is discipline".to_string()),
+            params: Some(LlmPlannerParams {
+                metric: Some("revenue_usd".to_string()),
+                group_by: Some(vec!["export_country".to_string()]),
+                filters: Some(
+                    [("discipline".to_string(), "Medical/Commercial".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            }),
+        };
+
+        let out = validate_llm_planner_action(
+            &proposed,
+            &args,
+            &[
+                "export_country".to_string(),
+                "discipline".to_string(),
+                "category".to_string(),
+            ],
+            &steps,
+            InvestigateInputKind::CsvDatasets,
+        )
+        .expect("should preserve prior scope and choose non-scoped group_by");
+        match out {
+            InvestigationExecAction::AnalyzeCompare {
+                group_by, scope, ..
+            } => {
+                assert_eq!(
+                    scope,
+                    vec![
+                        ("export_country".to_string(), "GB export".to_string()),
+                        ("discipline".to_string(), "Medical/Commercial".to_string())
+                    ]
+                );
+                assert_eq!(group_by, "category");
+            }
+            _ => panic!("expected analyze_compare"),
+        }
+    }
+
+    #[test]
+    fn normalize_planner_reason_rewrites_placeholder_text() {
+        assert_eq!(
+            normalize_planner_reason("drill_down", "previous_result"),
+            "planner selected drill-down from prior top mover"
+        );
+        assert_eq!(
+            normalize_planner_reason(
+                "analyze_compare",
+                "previous results indicate a need for comparison"
+            ),
+            "planner selected top-level comparison"
+        );
+    }
+
+    #[test]
+    fn parse_llm_planner_action_handles_wrapped_json() {
+        let raw = "planner: ok\n{\"action\":\"analyze_compare\",\"reason\":\"top\",\"params\":{\"group_by\":[\"region\"],\"filters\":{}}}\nextra";
+        let parsed = parse_llm_planner_action(raw).expect("parse wrapped json");
+        assert_eq!(parsed.action, "analyze_compare");
+    }
+
+    #[test]
+    fn parse_llm_planner_action_prefers_last_json_object() {
+        let raw = concat!(
+            "{\"action\":\"analyze_compare\",\"reason\":\"first\",\"params\":{\"group_by\":[\"region\"],\"filters\":{}}}\n",
+            "{\"action\":\"drill_down\",\"reason\":\"second\",\"params\":{\"group_by\":[\"channel\"],\"filters\":{\"region\":\"US\"}}}\n"
+        );
+        let parsed = parse_llm_planner_action(raw).expect("parse last json");
+        assert_eq!(parsed.action, "drill_down");
+    }
+
+    #[test]
+    fn sanitize_llm_summary_strips_prompt_and_json_noise() {
+        let raw = r#"Provide 2-4 short lines. Keep it concise and grounded.
+{
+  "question": "Why did revenue concentration increase?"
+}
+assistant
+Revenue concentration increased mainly due to US growth.
+Within US, Direct gained share while Marketplace lost share.
+Further drill-down stopped at max depth.
+"#;
+        let cleaned = sanitize_llm_summary(raw, "Why did revenue concentration increase?");
+        assert!(cleaned.contains("Revenue concentration increased mainly due to US growth."));
+        assert!(!cleaned.contains("\"question\""));
+        assert!(!cleaned.contains("Provide 2-4 short lines"));
+    }
+
+    #[test]
+    fn sanitize_llm_summary_trims_trailing_pipe_noise() {
+        let raw = "Revenue concentration increased in US. |\nWithin US, Direct gained share. |";
+        let cleaned = sanitize_llm_summary(raw, "Why did revenue concentration increase?");
+        assert!(!cleaned.contains('|'));
+        assert!(cleaned.contains("Revenue concentration increased in US."));
+    }
+
+    #[test]
+    fn llm_summary_quality_rejects_long_decimals_and_prompt_tokens() {
+        let steps = vec![InvestigationStep {
+            depth: 0,
+            dimension: "region".to_string(),
+            scope: vec![],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 100,
+            new_records: 150,
+            segment_count: 4,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 29.0,
+            top1_concentration_new_pct: 47.33,
+            top1_concentration_delta_pp: 18.33,
+            movers: vec![InvestigationMover {
+                segment: "US".to_string(),
+                base_records: 29,
+                new_records: 71,
+                base_share_pct: 29.0,
+                new_share_pct: 47.33,
+                delta_share_pp: 18.33,
+                base_primary_metric_value: 4_020_509.65,
+                new_primary_metric_value: 13_561_697.76,
+                delta_primary_metric_value: 9_541_188.11,
+            }],
+        }];
+        assert!(!llm_summary_is_usable(
+            "Revenue moved from 28.999999 to 47.333333 [USER]",
+            &steps,
+            "reached max depth 2"
+        ));
+        assert!(llm_summary_is_usable(
+            "US share increased from 29.00% to 47.33% due to Direct growth.",
+            &steps,
+            "reached max depth 2"
+        ));
+        assert!(!llm_summary_is_usable(
+            "US delta was 954118.11 which drove concentration.",
+            &steps,
+            "reached max depth 2"
+        ));
+        assert!(!llm_summary_is_usable(
+            "The revenue concentration increased because the US region's share",
+            &steps,
+            "reached max depth 2"
+        ));
+    }
+
+    #[test]
+    fn recommended_next_question_skips_zero_signal_mover() {
+        let step = InvestigationStep {
+            depth: 1,
+            dimension: "region".to_string(),
+            scope: vec![("region".to_string(), "US".to_string())],
+            primary_metric: "revenue_usd".to_string(),
+            base_records: 50,
+            new_records: 50,
+            segment_count: 1,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 100.0,
+            top1_concentration_new_pct: 100.0,
+            top1_concentration_delta_pp: 0.0,
+            movers: vec![InvestigationMover {
+                segment: "US".to_string(),
+                base_records: 50,
+                new_records: 50,
+                base_share_pct: 100.0,
+                new_share_pct: 100.0,
+                delta_share_pp: 0.0,
+                base_primary_metric_value: 100.0,
+                new_primary_metric_value: 100.0,
+                delta_primary_metric_value: 0.0,
+            }],
+        };
+
+        let q = recommended_next_question(InvestigationMode::ConcentrationDrivers, Some(&step));
+        assert!(q.contains("reduce top-5 concentration"));
+        assert!(!q.contains("Drill deeper"));
+    }
+
+    #[test]
+    fn recommended_next_question_includes_scope_and_signed_delta() {
+        let step = InvestigationStep {
+            depth: 4,
+            dimension: "provider_name".to_string(),
+            scope: vec![
+                ("export_country".to_string(), "GB export".to_string()),
+                ("discipline".to_string(), "Medical/Commercial".to_string()),
+                ("category".to_string(), "Medical Communications".to_string()),
+                ("organization_name".to_string(), "AstraZeneca".to_string()),
+            ],
+            primary_metric: "customer_purchase_order_retail_total_price_usd".to_string(),
+            base_records: 20,
+            new_records: 20,
+            segment_count: 3,
+            top5_concentration_base_pct: 100.0,
+            top5_concentration_new_pct: 100.0,
+            top5_concentration_delta_pp: 0.0,
+            top1_concentration_base_pct: 60.0,
+            top1_concentration_new_pct: 20.0,
+            top1_concentration_delta_pp: -40.0,
+            movers: vec![InvestigationMover {
+                segment: "Eight 9 Health LTD".to_string(),
+                base_records: 10,
+                new_records: 3,
+                base_share_pct: 50.0,
+                new_share_pct: 9.17,
+                delta_share_pp: -40.83,
+                base_primary_metric_value: 800_000.0,
+                new_primary_metric_value: 508_576.75,
+                delta_primary_metric_value: -291_423.25,
+            }],
+        };
+
+        let q = recommended_next_question(InvestigationMode::ConcentrationDrivers, Some(&step));
+        assert!(q.contains("within scope [export_country=GB export"));
+        assert!(q.contains("provider_name='Eight 9 Health LTD'"));
+        assert!(q.contains("delta share -40.83 pp"));
+    }
+
+    #[test]
+    fn sanitize_explain_analyze_answer_normalizes_to_bullets() {
+        let raw =
+            "Here is the summary:\n- Revenue grew 10.00% [E1]\n- Top segment changed 5.00 [E2]";
+        let out = sanitize_explain_analyze_answer(raw, 3);
+        assert!(out.lines().all(|l| l.trim_start().starts_with('-')));
+        assert!(out.contains("[E1]"));
+    }
+
+    #[test]
+    fn explain_analyze_answer_requires_citations_and_grounded_numbers() {
+        let evidence = vec![
+            "group='US' records=10 revenue_usd=100.00".to_string(),
+            "group='EU' records=5 revenue_usd=50.00".to_string(),
+        ];
+        assert!(explain_analyze_answer_is_usable(
+            "- US revenue is 100.00 [E1]",
+            &evidence
+        ));
+        assert!(!explain_analyze_answer_is_usable(
+            "- US revenue is 999.99 [E1]",
+            &evidence
+        ));
+        assert!(!explain_analyze_answer_is_usable(
+            "- US revenue is 100.00",
+            &evidence
+        ));
     }
 }
 
@@ -6590,6 +11485,91 @@ fn build_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
     }
 
     out
+}
+
+fn sanitize_explain_analyze_answer(raw: &str, max_bullets: usize) -> String {
+    let mut text = raw.trim();
+    if let Some((_, tail)) = raw.rsplit_once("assistant") {
+        let trimmed = tail.trim();
+        if !trimmed.is_empty() {
+            text = trimmed;
+        }
+    }
+
+    let mut out = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for line in text.lines() {
+        let trimmed = line
+            .trim()
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("question:")
+            || lower.starts_with("analysis context:")
+            || lower.starts_with("here is")
+            || lower.starts_with("summary:")
+            || lower.contains("```")
+        {
+            continue;
+        }
+        let alpha = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        if alpha < 8 {
+            continue;
+        }
+        let canonical = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        let key = canonical.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(format!("- {}", canonical));
+        }
+        if out.len() >= max_bullets.max(1) {
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+fn explain_analyze_answer_is_usable(answer: &str, evidence: &[String]) -> bool {
+    if answer.trim().is_empty() {
+        return false;
+    }
+    if contains_long_decimal(answer, 2) {
+        return false;
+    }
+    let has_citation = answer.contains("[E");
+    if !has_citation {
+        return false;
+    }
+    let mut allowed = Vec::<f64>::new();
+    for line in evidence {
+        allowed.extend(extract_numeric_values(line));
+    }
+    allowed.extend((1..=evidence.len()).map(|i| i as f64));
+    if !summary_numbers_are_grounded(answer, &allowed) {
+        return false;
+    }
+    true
+}
+
+fn deterministic_explain_analyze_from_evidence(
+    _question: &str,
+    evidence: &[String],
+    max_bullets: usize,
+) -> String {
+    if evidence.is_empty() {
+        return "- Unable to provide a grounded summary from the provided analysis context."
+            .to_string();
+    }
+    evidence
+        .iter()
+        .take(max_bullets.max(1))
+        .enumerate()
+        .map(|(i, line)| format!("- {} [E{}]", line, i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn should_normalize_group_column(col: &str) -> bool {
@@ -6728,6 +11708,14 @@ fn fmt_num(value: f64, decimals: usize) -> String {
         format!("{}{}", sign, grouped_int)
     } else {
         format!("{}{}.{}", sign, grouped_int, frac_part)
+    }
+}
+
+fn signed_fmt_num(value: f64, decimals: usize) -> String {
+    if value >= 0.0 {
+        format!("+{}", fmt_num(value, decimals))
+    } else {
+        fmt_num(value, decimals)
     }
 }
 

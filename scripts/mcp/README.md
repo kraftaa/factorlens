@@ -11,6 +11,7 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 - `analyze_csv`: run `factorlens analyze` on CSV input
 - `analyze_query`: run `factorlens analyze` on Postgres query input
 - `analyze_compare`: compare two `analysis.json` snapshots (`md`, `html`, `json`, or `both`)
+- `investigate`: guided drill-down across base/new snapshots (deterministic or LLM planner)
 - `explain_analyze`: run `factorlens explain-analyze` (Bedrock or local)
 - `healthcheck`: quick CLI availability check
 
@@ -96,7 +97,22 @@ Explain analysis:
   "analysis_json": "/path/to/artifacts/analysis.json",
   "backend": "bedrock",
   "model": "anthropic.claude-3-haiku-20240307-v1:0",
-  "question": "What are the main drivers of revenue concentration?"
+  "question": "What are the main drivers of revenue concentration?",
+  "strict_facts": true,
+  "max_bullets": 5
+}
+```
+
+Investigate with config defaults:
+
+```json
+{
+  "question": "Why did revenue change?",
+  "base": "/path/to/feb.csv",
+  "new": "/path/to/mar.csv",
+  "out": "/path/to/artifacts/investigate.md",
+  "config": "/path/to/profiles/investigate.example.toml",
+  "mode": "change_drivers"
 }
 ```
 

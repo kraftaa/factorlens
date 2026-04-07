@@ -36,7 +36,7 @@ impl LlmClient for LocalLlamaCppClient {
         }
 
         let raw = String::from_utf8_lossy(&output.stdout);
-        Ok(clean_generation(&raw, system_prompt))
+        Ok(clean_generation(&raw, system_prompt, user_prompt))
     }
 }
 
@@ -103,20 +103,78 @@ impl LlmClient for BedrockClient {
 fn run_llama(bin: &str, model: &str, prompt: &str) -> Result<std::process::Output> {
     let mut cmd = Command::new(bin);
     cmd.arg("-m").arg(model);
+    cmd.arg("-ngl").arg(llama_gpu_layers());
+    if let Some(device) = llama_device() {
+        cmd.arg("--device").arg(device);
+    }
+    cmd.arg("-c").arg(llama_ctx_size());
     if bin == "llama-cli" {
         cmd.arg("-st");
+    } else if bin == "llama-completion" {
+        cmd.arg("-no-cnv");
+    }
+    if llama_no_warmup() {
+        cmd.arg("--no-warmup");
     }
     cmd.arg("-p")
         .arg(prompt)
         .arg("-n")
-        .arg("220")
+        .arg(llama_max_tokens())
         .arg("--temp")
         .arg("0.2");
     cmd.output()
         .with_context(|| format!("failed to invoke {}", bin))
 }
 
-fn clean_generation(raw: &str, system_prompt: &str) -> String {
+fn llama_gpu_layers() -> String {
+    if let Ok(raw) = std::env::var("FACTORLENS_LLAMA_GPU_LAYERS") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "0".to_string()
+}
+
+fn llama_device() -> Option<String> {
+    if let Ok(raw) = std::env::var("FACTORLENS_LLAMA_DEVICE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn llama_ctx_size() -> String {
+    if let Ok(raw) = std::env::var("FACTORLENS_LLAMA_CTX") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "4096".to_string()
+}
+
+fn llama_max_tokens() -> String {
+    if let Ok(raw) = std::env::var("FACTORLENS_LLAMA_MAX_TOKENS") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "96".to_string()
+}
+
+fn llama_no_warmup() -> bool {
+    if let Ok(raw) = std::env::var("FACTORLENS_LLAMA_NO_WARMUP") {
+        let lower = raw.trim().to_ascii_lowercase();
+        return !(lower == "0" || lower == "false" || lower == "no");
+    }
+    true
+}
+
+fn clean_generation(raw: &str, system_prompt: &str, user_prompt: &str) -> String {
     let mut text = raw.replace("\r\n", "\n");
     if let Some(i) = text.rfind("\nassistant") {
         text = text[(i + "\nassistant".len())..].to_string();
@@ -155,6 +213,11 @@ fn clean_generation(raw: &str, system_prompt: &str) -> String {
         cleaned
     };
 
+    let combined_prompt = format!("[SYSTEM]\n{}\n\n[USER]\n{}", system_prompt, user_prompt);
+    if let Some(i) = out.find(&combined_prompt) {
+        out = out[(i + combined_prompt.len())..].trim_start().to_string();
+    }
+
     let mut out_trim = out.trim_start().to_string();
     if let Some(first_line_end) = out_trim.find('\n') {
         let first_line = out_trim[..first_line_end].trim();
@@ -165,12 +228,13 @@ fn clean_generation(raw: &str, system_prompt: &str) -> String {
         out_trim.clear();
     }
 
-    let out_trim = out_trim.trim_start();
-    if let Some(stripped) = out_trim.strip_prefix(system_prompt) {
-        out = stripped.trim_start().to_string();
-    } else {
-        out = out_trim.to_string();
+    let mut out_trim = out_trim.trim_start().to_string();
+    for prefix in [system_prompt, user_prompt] {
+        if let Some(stripped) = out_trim.strip_prefix(prefix) {
+            out_trim = stripped.trim_start().to_string();
+        }
     }
+    out = out_trim;
 
     if out.ends_with("assistant") {
         out = out.trim_end_matches("assistant").trim_end().to_string();

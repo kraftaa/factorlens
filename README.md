@@ -81,29 +81,44 @@ Residual segments
 Typical workflow:
 
 - `analyze` - explore segments and concentration.
-- `analyze-drivers` - explain metric changes automatically.
-- `analyze-compare` - compare two snapshots.
+- `investigate` - guided multi-step drill-down for period/snapshot change analysis.
 - `explain-analyze` - add optional narrative explanation.
+
+Primary commands:
 
 | Command | Purpose |
 |---|---|
 | `analyze` | factor/segment attribution from CSV or Postgres |
-| `analyze-investigate` | metric change decomposition into top driver contributions |
-| `analyze-drivers` | automatic metric identity detection and driver decomposition |
-| `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile TOML |
-| `analyze-compare` | snapshot delta analysis (biggest movers) |
+| `investigate` | guided drill-down investigation across snapshots/periods (deterministic or LLM planner) |
 | `explain-analyze` | executive narrative and actions from computed JSON |
+
+Specialized / legacy-compatible commands:
+
+| Command | Purpose |
+|---|---|
+| `analyze-investigate` | legacy-compatible numeric driver decomposition (curated driver sets) |
+| `analyze-drivers` | automatic metric identity detection and driver decomposition |
+| `analyze-suggest` | infer likely dimensions/metrics/date and generate starter profile config (`toml` or `json`) |
+| `analyze-compare` | snapshot delta analysis (biggest movers) |
 | `factors fit` / `factors regress` | statistical factors (PCA) or known-factor regression |
 
 ## When To Use Which
 
 - `analyze` answers: **which groups changed?**
-- `analyze-investigate` answers: **which numeric drivers account for the metric change?**
+- `investigate` answers: **where should I drill next, and what likely drove the change?**
+- `analyze-investigate` answers: **which numeric drivers account for the metric change?** (curated numeric-driver mode)
 - `analyze-drivers` answers: **what metric identity or formula explains the change?**
+
+Tip: `investigate` can auto-route from question text, or you can force mode with
+`--mode change_drivers|concentration_drivers|compare_snapshots|recommend_next`.
+
+To avoid long investigate commands, store defaults in a TOML config and pass
+`--config profiles/investigate.example.toml` (or `--profile` alias).
 
 Practical rule:
 
 - Start with `analyze` for wide business tables.
+- Use `investigate` for end-to-end drill-down across dimensions and periods/snapshots.
 - Use `analyze-investigate` when you have a curated dataset with a few meaningful numeric drivers.
 - Use `analyze-drivers` when the metric likely has a formula such as `revenue ≈ orders * avg_price`.
 
@@ -142,7 +157,9 @@ factorlens explain-analyze \
   --backend bedrock \
   --model anthropic.claude-3-haiku-20240307-v1:0 \
   --analysis-json artifacts/analysis_compare.json \
-  --question "What are the top concentration risks and what 3 actions should we take in the next 30 days?"
+  --question "What are the top concentration risks and what 3 actions should we take in the next 30 days?" \
+  --strict-facts true \
+  --max-bullets 5
 ```
 
 One-command runner:
@@ -209,6 +226,26 @@ This writes:
 - `artifacts/demo_suggest.md` (human summary)
 - `artifacts/demo_suggest.json` (machine-readable suggestion report)
 - `artifacts/demo_suggest.toml` (ready profile config block)
+
+If you want JSON profile output instead of TOML:
+
+```bash
+factorlens analyze-suggest \
+  --input data/factorlens_demo_sales_150.csv \
+  --out artifacts/demo_suggest_json_profile.md \
+  --profile-format json
+```
+
+Investigate using config defaults:
+
+```bash
+cargo run -p factor_cli -- investigate \
+  --profile profiles/investigate.example.toml \
+  --question "Why did revenue change?" \
+  --base data/gold_feb2026.csv \
+  --new data/gold_mar2026.csv \
+  --out artifacts/investigate_gold.md
+```
 
 ## Architecture
 
@@ -532,9 +569,10 @@ Notes:
 - `analyze-compare` supports `--output-format md|html|json|both`.
 - `--top-movers` controls how many largest movers are shown (default: `10`).
 
-## Analyze Investigate
+## Analyze Investigate (Legacy / Specialized)
 
-Use `analyze-investigate` when you want a compact “metric change + top drivers” output from a **curated numeric driver set**.
+Use `analyze-investigate` when you need legacy-compatible, compact “metric change + top drivers” output from a **curated numeric driver set**.
+For most new workflows, prefer `investigate`.
 
 Recommended demo file:
 
@@ -788,7 +826,9 @@ Notes:
 - `--word-freq` adds a Top Words section/counts for `name`/`title`-style grouping columns.
 - `--output-format` supports `md`, `json`, `both` (default), or `html`.
 - `--min-records` drops tiny segments before ranking (useful to avoid one-record outliers).
-- `analyze-suggest --out-profile <path.toml>` writes a ready profile file directly.
+- `analyze-suggest --out-profile <path>` writes a ready profile file directly (`--profile-format toml|json`, default `toml`).
+- `explain-analyze --strict-facts true` enforces evidence-cited, grounded summaries (default: `true`).
+- `explain-analyze --max-bullets <n>` limits explanation verbosity (default: `5`).
 
 Example `--profile-config` file:
 
@@ -842,7 +882,9 @@ factorlens explain-analyze \
   --backend local \
   --model /path/to/model.gguf \
   --analysis-json /path/to/analysis.json \
-  --question "What are the top concentration risks and 3 actions?"
+  --question "What are the top concentration risks and 3 actions?" \
+  --strict-facts true \
+  --max-bullets 5
 ```
 
 Bedrock
@@ -851,7 +893,9 @@ factorlens explain-analyze \
   --backend bedrock \
   --model anthropic.claude-3-haiku-20240307-v1:0 \
   --analysis-json /path/to/analysis.json \
-  --question "What are the top concentration risks and 3 actions?"
+  --question "What are the top concentration risks and 3 actions?" \
+  --strict-facts true \
+  --max-bullets 5
 ```
 
 ### MCP Server (Optional)

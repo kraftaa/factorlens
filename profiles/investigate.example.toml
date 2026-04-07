@@ -1,0 +1,41 @@
+[investigate]
+# Required unless passed via CLI.
+question = "Why did revenue change?"
+
+# Optional mode override:
+# change_drivers | concentration_drivers | compare_snapshots | recommend_next
+mode = "change_drivers"
+
+# Required metric for change/concentration analysis.
+metric = "revenue_usd"
+
+# Optional explicit dimension order.
+dimensions = [
+  "region",
+  "channel",
+  "product_line",
+  "plan_tier",
+]
+
+# Optional drill-down order.
+drill_fields = [
+  "channel",
+  "product_line",
+  "plan_tier",
+]
+
+max_depth = 5
+max_branches = 1
+min_contribution = 1.5
+min_score_improvement = 0.0
+min_slice_rows = 10
+top_movers = 12
+
+planner = "llm"
+planner_backend = "local"
+# planner_model can also come from FACTORLENS_PLANNER_LOCAL_MODEL env var.
+planner_model = "/absolute/path/to/models/llama_instruct.gguf"
+
+output_format = "both"
+verbose = false
+trace = false
