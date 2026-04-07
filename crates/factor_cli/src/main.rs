@@ -9894,11 +9894,11 @@ mod tests {
     #[test]
     fn auto_select_numeric_drivers_skips_count_like_columns() {
         let headers = StringRecord::from(vec![
-            "quote_group_created_at",
-            "customer_purchase_order_retail_total_price_usd",
-            "net_gmv",
-            "count_proposal_per_quote_group",
-            "advantage_plan",
+            "created_at",
+            "revenue_usd",
+            "net_margin_usd",
+            "event_count_per_group",
+            "plan_flag",
         ]);
         let rows = (0..40)
             .map(|i| {
@@ -9918,9 +9918,9 @@ mod tests {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"net_gmv".to_string()));
-        assert!(!names.contains(&"count_proposal_per_quote_group".to_string()));
-        assert!(!names.contains(&"advantage_plan".to_string()));
+        assert!(names.contains(&"net_margin_usd".to_string()));
+        assert!(!names.contains(&"event_count_per_group".to_string()));
+        assert!(!names.contains(&"plan_flag".to_string()));
     }
 
     #[test]
@@ -10491,12 +10491,12 @@ drill_fields = ["channel", "channel", "product_line", "CHANNEL"]
         let new_path = std::env::temp_dir().join(format!("factorlens_new_{}.csv", ts));
 
         let csv = "\
-export_country,quote_group_identifier,revenue_usd\n\
-US export,QG-1,100\n\
-US export,QG-2,200\n\
-CN export,QG-3,300\n\
-DE export,QG-4,400\n\
-Other export,QG-5,500\n";
+region,group_id,revenue_usd\n\
+North,G-1,100\n\
+North,G-2,200\n\
+West,G-3,300\n\
+East,G-4,400\n\
+Other,G-5,500\n";
         fs::write(&base_path, csv).expect("write base");
         fs::write(&new_path, csv).expect("write new");
 
@@ -10504,11 +10504,11 @@ Other export,QG-5,500\n";
             infer_csv_investigation_dimensions(&base_path, &new_path, Some("revenue_usd"))
                 .expect("infer dimensions");
         assert!(
-            inferred.iter().any(|d| d == "export_country"),
-            "expected export_country to be inferred"
+            inferred.iter().any(|d| d == "region"),
+            "expected region to be inferred"
         );
         assert!(
-            !inferred.iter().any(|d| d == "quote_group_identifier"),
+            !inferred.iter().any(|d| d == "group_id"),
             "identifier columns should be excluded from inferred dimensions"
         );
 
@@ -10518,7 +10518,7 @@ Other export,QG-5,500\n";
 
     #[test]
     fn infer_column_role_excludes_identifier_like_dimension_candidates() {
-        let role = infer_column_role("quote_group_identifier", 95.0, 35, 0.05, 0.0);
+        let role = infer_column_role("group_id", 95.0, 35, 0.05, 0.0);
         assert_ne!(
             role, "dimension",
             "identifier-like columns should not be inferred as dimensions"
@@ -10533,21 +10533,18 @@ Other export,QG-5,500\n";
             .as_nanos();
         let csv_path = std::env::temp_dir().join(format!("factorlens_groups_{}.csv", ts));
         let csv = "\
-export_country,quote_group_identifier,category\n\
-US export,QG-1,A\n\
-US export,QG-2,A\n\
-CN export,QG-3,B\n\
-CN export,QG-4,B\n\
-DE export,QG-5,C\n";
+region,group_id,category\n\
+North,G-1,A\n\
+North,G-2,A\n\
+West,G-3,B\n\
+West,G-4,B\n\
+East,G-5,C\n";
         fs::write(&csv_path, csv).expect("write csv");
-        let headers =
-            StringRecord::from(vec!["export_country", "quote_group_identifier", "category"]);
+        let headers = StringRecord::from(vec!["region", "group_id", "category"]);
         let groups = auto_detect_groups(&headers, &csv_path, 3).expect("auto groups");
+        assert!(groups.iter().any(|g| g == "region") || groups.iter().any(|g| g == "category"));
         assert!(
-            groups.iter().any(|g| g == "export_country") || groups.iter().any(|g| g == "category")
-        );
-        assert!(
-            !groups.iter().any(|g| g == "quote_group_identifier"),
+            !groups.iter().any(|g| g == "group_id"),
             "identifier columns should be excluded from auto group suggestions"
         );
         let _ = fs::remove_file(&csv_path);
@@ -11076,7 +11073,7 @@ DE export,QG-5,C\n";
         let steps = vec![
             InvestigationStep {
                 depth: 0,
-                dimension: "export_country".to_string(),
+                dimension: "region".to_string(),
                 scope: vec![],
                 primary_metric: "revenue_usd".to_string(),
                 base_records: 100,
@@ -11089,7 +11086,7 @@ DE export,QG-5,C\n";
                 top1_concentration_new_pct: 34.0,
                 top1_concentration_delta_pp: 4.0,
                 movers: vec![InvestigationMover {
-                    segment: "GB export".to_string(),
+                    segment: "West".to_string(),
                     base_records: 20,
                     new_records: 35,
                     base_share_pct: 20.0,
@@ -11103,7 +11100,7 @@ DE export,QG-5,C\n";
             InvestigationStep {
                 depth: 1,
                 dimension: "discipline".to_string(),
-                scope: vec![("export_country".to_string(), "GB export".to_string())],
+                scope: vec![("region".to_string(), "West".to_string())],
                 primary_metric: "revenue_usd".to_string(),
                 base_records: 50,
                 new_records: 60,
@@ -11115,7 +11112,7 @@ DE export,QG-5,C\n";
                 top1_concentration_new_pct: 55.0,
                 top1_concentration_delta_pp: 10.0,
                 movers: vec![InvestigationMover {
-                    segment: "Medical/Commercial".to_string(),
+                    segment: "Enterprise".to_string(),
                     base_records: 30,
                     new_records: 40,
                     base_share_pct: 45.0,
@@ -11133,9 +11130,9 @@ DE export,QG-5,C\n";
             reason: Some("Strongest driver is discipline".to_string()),
             params: Some(LlmPlannerParams {
                 metric: Some("revenue_usd".to_string()),
-                group_by: Some(vec!["export_country".to_string()]),
+                group_by: Some(vec!["region".to_string()]),
                 filters: Some(
-                    [("discipline".to_string(), "Medical/Commercial".to_string())]
+                    [("discipline".to_string(), "Enterprise".to_string())]
                         .into_iter()
                         .collect(),
                 ),
@@ -11146,7 +11143,7 @@ DE export,QG-5,C\n";
             &proposed,
             &args,
             &[
-                "export_country".to_string(),
+                "region".to_string(),
                 "discipline".to_string(),
                 "category".to_string(),
             ],
@@ -11161,8 +11158,8 @@ DE export,QG-5,C\n";
                 assert_eq!(
                     scope,
                     vec![
-                        ("export_country".to_string(), "GB export".to_string()),
-                        ("discipline".to_string(), "Medical/Commercial".to_string())
+                        ("region".to_string(), "West".to_string()),
+                        ("discipline".to_string(), "Enterprise".to_string())
                     ]
                 );
                 assert_eq!(group_by, "category");
@@ -11318,12 +11315,12 @@ Further drill-down stopped at max depth.
             depth: 4,
             dimension: "provider_name".to_string(),
             scope: vec![
-                ("export_country".to_string(), "GB export".to_string()),
-                ("discipline".to_string(), "Medical/Commercial".to_string()),
-                ("category".to_string(), "Medical Communications".to_string()),
-                ("organization_name".to_string(), "AstraZeneca".to_string()),
+                ("region".to_string(), "West".to_string()),
+                ("discipline".to_string(), "Enterprise".to_string()),
+                ("category".to_string(), "Field Services".to_string()),
+                ("client_name".to_string(), "Client A".to_string()),
             ],
-            primary_metric: "customer_purchase_order_retail_total_price_usd".to_string(),
+            primary_metric: "revenue_usd".to_string(),
             base_records: 20,
             new_records: 20,
             segment_count: 3,
@@ -11334,7 +11331,7 @@ Further drill-down stopped at max depth.
             top1_concentration_new_pct: 20.0,
             top1_concentration_delta_pp: -40.0,
             movers: vec![InvestigationMover {
-                segment: "Eight 9 Health LTD".to_string(),
+                segment: "Provider A".to_string(),
                 base_records: 10,
                 new_records: 3,
                 base_share_pct: 50.0,
@@ -11347,8 +11344,8 @@ Further drill-down stopped at max depth.
         };
 
         let q = recommended_next_question(InvestigationMode::ConcentrationDrivers, Some(&step));
-        assert!(q.contains("within scope [export_country=GB export"));
-        assert!(q.contains("provider_name='Eight 9 Health LTD'"));
+        assert!(q.contains("within scope [region=West"));
+        assert!(q.contains("provider_name='Provider A'"));
         assert!(q.contains("delta share -40.83 pp"));
     }
 
