@@ -242,9 +242,39 @@ Investigate using config defaults:
 cargo run -p factor_cli -- investigate \
   --profile profiles/investigate.example.toml \
   --question "Why did revenue change?" \
-  --base data/gold_feb2026.csv \
-  --new data/gold_mar2026.csv \
-  --out artifacts/investigate_gold.md
+  --base data/factorlens_demo_sales_100.csv \
+  --new data/factorlens_demo_sales_150.csv \
+  --out artifacts/investigate_demo.md
+```
+
+Investigate from Postgres query with period windows:
+
+```bash
+cargo run -p factor_cli -- investigate \
+  --profile profiles/investigate.example.toml \
+  --question "Why did revenue change last month?" \
+  --postgres-url "$DATABASE_URL" \
+  --query "SELECT order_date, region, channel, product_line, plan_tier, revenue_usd FROM analytics.sales" \
+  --date-column order_date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15 \
+  --out artifacts/investigate_postgres.md
+```
+
+Investigate from Postgres query file with period windows:
+
+```bash
+cargo run -p factor_cli -- investigate \
+  --profile profiles/investigate.example.toml \
+  --question "Why did revenue change last month?" \
+  --postgres-url "$DATABASE_URL" \
+  --query-file sql/investigate_sales.sql \
+  --date-column order_date \
+  --time-grain month \
+  --period last \
+  --anchor-date 2026-04-15 \
+  --out artifacts/investigate_postgres_file.md
 ```
 
 ## Architecture
