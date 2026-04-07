@@ -2903,7 +2903,6 @@ fn auto_select_categorical_drivers(
             &[
                 "category",
                 "subcategory",
-                "discipline",
                 "segment",
                 "plan",
                 "tier",
@@ -11099,7 +11098,7 @@ East,G-5,C\n";
             },
             InvestigationStep {
                 depth: 1,
-                dimension: "discipline".to_string(),
+                dimension: "channel".to_string(),
                 scope: vec![("region".to_string(), "West".to_string())],
                 primary_metric: "revenue_usd".to_string(),
                 base_records: 50,
@@ -11112,7 +11111,7 @@ East,G-5,C\n";
                 top1_concentration_new_pct: 55.0,
                 top1_concentration_delta_pp: 10.0,
                 movers: vec![InvestigationMover {
-                    segment: "Enterprise".to_string(),
+                    segment: "Direct".to_string(),
                     base_records: 30,
                     new_records: 40,
                     base_share_pct: 45.0,
@@ -11127,12 +11126,12 @@ East,G-5,C\n";
 
         let proposed = LlmPlannerAction {
             action: "analyze_compare".to_string(),
-            reason: Some("Strongest driver is discipline".to_string()),
+            reason: Some("Strongest driver is channel".to_string()),
             params: Some(LlmPlannerParams {
                 metric: Some("revenue_usd".to_string()),
                 group_by: Some(vec!["region".to_string()]),
                 filters: Some(
-                    [("discipline".to_string(), "Enterprise".to_string())]
+                    [("channel".to_string(), "Direct".to_string())]
                         .into_iter()
                         .collect(),
                 ),
@@ -11144,8 +11143,8 @@ East,G-5,C\n";
             &args,
             &[
                 "region".to_string(),
-                "discipline".to_string(),
-                "category".to_string(),
+                "channel".to_string(),
+                "product_line".to_string(),
             ],
             &steps,
             InvestigateInputKind::CsvDatasets,
@@ -11159,10 +11158,10 @@ East,G-5,C\n";
                     scope,
                     vec![
                         ("region".to_string(), "West".to_string()),
-                        ("discipline".to_string(), "Enterprise".to_string())
+                        ("channel".to_string(), "Direct".to_string())
                     ]
                 );
-                assert_eq!(group_by, "category");
+                assert_eq!(group_by, "product_line");
             }
             _ => panic!("expected analyze_compare"),
         }
@@ -11313,12 +11312,11 @@ Further drill-down stopped at max depth.
     fn recommended_next_question_includes_scope_and_signed_delta() {
         let step = InvestigationStep {
             depth: 4,
-            dimension: "provider_name".to_string(),
+            dimension: "plan_tier".to_string(),
             scope: vec![
                 ("region".to_string(), "West".to_string()),
-                ("discipline".to_string(), "Enterprise".to_string()),
-                ("category".to_string(), "Field Services".to_string()),
-                ("client_name".to_string(), "Client A".to_string()),
+                ("channel".to_string(), "Direct".to_string()),
+                ("product_line".to_string(), "Core".to_string()),
             ],
             primary_metric: "revenue_usd".to_string(),
             base_records: 20,
@@ -11331,7 +11329,7 @@ Further drill-down stopped at max depth.
             top1_concentration_new_pct: 20.0,
             top1_concentration_delta_pp: -40.0,
             movers: vec![InvestigationMover {
-                segment: "Provider A".to_string(),
+                segment: "Premium".to_string(),
                 base_records: 10,
                 new_records: 3,
                 base_share_pct: 50.0,
@@ -11345,7 +11343,7 @@ Further drill-down stopped at max depth.
 
         let q = recommended_next_question(InvestigationMode::ConcentrationDrivers, Some(&step));
         assert!(q.contains("within scope [region=West"));
-        assert!(q.contains("provider_name='Provider A'"));
+        assert!(q.contains("plan_tier='Premium'"));
         assert!(q.contains("delta share -40.83 pp"));
     }
 
