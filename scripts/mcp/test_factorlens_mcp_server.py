@@ -388,6 +388,54 @@ class InvestigateToolTests(unittest.TestCase):
             mod._validate_write_path = old_validate_write
             mod._run = old_run
 
+    def test_investigate_accepts_profile_and_profile_config(self):
+        calls: dict[str, object] = {}
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        old_validate_write = mod._validate_write_path
+        old_run = mod._run
+        try:
+            mod._validate_read_path = lambda p, _label: Path(f"/safe/read/{Path(p).name}")
+            mod._validate_write_path = lambda p, _label: Path(
+                f"/safe/write/{Path(p).name}"
+            )
+
+            def _fake_run(cmd: list[str], timeout_sec: int | None):
+                calls["cmd"] = cmd
+                calls["timeout_sec"] = timeout_sec
+                return {"ok": True}
+
+            mod._run = _fake_run
+            mod.investigate(
+                question="q",
+                base="artifacts/base.json",
+                new="artifacts/new.json",
+                out="artifacts/investigate.md",
+                profile="default",
+                profile_config="profiles/investigate.example.toml",
+            )
+            self.assertIn("--profile", calls["cmd"])
+            profile_idx = calls["cmd"].index("--profile")
+            self.assertEqual(calls["cmd"][profile_idx + 1], "default")
+            self.assertIn("--profile-config", calls["cmd"])
+            cfg_idx = calls["cmd"].index("--profile-config")
+            self.assertEqual(calls["cmd"][cfg_idx + 1], "/safe/read/investigate.example.toml")
+        finally:
+            mod._validate_read_path = old_validate_read
+            mod._validate_write_path = old_validate_write
+            mod._run = old_run
+
+    def test_investigate_rejects_mixed_config_and_profile(self):
+        with self.assertRaisesRegex(ValueError, "use either config or profile/profile_config"):
+            self.mod.investigate(
+                question="q",
+                base="artifacts/base.json",
+                new="artifacts/new.json",
+                out="artifacts/investigate.md",
+                config="profiles/investigate.example.toml",
+                profile="default",
+            )
+
 
 class ExplainAnalyzeToolTests(unittest.TestCase):
     @classmethod

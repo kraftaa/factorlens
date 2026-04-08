@@ -111,7 +111,8 @@ Investigate with config defaults:
   "base": "/path/to/feb.csv",
   "new": "/path/to/mar.csv",
   "out": "/path/to/artifacts/investigate.md",
-  "config": "/path/to/profiles/investigate.example.toml",
+  "profile": "default",
+  "profile_config": "/path/to/profiles/investigate.example.toml",
   "mode": "change_drivers"
 }
 ```

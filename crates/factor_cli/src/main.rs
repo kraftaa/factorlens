@@ -221,8 +221,12 @@ struct InvestigateWorkflowArgs {
     question: String,
     #[arg(long, value_enum)]
     mode: Option<InvestigationModeArg>,
-    #[arg(long, visible_alias = "profile")]
+    #[arg(long, conflicts_with_all = ["profile", "profile_config"])]
     config: Option<PathBuf>,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long, requires = "profile", conflicts_with = "config")]
+    profile_config: Option<PathBuf>,
     #[arg(long)]
     base: Option<PathBuf>,
     #[arg(long)]
@@ -7596,6 +7600,28 @@ fn apply_analyze_profile(mut args: AnalyzeArgs) -> Result<AnalyzeArgs> {
     Ok(args)
 }
 
+fn decode_investigate_config_entry(
+    path: &Path,
+    section: toml::Value,
+    context: &str,
+) -> Result<InvestigateConfigEntry> {
+    if !section.is_table() {
+        return Err(anyhow!(
+            "investigate config '{}' {} must be a TOML table",
+            path.display(),
+            context
+        ));
+    }
+    section.try_into().map_err(|e| {
+        anyhow!(
+            "failed to decode investigate config '{}' {}: {}",
+            path.display(),
+            context,
+            e
+        )
+    })
+}
+
 fn load_investigate_config(path: &Path) -> Result<InvestigateConfigEntry> {
     let text = fs::read_to_string(path).map_err(|e| {
         anyhow!(
@@ -7611,23 +7637,72 @@ fn load_investigate_config(path: &Path) -> Result<InvestigateConfigEntry> {
             e
         )
     })?;
-    let section = raw
-        .get("investigate")
-        .cloned()
-        .unwrap_or_else(|| raw.clone());
-    if !section.is_table() {
-        return Err(anyhow!(
-            "investigate config '{}' must be a TOML table or contain [investigate] table",
-            path.display()
-        ));
+    if let Some(section) = raw.get("investigate").cloned() {
+        return decode_investigate_config_entry(path, section, "from [investigate]");
     }
-    section.try_into().map_err(|e| {
+    if let Some(profiles) = raw.get("profiles").and_then(|v| v.as_table()) {
+        if profiles.is_empty() {
+            return Err(anyhow!(
+                "investigate config '{}' has empty [profiles] table",
+                path.display()
+            ));
+        }
+        if profiles.len() > 1 {
+            return Err(anyhow!(
+                "investigate config '{}' has multiple [profiles.*] entries; choose one with --profile <name> --profile-config <path.toml>",
+                path.display()
+            ));
+        }
+        let (name, section) = profiles.iter().next().expect("checked non-empty");
+        return decode_investigate_config_entry(
+            path,
+            section.clone(),
+            &format!("from [profiles.{}]", name),
+        );
+    }
+    decode_investigate_config_entry(path, raw, "from root table")
+}
+
+fn load_investigate_profile(path: &Path, profile_raw: &str) -> Result<InvestigateConfigEntry> {
+    let text = fs::read_to_string(path).map_err(|e| {
         anyhow!(
-            "failed to decode investigate config '{}': {}",
+            "failed to read investigate profile config '{}': {}",
             path.display(),
             e
         )
-    })
+    })?;
+    let raw: toml::Value = toml::from_str(&text).map_err(|e| {
+        anyhow!(
+            "failed to parse investigate profile config '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    let profiles = raw
+        .get("profiles")
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| {
+            anyhow!(
+                "investigate profile config '{}' must contain [profiles.<name>] entries",
+                path.display()
+            )
+        })?;
+    let profile = profile_raw.trim();
+    let (matched_name, section) = profiles
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(profile))
+        .ok_or_else(|| {
+            anyhow!(
+                "investigate profile '{}' not found in {}",
+                profile_raw,
+                path.display()
+            )
+        })?;
+    decode_investigate_config_entry(
+        path,
+        section.clone(),
+        &format!("for profile '{}'", matched_name),
+    )
 }
 
 fn parse_mode_arg_from_str(raw: &str) -> Result<InvestigationModeArg> {
@@ -7715,9 +7790,45 @@ fn parse_period_preset_from_str(raw: &str) -> Result<PeriodPreset> {
 }
 
 fn apply_investigate_config(mut args: InvestigateWorkflowArgs) -> Result<InvestigateWorkflowArgs> {
-    if let Some(cfg_path) = args.config.clone() {
-        let cfg = load_investigate_config(&cfg_path)?;
+    if args.config.is_some() && args.profile.is_some() {
+        return Err(anyhow!(
+            "use either --config <path.toml> or --profile <name> [--profile-config <path.toml>], not both"
+        ));
+    }
+    if args.config.is_some() && args.profile_config.is_some() {
+        return Err(anyhow!(
+            "use either --config <path.toml> or --profile <name> [--profile-config <path.toml>], not both"
+        ));
+    }
+    if args.profile_config.is_some() && args.profile.is_none() {
+        return Err(anyhow!("--profile-config requires --profile <name>"));
+    }
 
+    let cfg_opt = if let Some(cfg_path) = args.config.clone() {
+        Some(load_investigate_config(&cfg_path)?)
+    } else if let Some(profile_raw) = args.profile.clone() {
+        if let Some(cfg_path) = args.profile_config.clone() {
+            Some(load_investigate_profile(&cfg_path, &profile_raw)?)
+        } else {
+            let profile_trimmed = profile_raw.trim();
+            let looks_like_path = profile_trimmed.contains(std::path::MAIN_SEPARATOR)
+                || profile_trimmed.contains('/')
+                || profile_trimmed.contains('\\')
+                || profile_trimmed.ends_with(".toml");
+            if looks_like_path {
+                Some(load_investigate_config(Path::new(profile_trimmed))?)
+            } else {
+                return Err(anyhow!(
+                    "investigate --profile '{}' expects --profile-config <path.toml>; or use --config <path.toml> for single investigate configs",
+                    profile_raw
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(cfg) = cfg_opt {
         if args.question.trim().is_empty() {
             if let Some(v) = cfg.question {
                 args.question = v;
@@ -9719,6 +9830,11 @@ fn parse_date_like(v: &str) -> Option<chrono::NaiveDate> {
     if s.is_empty() {
         return None;
     }
+    if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+            return Some(d);
+        }
+    }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some(d);
     }
@@ -9727,6 +9843,18 @@ fn parse_date_like(v: &str) -> Option<chrono::NaiveDate> {
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return Some(dt.date());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%:z") {
+        return Some(dt.date_naive());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z") {
+        return Some(dt.date_naive());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+        return Some(dt.date_naive());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z") {
+        return Some(dt.date_naive());
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.date_naive());
@@ -9767,6 +9895,8 @@ mod tests {
             question: "why did revenue change".to_string(),
             mode: None,
             config: None,
+            profile: None,
+            profile_config: None,
             base: Some(PathBuf::from("artifacts/base.json")),
             new: Some(PathBuf::from("artifacts/new.json")),
             postgres_url: None,
@@ -10267,6 +10397,86 @@ planner_model = "/models/llama.gguf"
     }
 
     #[test]
+    fn investigate_profile_config_applies_named_profile() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let cfg_path =
+            std::env::temp_dir().join(format!("factorlens_investigate_profiles_{}.toml", ts));
+        fs::write(
+            &cfg_path,
+            r#"
+[profiles.change]
+question = "Why did revenue change?"
+mode = "change_drivers"
+metric = "revenue_usd"
+dimensions = ["region", "channel"]
+"#,
+        )
+        .expect("write config");
+
+        let mut args = investigate_workflow_args();
+        args.question = String::new();
+        args.metric = None;
+        args.dimensions = vec![];
+        args.profile = Some("change".to_string());
+        args.profile_config = Some(cfg_path.clone());
+
+        let out = apply_investigate_config(args).expect("apply config");
+        assert_eq!(out.question, "Why did revenue change?");
+        assert_eq!(out.mode, Some(InvestigationModeArg::ChangeDrivers));
+        assert_eq!(out.metric.as_deref(), Some("revenue_usd"));
+        assert_eq!(
+            out.dimensions,
+            vec!["region".to_string(), "channel".to_string()]
+        );
+
+        let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn investigate_config_with_multiple_profiles_requires_profile_name() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let cfg_path =
+            std::env::temp_dir().join(format!("factorlens_investigate_profiles_multi_{}.toml", ts));
+        fs::write(
+            &cfg_path,
+            r#"
+[profiles.change]
+question = "Why did revenue change?"
+
+[profiles.conc]
+question = "Why did concentration increase?"
+"#,
+        )
+        .expect("write config");
+
+        let mut args = investigate_workflow_args();
+        args.config = Some(cfg_path.clone());
+        let err = apply_investigate_config(args)
+            .err()
+            .expect("expected multi-profile error");
+        assert!(err.to_string().contains("multiple [profiles.*] entries"));
+
+        let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn investigate_profile_config_requires_profile_name() {
+        let mut args = investigate_workflow_args();
+        args.profile = None;
+        args.profile_config = Some(PathBuf::from("profiles/investigate.example.toml"));
+        let err = apply_investigate_config(args)
+            .err()
+            .expect("expected profile_config validation error");
+        assert!(err.to_string().contains("requires --profile"));
+    }
+
+    #[test]
     fn investigate_config_does_not_override_non_default_cli_values() {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10328,6 +10538,17 @@ drill_fields = ["channel", "channel", "product_line", "CHANNEL"]
         );
 
         let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn parse_date_like_supports_postgres_timestamptz_variants() {
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 3, 12).expect("valid date");
+        assert_eq!(parse_date_like("2026-03-12 14:23:55+00"), Some(expected));
+        assert_eq!(
+            parse_date_like("2026-03-12 14:23:55.123456+00"),
+            Some(expected)
+        );
+        assert_eq!(parse_date_like("2026-03-12 14:23:55+0000"), Some(expected));
     }
 
     #[test]

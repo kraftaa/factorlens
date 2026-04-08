@@ -634,6 +634,8 @@ def investigate(
     previous_start: str | None = None,
     previous_end: str | None = None,
     config: str | None = None,
+    profile: str | None = None,
+    profile_config: str | None = None,
     mode: str | None = None,
     metric: str | None = None,
     dimensions_csv: str | None = None,
@@ -678,6 +680,10 @@ def investigate(
         raise ValueError(
             f"postgres_ssl_mode must be one of {sorted(VALID_POSTGRES_SSL_MODES)}"
         )
+    if config and profile:
+        raise ValueError("use either config or profile/profile_config, not both")
+    if profile_config and not profile:
+        raise ValueError("profile_config requires profile")
 
     has_pair_mode = bool(base) or bool(new)
     has_query_mode = bool(query) or bool(query_file) or bool(postgres_url)
@@ -708,8 +714,11 @@ def investigate(
 
     out_path = _validate_write_path(out, "out")
     config_path: Path | None = None
+    profile_config_path: Path | None = None
     if config:
         config_path = _validate_read_path(config, "config")
+    if profile_config:
+        profile_config_path = _validate_read_path(profile_config, "profile_config")
 
     cmd = [
         "investigate",
@@ -763,6 +772,9 @@ def investigate(
     _append_optional(cmd, "--metric", metric)
     if config_path:
         cmd.extend(["--config", str(config_path)])
+    _append_optional(cmd, "--profile", profile)
+    if profile_config_path:
+        cmd.extend(["--profile-config", str(profile_config_path)])
     _append_optional(cmd, "--mode", mode)
     _append_optional(cmd, "--dimensions", dimensions_csv)
     _append_optional(cmd, "--drill-fields", drill_fields_csv)

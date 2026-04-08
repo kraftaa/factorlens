@@ -113,7 +113,8 @@ Tip: `investigate` can auto-route from question text, or you can force mode with
 `--mode change_drivers|concentration_drivers|compare_snapshots|recommend_next`.
 
 To avoid long investigate commands, store defaults in a TOML config and pass
-`--config profiles/investigate.example.toml` (or `--profile` alias).
+`--profile default --profile-config profiles/investigate.example.toml`
+(or legacy `--config profiles/investigate.example.toml`).
 
 Practical rule:
 
@@ -240,7 +241,8 @@ Investigate using config defaults:
 
 ```bash
 cargo run -p factor_cli -- investigate \
-  --profile profiles/investigate.example.toml \
+  --profile default \
+  --profile-config profiles/investigate.example.toml \
   --question "Why did revenue change?" \
   --base data/factorlens_demo_sales_100.csv \
   --new data/factorlens_demo_sales_150.csv \
@@ -251,7 +253,8 @@ Investigate from Postgres query with period windows:
 
 ```bash
 cargo run -p factor_cli -- investigate \
-  --profile profiles/investigate.example.toml \
+  --profile default \
+  --profile-config profiles/investigate.example.toml \
   --question "Why did revenue change last month?" \
   --postgres-url "$DATABASE_URL" \
   --query "SELECT order_date, region, channel, product_line, plan_tier, revenue_usd FROM analytics.sales" \
@@ -266,7 +269,8 @@ Investigate from Postgres query file with period windows:
 
 ```bash
 cargo run -p factor_cli -- investigate \
-  --profile profiles/investigate.example.toml \
+  --profile default \
+  --profile-config profiles/investigate.example.toml \
   --question "Why did revenue change last month?" \
   --postgres-url "$DATABASE_URL" \
   --query-file sql/investigate_sales.sql \

@@ -1,4 +1,4 @@
-[investigate]
+[profiles.default]
 # Required unless passed via CLI.
 question = "Why did revenue change?"
 
