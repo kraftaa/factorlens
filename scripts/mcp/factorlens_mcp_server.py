@@ -617,9 +617,22 @@ def analyze_compare(
 @mcp.tool()
 def investigate(
     question: str,
-    base: str,
-    new: str,
     out: str,
+    base: str | None = None,
+    new: str | None = None,
+    query: str | None = None,
+    query_file: str | None = None,
+    postgres_url: str | None = None,
+    postgres_ssl_mode: str = "prefer",
+    postgres_ca_file: str | None = None,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
     config: str | None = None,
     mode: str | None = None,
     metric: str | None = None,
@@ -661,9 +674,38 @@ def investigate(
         raise ValueError(f"planner must be one of {sorted(VALID_INVESTIGATE_PLANNERS)}")
     if planner_backend not in VALID_BACKENDS:
         raise ValueError(f"planner_backend must be one of {sorted(VALID_BACKENDS)}")
+    if postgres_ssl_mode not in VALID_POSTGRES_SSL_MODES:
+        raise ValueError(
+            f"postgres_ssl_mode must be one of {sorted(VALID_POSTGRES_SSL_MODES)}"
+        )
 
-    base_path = _validate_read_path(base, "base")
-    new_path = _validate_read_path(new, "new")
+    has_pair_mode = bool(base) or bool(new)
+    has_query_mode = bool(query) or bool(query_file) or bool(postgres_url)
+    if has_pair_mode and has_query_mode:
+        raise ValueError(
+            "choose one input mode: (--base and --new) OR (--query/--query-file with optional --postgres-url)"
+        )
+
+    if has_pair_mode:
+        if not base or not new:
+            raise ValueError("provide both base and new for file input mode")
+    else:
+        if bool(query) == bool(query_file):
+            raise ValueError("provide exactly one of query or query_file for query input mode")
+
+    base_path: Path | None = None
+    new_path: Path | None = None
+    query_file_path: Path | None = None
+    ca_file_path: Path | None = None
+    if base:
+        base_path = _validate_read_path(base, "base")
+    if new:
+        new_path = _validate_read_path(new, "new")
+    if query_file:
+        query_file_path = _validate_read_path(query_file, "query_file")
+    if postgres_ca_file:
+        ca_file_path = _validate_read_path(postgres_ca_file, "postgres_ca_file")
+
     out_path = _validate_write_path(out, "out")
     config_path: Path | None = None
     if config:
@@ -673,10 +715,6 @@ def investigate(
         "investigate",
         "--question",
         question,
-        "--base",
-        str(base_path),
-        "--new",
-        str(new_path),
         "--out",
         str(out_path),
         "--output-format",
@@ -699,6 +737,29 @@ def investigate(
         planner_backend,
     ]
 
+    if base_path and new_path:
+        cmd.extend(["--base", str(base_path), "--new", str(new_path)])
+    else:
+        _append_optional(cmd, "--postgres-url", postgres_url)
+        cmd.extend(["--postgres-ssl-mode", postgres_ssl_mode])
+        if query:
+            cmd.extend(["--query", query])
+        if query_file_path:
+            cmd.extend(["--query-file", str(query_file_path)])
+        if ca_file_path:
+            cmd.extend(["--postgres-ca-file", str(ca_file_path)])
+
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
     _append_optional(cmd, "--metric", metric)
     if config_path:
         cmd.extend(["--config", str(config_path)])

@@ -158,10 +158,6 @@ class InvestigateToolTests(unittest.TestCase):
                     "investigate",
                     "--question",
                     "Why did revenue change?",
-                    "--base",
-                    "/safe/read/base.json",
-                    "--new",
-                    "/safe/read/new.json",
                     "--out",
                     "/safe/write/investigate.md",
                     "--output-format",
@@ -182,6 +178,10 @@ class InvestigateToolTests(unittest.TestCase):
                     "llm",
                     "--planner-backend",
                     "bedrock",
+                    "--base",
+                    "/safe/read/base.json",
+                    "--new",
+                    "/safe/read/new.json",
                     "--metric",
                     "revenue_usd",
                     "--mode",
@@ -194,6 +194,101 @@ class InvestigateToolTests(unittest.TestCase):
                     "anthropic.claude-3-haiku-20240307-v1:0",
                     "--verbose",
                     "--trace",
+                ],
+            )
+        finally:
+            mod._validate_read_path = old_validate_read
+            mod._validate_write_path = old_validate_write
+            mod._run = old_run
+
+    def test_investigate_query_mode_builds_expected_command(self):
+        calls: dict[str, object] = {}
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        old_validate_write = mod._validate_write_path
+        old_run = mod._run
+        try:
+            mod._validate_read_path = lambda p, _label: Path(f"/safe/read/{Path(p).name}")
+            mod._validate_write_path = lambda p, _label: Path(
+                f"/safe/write/{Path(p).name}"
+            )
+
+            def _fake_run(cmd: list[str], timeout_sec: int | None):
+                calls["cmd"] = cmd
+                calls["timeout_sec"] = timeout_sec
+                return {"ok": True}
+
+            mod._run = _fake_run
+            raw = mod.investigate(
+                question="Why did revenue change?",
+                out="artifacts/investigate.md",
+                query_file="sql/sales.sql",
+                postgres_url="postgres://db",
+                postgres_ssl_mode="require",
+                postgres_ca_file="certs/ca.pem",
+                date_column="order_date",
+                time_grain="month",
+                period="last",
+                anchor_date="2026-04-15",
+                current_start="2026-03-01",
+                current_end="2026-03-31",
+                previous_start="2026-02-01",
+                previous_end="2026-02-28",
+                output_format="both",
+                timeout_sec=90,
+            )
+            self.assertEqual(json.loads(raw), {"ok": True})
+            self.assertEqual(calls["timeout_sec"], 90)
+            self.assertEqual(
+                calls["cmd"],
+                [
+                    "investigate",
+                    "--question",
+                    "Why did revenue change?",
+                    "--out",
+                    "/safe/write/investigate.md",
+                    "--output-format",
+                    "both",
+                    "--max-depth",
+                    "2",
+                    "--max-branches",
+                    "1",
+                    "--min-contribution",
+                    "5.0",
+                    "--min-score-improvement",
+                    "0.0",
+                    "--min-slice-rows",
+                    "5",
+                    "--top-movers",
+                    "12",
+                    "--planner",
+                    "deterministic",
+                    "--planner-backend",
+                    "local",
+                    "--postgres-url",
+                    "postgres://db",
+                    "--postgres-ssl-mode",
+                    "require",
+                    "--query-file",
+                    "/safe/read/sales.sql",
+                    "--postgres-ca-file",
+                    "/safe/read/ca.pem",
+                    "--date-column",
+                    "order_date",
+                    "--time-grain",
+                    "month",
+                    "--period",
+                    "last",
+                    "--anchor-date",
+                    "2026-04-15",
+                    "--current-start",
+                    "2026-03-01",
+                    "--current-end",
+                    "2026-03-31",
+                    "--previous-start",
+                    "2026-02-01",
+                    "--previous-end",
+                    "2026-02-28",
                 ],
             )
         finally:
@@ -235,10 +330,29 @@ class InvestigateToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "min_score_improvement must be >= 0"):
             self.mod.investigate(
                 question="q",
+                out="artifacts/investigate.md",
                 base="artifacts/base.json",
                 new="artifacts/new.json",
-                out="artifacts/investigate.md",
                 min_score_improvement=-0.1,
+            )
+
+    def test_investigate_rejects_mixed_input_modes(self):
+        with self.assertRaisesRegex(ValueError, "choose one input mode"):
+            self.mod.investigate(
+                question="q",
+                out="artifacts/investigate.md",
+                base="artifacts/base.json",
+                new="artifacts/new.json",
+                query="select 1",
+            )
+
+    def test_investigate_rejects_query_mode_without_query_or_file(self):
+        with self.assertRaisesRegex(
+            ValueError, "provide exactly one of query or query_file for query input mode"
+        ):
+            self.mod.investigate(
+                question="q",
+                out="artifacts/investigate.md",
             )
 
     def test_investigate_accepts_config_path(self):

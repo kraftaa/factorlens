@@ -116,6 +116,24 @@ Investigate with config defaults:
 }
 ```
 
+Investigate from Postgres query with period windows:
+
+```json
+{
+  "question": "Why did revenue change?",
+  "out": "/path/to/artifacts/investigate_query.md",
+  "query": "select order_date, region, channel, product_line, plan_tier, revenue_usd from analytics.sales",
+  "date_column": "order_date",
+  "time_grain": "month",
+  "period": "last",
+  "anchor_date": "2026-04-15",
+  "metric": "revenue_usd",
+  "mode": "change_drivers",
+  "planner": "deterministic",
+  "output_format": "both"
+}
+```
+
 Analyze Postgres query:
 
 ```json
