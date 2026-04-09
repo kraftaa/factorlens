@@ -6481,9 +6481,16 @@ fn infer_csv_investigation_dimensions(
     new_path: &Path,
     metric: Option<&str>,
 ) -> Result<Vec<String>> {
+    const AUTO_KEEP_HIGH_CARD_TOP1_COUNT_SHARE: f64 = 0.12;
+    const AUTO_KEEP_HIGH_CARD_TOP5_COUNT_SHARE: f64 = 0.35;
+    const AUTO_KEEP_HIGH_CARD_TOP1_METRIC_SHARE: f64 = 0.12;
+    const AUTO_KEEP_HIGH_CARD_TOP5_METRIC_SHARE: f64 = 0.40;
+
     let sample_rows = 300usize;
     let (base_headers, base_rows) = read_csv_headers_and_sample(base_path, sample_rows)?;
     let (new_headers, new_rows) = read_csv_headers_and_sample(new_path, sample_rows)?;
+    let base_metric_idx = metric.and_then(|m| header_index_case_insensitive(&base_headers, m));
+    let new_metric_idx = metric.and_then(|m| header_index_case_insensitive(&new_headers, m));
 
     let mut out = Vec::<String>::new();
     for base_name in &base_headers {
@@ -6504,12 +6511,16 @@ fn infer_csv_investigation_dimensions(
         let mut numeric_like = 0usize;
         let mut date_like = 0usize;
         let mut unique_values = HashSet::<String>::new();
+        let mut value_counts = HashMap::<String, usize>::new();
+        let mut metric_by_value = HashMap::<String, f64>::new();
+        let mut metric_total_abs = 0.0f64;
         for rec in &base_rows {
             let v = rec.get(base_idx).unwrap_or("").trim();
             if v.is_empty() {
                 continue;
             }
             non_empty += 1;
+            *value_counts.entry(v.to_string()).or_insert(0) += 1;
             if parse_numeric(v).is_some() {
                 numeric_like += 1;
             }
@@ -6518,6 +6529,13 @@ fn infer_csv_investigation_dimensions(
             }
             if unique_values.len() < 256 {
                 unique_values.insert(v.to_string());
+            }
+            if let Some(metric_idx) = base_metric_idx {
+                if let Some(m) = parse_numeric(rec.get(metric_idx).unwrap_or("").trim()) {
+                    let abs = m.abs();
+                    metric_total_abs += abs;
+                    *metric_by_value.entry(v.to_string()).or_insert(0.0) += abs;
+                }
             }
         }
         for rec in &new_rows {
@@ -6526,6 +6544,7 @@ fn infer_csv_investigation_dimensions(
                 continue;
             }
             non_empty += 1;
+            *value_counts.entry(v.to_string()).or_insert(0) += 1;
             if parse_numeric(v).is_some() {
                 numeric_like += 1;
             }
@@ -6534,6 +6553,13 @@ fn infer_csv_investigation_dimensions(
             }
             if unique_values.len() < 256 {
                 unique_values.insert(v.to_string());
+            }
+            if let Some(metric_idx) = new_metric_idx {
+                if let Some(m) = parse_numeric(rec.get(metric_idx).unwrap_or("").trim()) {
+                    let abs = m.abs();
+                    metric_total_abs += abs;
+                    *metric_by_value.entry(v.to_string()).or_insert(0.0) += abs;
+                }
             }
         }
         if non_empty == 0 {
@@ -6550,9 +6576,35 @@ fn infer_csv_investigation_dimensions(
         // High-cardinality text-like columns are usually IDs/keys and make poor drill dimensions.
         let high_cardinality_text =
             numeric_ratio < 0.9 && unique_count >= 64 && unique_ratio >= 0.35;
+        let mut count_distribution = value_counts.values().copied().collect::<Vec<_>>();
+        count_distribution.sort_unstable_by(|a, b| b.cmp(a));
+        let top1_count_share = count_distribution
+            .first()
+            .map(|v| *v as f64 / non_empty as f64)
+            .unwrap_or(0.0);
+        let top5_count_share =
+            count_distribution.iter().take(5).sum::<usize>() as f64 / non_empty as f64;
+
+        let mut metric_distribution = metric_by_value.values().copied().collect::<Vec<_>>();
+        metric_distribution.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top1_metric_share = if metric_total_abs > 0.0 {
+            metric_distribution.first().copied().unwrap_or(0.0) / metric_total_abs
+        } else {
+            0.0
+        };
+        let top5_metric_share = if metric_total_abs > 0.0 {
+            metric_distribution.iter().take(5).sum::<f64>() / metric_total_abs
+        } else {
+            0.0
+        };
+        let keep_high_cardinality_text = top1_count_share >= AUTO_KEEP_HIGH_CARD_TOP1_COUNT_SHARE
+            || top5_count_share >= AUTO_KEEP_HIGH_CARD_TOP5_COUNT_SHARE
+            || top1_metric_share >= AUTO_KEEP_HIGH_CARD_TOP1_METRIC_SHARE
+            || top5_metric_share >= AUTO_KEEP_HIGH_CARD_TOP5_METRIC_SHARE;
+
         if date_ratio >= 0.8
             || (numeric_ratio >= 0.9 && !low_cardinality_code)
-            || high_cardinality_text
+            || (high_cardinality_text && !keep_high_cardinality_text)
         {
             continue;
         }
@@ -10730,6 +10782,104 @@ Other,G-5,500\n";
         assert!(
             !inferred.iter().any(|d| d == "group_id"),
             "identifier columns should be excluded from inferred dimensions"
+        );
+
+        let _ = fs::remove_file(&base_path);
+        let _ = fs::remove_file(&new_path);
+    }
+
+    #[test]
+    fn infer_csv_dimensions_keeps_concentrated_high_cardinality_text_columns() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let base_path = std::env::temp_dir().join(format!("factorlens_hc_keep_base_{}.csv", ts));
+        let new_path = std::env::temp_dir().join(format!("factorlens_hc_keep_new_{}.csv", ts));
+
+        let mut base_w = csv::Writer::from_path(&base_path).expect("create base");
+        let mut new_w = csv::Writer::from_path(&new_path).expect("create new");
+        base_w
+            .write_record(["organization_name", "region", "revenue_usd"])
+            .expect("base header");
+        new_w
+            .write_record(["organization_name", "region", "revenue_usd"])
+            .expect("new header");
+
+        for i in 0..100usize {
+            let (org, revenue) = if i < 40 {
+                ("MajorOrg".to_string(), "1000".to_string())
+            } else {
+                (format!("Org_{}", i), "10".to_string())
+            };
+            base_w
+                .write_record([org, "US".to_string(), revenue])
+                .expect("base row");
+        }
+        for i in 0..100usize {
+            let (org, revenue) = if i < 45 {
+                ("MajorOrg".to_string(), "1200".to_string())
+            } else {
+                (format!("Org_{}", i + 100), "12".to_string())
+            };
+            new_w
+                .write_record([org, "US".to_string(), revenue])
+                .expect("new row");
+        }
+        base_w.flush().expect("flush base");
+        new_w.flush().expect("flush new");
+
+        let inferred =
+            infer_csv_investigation_dimensions(&base_path, &new_path, Some("revenue_usd"))
+                .expect("infer dimensions");
+        assert!(
+            inferred.iter().any(|d| d == "organization_name"),
+            "expected concentrated high-cardinality dimension to be kept"
+        );
+
+        let _ = fs::remove_file(&base_path);
+        let _ = fs::remove_file(&new_path);
+    }
+
+    #[test]
+    fn infer_csv_dimensions_skips_diffuse_high_cardinality_text_columns() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let base_path = std::env::temp_dir().join(format!("factorlens_hc_skip_base_{}.csv", ts));
+        let new_path = std::env::temp_dir().join(format!("factorlens_hc_skip_new_{}.csv", ts));
+
+        let mut base_w = csv::Writer::from_path(&base_path).expect("create base");
+        let mut new_w = csv::Writer::from_path(&new_path).expect("create new");
+        base_w
+            .write_record(["organization_name", "region", "revenue_usd"])
+            .expect("base header");
+        new_w
+            .write_record(["organization_name", "region", "revenue_usd"])
+            .expect("new header");
+
+        for i in 0..120usize {
+            base_w
+                .write_record([format!("Org_{}", i), "US".to_string(), "100".to_string()])
+                .expect("base row");
+            new_w
+                .write_record([
+                    format!("Org_{}", i + 200),
+                    "US".to_string(),
+                    "100".to_string(),
+                ])
+                .expect("new row");
+        }
+        base_w.flush().expect("flush base");
+        new_w.flush().expect("flush new");
+
+        let inferred =
+            infer_csv_investigation_dimensions(&base_path, &new_path, Some("revenue_usd"))
+                .expect("infer dimensions");
+        assert!(
+            !inferred.iter().any(|d| d == "organization_name"),
+            "expected diffuse high-cardinality dimension to be skipped"
         );
 
         let _ = fs::remove_file(&base_path);

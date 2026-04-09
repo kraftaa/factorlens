@@ -11,7 +11,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "4.1.1"
+version = "4.1.2"
 authors = ["FactorLens"]
 
 [workspace.dependencies]
