@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ VALID_INVESTIGATE_MODES = {
 }
 VALID_BACKENDS = {"local", "bedrock"}
 VALID_POSTGRES_SSL_MODES = {"disable", "prefer", "require"}
+MAX_READ_ARTIFACT_CHARS = 2_000_000
 
 
 def _split_roots(env_key: str, defaults: list[Path]) -> list[Path]:
@@ -195,6 +197,23 @@ def _append_period_flags(
     _append_optional(cmd, "--current-end", current_end)
     _append_optional(cmd, "--previous-start", previous_start)
     _append_optional(cmd, "--previous-end", previous_end)
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib_metadata.version(name)
+    except Exception:
+        return "unknown"
+
+
+def _extract_version_line(result: dict[str, Any]) -> str:
+    stdout = str(result.get("stdout", "") or "").strip()
+    if stdout:
+        return stdout.splitlines()[0]
+    stderr = str(result.get("stderr", "") or "").strip()
+    if stderr:
+        return stderr.splitlines()[0]
+    return "unknown"
 
 
 @mcp.tool()
@@ -825,6 +844,62 @@ def explain_analyze(
         cmd.extend(["--strict-facts", "false"])
 
     return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
+def server_info(timeout_sec: int | None = 20) -> str:
+    timeout = _timeout_sec(timeout_sec)
+    try:
+        version_probe = _run(["--version"], timeout)
+    except Exception as exc:
+        version_probe = {
+            "ok": False,
+            "return_code": 127,
+            "cmd": [],
+            "stdout": "",
+            "stderr": str(exc),
+            "timeout_sec": timeout,
+        }
+
+    payload = {
+        "ok": bool(version_probe.get("ok", False)),
+        "mcp_server_name": "factorlens",
+        "mcp_sdk_version": _package_version("mcp"),
+        "factorlens_version": _extract_version_line(version_probe),
+        "factorlens_version_probe": version_probe,
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+@mcp.tool()
+def read_artifact(path: str, max_chars: int = 200000) -> str:
+    if max_chars < 1 or max_chars > MAX_READ_ARTIFACT_CHARS:
+        raise ValueError(
+            f"max_chars must be between 1 and {MAX_READ_ARTIFACT_CHARS}"
+        )
+
+    artifact_path = _validate_read_path(path, "path")
+    if not artifact_path.exists():
+        raise ValueError(f"path does not exist: {artifact_path}")
+    if not artifact_path.is_file():
+        raise ValueError(f"path must be a file: {artifact_path}")
+
+    with artifact_path.open("r", encoding="utf-8", errors="replace") as handle:
+        content = handle.read(max_chars + 1)
+    truncated = len(content) > max_chars
+    if truncated:
+        content = content[:max_chars]
+
+    return json.dumps(
+        {
+            "ok": True,
+            "path": str(artifact_path),
+            "truncated": truncated,
+            "max_chars": max_chars,
+            "content": content,
+        },
+        ensure_ascii=True,
+    )
 
 
 @mcp.tool()

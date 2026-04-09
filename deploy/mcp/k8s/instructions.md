@@ -6,7 +6,7 @@
 # - Python MCP server wrapper
 # - streamable HTTP transport support
 
-docker build -f deploy/mcp/docker/Dockerfile -t ghcr.io/kraftaa/factorlens-mcp:4.1.3 .
+docker build -f deploy/mcp/docker/Dockerfile -t ghcr.io/kraftaa/factorlens-mcp:4.1.4 .
 
 
 ## 1) Run MCP server locally in Docker
@@ -28,7 +28,7 @@ docker run --rm -p 8010:8010 \
   -v /path/to/factorlens/profiles:/profiles:ro \
   -v /path/to/factorlens/artifacts:/artifacts \
   -v /path/to/factorlens/certs:/certs:ro \
-  ghcr.io/kraftaa/factorlens-mcp:4.1.3
+  ghcr.io/kraftaa/factorlens-mcp:4.1.4
 
 
 ## 2) Health check the MCP endpoint

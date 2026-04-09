@@ -4573,8 +4573,13 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
         new_json_artifact.as_ref(),
     )?;
     let available_dimensions = investigate_available_dimensions(&top_dimension, &drill_dimensions);
-    let major_global_changes =
-        identify_major_global_changes(&args, &input_refs, mode, &available_dimensions, 3)?;
+    let major_global_changes = identify_major_global_changes(
+        &args,
+        &input_refs,
+        mode,
+        &available_dimensions,
+        major_change_limit_for_dimensions(&available_dimensions),
+    )?;
 
     if args.verbose {
         println!("[route] Question classified as {}", mode_label);
@@ -4880,8 +4885,13 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
         new_json_artifact.as_ref(),
     )?;
     let available_dimensions = investigate_available_dimensions(&top_dimension, &drill_dimensions);
-    let major_global_changes =
-        identify_major_global_changes(&args, &input_refs, mode, &available_dimensions, 3)?;
+    let major_global_changes = identify_major_global_changes(
+        &args,
+        &input_refs,
+        mode,
+        &available_dimensions,
+        major_change_limit_for_dimensions(&available_dimensions),
+    )?;
 
     let planner_backend = match args.planner_backend {
         BackendArg::Local => Backend::Local,
@@ -5904,6 +5914,10 @@ fn investigate_available_dimensions(
         }
     }
     out
+}
+
+fn major_change_limit_for_dimensions(available_dimensions: &[String]) -> usize {
+    available_dimensions.len().clamp(3, 10)
 }
 
 fn identify_major_global_changes(
@@ -7288,6 +7302,52 @@ fn render_investigation_workflow_markdown(
         md.push('\n');
 
         if !step0.movers.is_empty() {
+            let mut largest_segments = step0.movers.iter().collect::<Vec<_>>();
+            largest_segments.sort_by(|a, b| {
+                b.new_share_pct
+                    .partial_cmp(&a.new_share_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.segment.cmp(&b.segment))
+            });
+            let top5_names = largest_segments
+                .iter()
+                .take(5)
+                .map(|m| format!("{} ({:.2}%)", m.segment, m.new_share_pct))
+                .collect::<Vec<_>>()
+                .join(", ");
+            md.push_str(&format!(
+                "- Largest new-period segments by record share: {}.\n",
+                if top5_names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    top5_names
+                }
+            ));
+            md.push('\n');
+
+            md.push_str("### Segments behind concentration (largest by record share)\n\n");
+            md.push_str("| # | Segment | Base share | New share | Delta share |\n");
+            md.push_str("|---:|---|---:|---:|---:|\n");
+            for (idx, mover) in largest_segments.iter().take(5).enumerate() {
+                md.push_str(&format!(
+                    "| {} | {} | {:.2}% | {:.2}% | {:+.2} pp |\n",
+                    idx + 1,
+                    md_cell(&mover.segment),
+                    mover.base_share_pct,
+                    mover.new_share_pct,
+                    mover.delta_share_pp
+                ));
+            }
+            if step0.segment_count > step0.movers.len() {
+                md.push_str(&format!(
+                    "\n_Note: concentration table is derived from reported movers only ({} of {} segments in this scope; tune `--top-movers` to expand)._\
+\n",
+                    step0.movers.len(),
+                    step0.segment_count
+                ));
+            }
+            md.push('\n');
+
             md.push_str("### Top-level movers (top 5)\n\n");
             md.push_str("| # | Segment | Base share | New share | Delta share | Delta metric |\n");
             md.push_str("|---:|---|---:|---:|---:|---:|\n");
@@ -7312,22 +7372,22 @@ fn render_investigation_workflow_markdown(
             }
             md.push('\n');
         }
-        md.push('\n');
-    }
 
-    if !data.major_global_changes.is_empty() {
-        md.push_str("## Major global changes\n\n");
-        for (idx, change) in data.major_global_changes.iter().enumerate() {
-            md.push_str(&format!(
-                "- {}. `{}` strongest mover `{}` (delta {} = {}, delta share = {:+.2} pp, score {}).\n",
-                idx + 1,
-                change.dimension,
-                change.segment,
-                change.primary_metric,
-                fmt_num(change.delta_primary_metric_value, 2),
-                change.delta_share_pp,
-                fmt_num(change.score, 2)
-            ));
+        if !data.major_global_changes.is_empty() {
+            md.push_str("### Strongest mover by configured dimension\n\n");
+            md.push_str("| # | Dimension | Segment | Delta metric | Delta share |\n");
+            md.push_str("|---:|---|---|---:|---:|\n");
+            for (idx, change) in data.major_global_changes.iter().enumerate() {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {:+.2} pp |\n",
+                    idx + 1,
+                    md_cell(&change.dimension),
+                    md_cell(&change.segment),
+                    signed_fmt_num(change.delta_primary_metric_value, 2),
+                    change.delta_share_pp
+                ));
+            }
+            md.push('\n');
         }
         md.push('\n');
     }
@@ -11803,6 +11863,27 @@ Further drill-down stopped at max depth.
     }
 
     #[test]
+    fn sanitize_explain_analyze_answer_strips_inline_markdown_noise() {
+        let raw = "- Investigate the **//Other export//** segment [E1]\n- Revenue is `10.00` [E2]";
+        let out = sanitize_explain_analyze_answer(raw, 3);
+        assert!(
+            !out.contains("**"),
+            "unexpected markdown emphasis in: {}",
+            out
+        );
+        assert!(
+            !out.contains("`"),
+            "unexpected markdown code ticks in: {}",
+            out
+        );
+        assert!(!out.contains("//"), "unexpected slash emphasis in: {}", out);
+        assert!(
+            out.contains("[E1]"),
+            "evidence citation should be preserved"
+        );
+    }
+
+    #[test]
     fn explain_analyze_answer_requires_citations_and_grounded_numbers() {
         let evidence = vec![
             "group='US' records=10 revenue_usd=100.00".to_string(),
@@ -12275,6 +12356,19 @@ fn build_investigate_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+fn strip_inline_markdown_noise(text: &str) -> String {
+    // Keep evidence tags like [E1] but remove common emphasis/code markers.
+    let mut out = text
+        .replace("```", " ")
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "");
+    if !out.contains("://") {
+        out = out.replace("//", "");
+    }
+    out
+}
+
 fn sanitize_explain_analyze_answer(raw: &str, max_bullets: usize) -> String {
     let mut text = raw.trim();
     if let Some((_, tail)) = raw.rsplit_once("assistant") {
@@ -12287,7 +12381,8 @@ fn sanitize_explain_analyze_answer(raw: &str, max_bullets: usize) -> String {
     let mut out = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
     for line in text.lines() {
-        let trimmed = line
+        let cleaned = strip_inline_markdown_noise(line);
+        let trimmed = cleaned
             .trim()
             .trim_start_matches('-')
             .trim_start_matches('*')

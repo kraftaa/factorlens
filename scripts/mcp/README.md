@@ -13,6 +13,8 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 - `analyze_compare`: compare two `analysis.json` snapshots (`md`, `html`, `json`, or `both`)
 - `investigate`: guided drill-down across base/new snapshots (deterministic or LLM planner)
 - `explain_analyze`: run `factorlens explain-analyze` (Bedrock or local)
+- `server_info`: report MCP SDK version + factorlens CLI version
+- `read_artifact`: read generated `.md`/`.json` outputs from allowed paths
 - `healthcheck`: quick CLI availability check
 
 All tool responses are JSON strings with this shape:
@@ -132,6 +134,23 @@ Investigate from Postgres query with period windows:
   "mode": "change_drivers",
   "planner": "deterministic",
   "output_format": "both"
+}
+```
+
+Read investigate/analyze artifacts:
+
+```json
+{
+  "path": "/path/to/artifacts/investigate_report.md",
+  "max_chars": 120000
+}
+```
+
+Report server/runtime versions:
+
+```json
+{
+  "timeout_sec": 20
 }
 ```
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -488,6 +489,84 @@ class ExplainAnalyzeToolTests(unittest.TestCase):
         finally:
             mod._validate_read_path = old_validate_read
             mod._run = old_run
+
+
+class ReadArtifactToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_read_artifact_returns_content_and_truncation_flag(self):
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / "report.md"
+                artifact.write_text("0123456789ABCDEFGHIJ", encoding="utf-8")
+                mod._validate_read_path = lambda _p, _label: artifact
+                raw = mod.read_artifact("artifacts/report.md", max_chars=10)
+                payload = json.loads(raw)
+                self.assertEqual(payload["ok"], True)
+                self.assertEqual(payload["path"], str(artifact))
+                self.assertEqual(payload["truncated"], True)
+                self.assertEqual(payload["content"], "0123456789")
+        finally:
+            mod._validate_read_path = old_validate_read
+
+    def test_read_artifact_rejects_invalid_max_chars(self):
+        with self.assertRaisesRegex(ValueError, "max_chars must be between 1 and"):
+            self.mod.read_artifact("artifacts/report.md", max_chars=0)
+
+
+class ServerInfoToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_server_info_reports_versions(self):
+        mod = self.mod
+        old_run = mod._run
+        old_pkg_ver = mod._package_version
+        try:
+            mod._package_version = lambda _name: "1.27.0"
+            mod._run = lambda _cmd, _timeout: {
+                "ok": True,
+                "return_code": 0,
+                "cmd": ["/safe/bin/factorlens", "--version"],
+                "stdout": "factorlens 4.1.4",
+                "stderr": "",
+                "timeout_sec": 20,
+            }
+            raw = mod.server_info(timeout_sec=20)
+            payload = json.loads(raw)
+            self.assertEqual(payload["ok"], True)
+            self.assertEqual(payload["mcp_server_name"], "factorlens")
+            self.assertEqual(payload["mcp_sdk_version"], "1.27.0")
+            self.assertEqual(payload["factorlens_version"], "factorlens 4.1.4")
+        finally:
+            mod._run = old_run
+            mod._package_version = old_pkg_ver
+
+    def test_server_info_handles_missing_cli(self):
+        mod = self.mod
+        old_run = mod._run
+        old_pkg_ver = mod._package_version
+        try:
+            mod._package_version = lambda _name: "1.27.0"
+
+            def _raise(_cmd, _timeout):
+                raise RuntimeError("factorlens binary not found")
+
+            mod._run = _raise
+            raw = mod.server_info(timeout_sec=20)
+            payload = json.loads(raw)
+            self.assertEqual(payload["ok"], False)
+            self.assertEqual(payload["mcp_server_name"], "factorlens")
+            self.assertEqual(payload["mcp_sdk_version"], "1.27.0")
+            self.assertIn("factorlens binary not found", payload["factorlens_version_probe"]["stderr"])
+        finally:
+            mod._run = old_run
+            mod._package_version = old_pkg_ver
 
 
 if __name__ == "__main__":
