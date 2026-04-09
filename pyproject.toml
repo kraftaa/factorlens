@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "factorlens"
-version = "4.1.2"
+version = "4.1.3"
 description = "Factor attribution and analytics CLI"
 readme = "README.md"
 requires-python = ">=3.9"
