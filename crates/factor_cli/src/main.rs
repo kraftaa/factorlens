@@ -7197,6 +7197,7 @@ fn render_investigation_workflow_markdown(
     mode: InvestigationMode,
     data: &InvestigationRenderData<'_>,
 ) -> String {
+    let md_cell = |v: &str| v.replace('|', "\\|").replace('\n', " ");
     let mut md = String::new();
     md.push_str("# Investigation Report\n\n");
     md.push_str(&format!("- Question: {}\n", args.question));
@@ -7265,6 +7266,52 @@ fn render_investigation_workflow_markdown(
                 step0.top5_concentration_delta_pp
             ));
         }
+        md.push_str(
+            "- Concentration is record-share concentration for this grouping dimension (share of rows captured by largest segments).\n",
+        );
+        md.push('\n');
+        md.push_str("### Concentration snapshot (record-share)\n\n");
+        md.push_str("| Measure | Base | New | Delta |\n");
+        md.push_str("|---|---:|---:|---:|\n");
+        md.push_str(&format!(
+            "| Top-1 concentration | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            step0.top1_concentration_base_pct,
+            step0.top1_concentration_new_pct,
+            step0.top1_concentration_delta_pp
+        ));
+        md.push_str(&format!(
+            "| Top-5 concentration | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            step0.top5_concentration_base_pct,
+            step0.top5_concentration_new_pct,
+            step0.top5_concentration_delta_pp
+        ));
+        md.push('\n');
+
+        if !step0.movers.is_empty() {
+            md.push_str("### Top-level movers (top 5)\n\n");
+            md.push_str("| # | Segment | Base share | New share | Delta share | Delta metric |\n");
+            md.push_str("|---:|---|---:|---:|---:|---:|\n");
+            for (idx, mover) in step0.movers.iter().take(5).enumerate() {
+                md.push_str(&format!(
+                    "| {} | {} | {:.2}% | {:.2}% | {:+.2} pp | {} |\n",
+                    idx + 1,
+                    md_cell(&mover.segment),
+                    mover.base_share_pct,
+                    mover.new_share_pct,
+                    mover.delta_share_pp,
+                    signed_fmt_num(mover.delta_primary_metric_value, 2)
+                ));
+            }
+            if step0.segment_count > step0.movers.len() {
+                md.push_str(&format!(
+                    "\n_Note: showing {} movers ({} total segments in this scope; tune `--top-movers` to expand)._\
+\n",
+                    step0.movers.len(),
+                    step0.segment_count
+                ));
+            }
+            md.push('\n');
+        }
         md.push('\n');
     }
 
@@ -7321,6 +7368,34 @@ fn render_investigation_workflow_markdown(
                         top.delta_share_pp
                     ));
                 }
+            }
+        }
+        md.push('\n');
+        md.push_str("### Follow-up strongest movers table\n\n");
+        md.push_str(
+            "| Depth | Scope | Grouped by | Strongest mover | Delta metric | Delta share |\n",
+        );
+        md.push_str("|---:|---|---|---|---:|---:|\n");
+        for step in data.steps.iter().skip(1) {
+            if let Some(top) = step.movers.first() {
+                let scope_txt = if step.scope.is_empty() {
+                    "global".to_string()
+                } else {
+                    step.scope
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {:+.2} pp |\n",
+                    step.depth,
+                    md_cell(&scope_txt),
+                    md_cell(&step.dimension),
+                    md_cell(&top.segment),
+                    signed_fmt_num(top.delta_primary_metric_value, 2),
+                    top.delta_share_pp
+                ));
             }
         }
     }
@@ -11746,9 +11821,122 @@ Further drill-down stopped at max depth.
             &evidence
         ));
     }
+
+    #[test]
+    fn build_analysis_evidence_supports_investigate_schema() {
+        let v = serde_json::json!({
+            "question": "Why did revenue change?",
+            "mode": "change_drivers",
+            "stopping_reason": "reached max depth 3",
+            "recommended_next_question": "Drill into provider",
+            "major_global_changes": [
+                {
+                    "dimension": "organization_name",
+                    "segment": "Acme",
+                    "primary_metric": "revenue_usd",
+                    "delta_primary_metric_value": -1200.5,
+                    "delta_share_pp": 2.3
+                }
+            ],
+            "steps": [
+                {
+                    "depth": 0,
+                    "dimension": "region",
+                    "primary_metric": "revenue_usd",
+                    "segment_count": 6,
+                    "top1_concentration_base_pct": 35.0,
+                    "top1_concentration_new_pct": 42.0,
+                    "top1_concentration_delta_pp": 7.0,
+                    "top5_concentration_base_pct": 88.0,
+                    "top5_concentration_new_pct": 91.0,
+                    "top5_concentration_delta_pp": 3.0,
+                    "movers": [
+                        {
+                            "segment": "US",
+                            "base_primary_metric_value": 10000.0,
+                            "new_primary_metric_value": 12000.0,
+                            "delta_primary_metric_value": 2000.0,
+                            "delta_share_pp": 5.5
+                        }
+                    ]
+                }
+            ]
+        });
+        let evidence = build_analysis_evidence(&v);
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.contains("schema") || e.contains("investigate mode")),
+            "missing investigate summary evidence: {:?}",
+            evidence
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.contains("major_change") && e.contains("Acme")),
+            "missing major change evidence: {:?}",
+            evidence
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.contains("top_level_strongest") && e.contains("US")),
+            "missing top-level strongest mover evidence: {:?}",
+            evidence
+        );
+    }
+
+    #[test]
+    fn build_analysis_prompt_context_marks_investigate_schema() {
+        let v = serde_json::json!({
+            "question": "Why did revenue change?",
+            "mode": "change_drivers",
+            "planner": "deterministic",
+            "stopping_reason": "reached max depth 2",
+            "steps": []
+        });
+        let context = build_analysis_prompt_context(&v, &["sample evidence".to_string()]);
+        assert!(context.contains("schema=investigate"));
+        assert!(context.contains("mode=change_drivers"));
+    }
 }
 
 fn build_analysis_prompt_context(v: &serde_json::Value, evidence: &[String]) -> String {
+    if is_investigate_analysis_json(v) {
+        let question = v
+            .get("question")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
+        let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("unknown");
+        let planner = v
+            .get("planner")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
+        let steps = v
+            .get("steps")
+            .and_then(|x| x.as_array())
+            .map(|xs| xs.len())
+            .unwrap_or(0);
+        let stop_reason = v
+            .get("stopping_reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
+        let evidence_block = if evidence.is_empty() {
+            "none".to_string()
+        } else {
+            evidence
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("[E{}] {}", i + 1, s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return format!(
+            "schema=investigate | question={} | mode={} | planner={} | steps={} | stopping_reason={}\nevidence:\n{}",
+            question, mode, planner, steps, stop_reason, evidence_block
+        );
+    }
+
     let records = v.get("records").and_then(|x| x.as_u64()).unwrap_or(0);
     let segments = v.get("segments").and_then(|x| x.as_u64()).unwrap_or(0);
     let group_by = v
@@ -11804,6 +11992,10 @@ fn build_analysis_prompt_context(v: &serde_json::Value, evidence: &[String]) -> 
 }
 
 fn build_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
+    if is_investigate_analysis_json(v) {
+        return build_investigate_analysis_evidence(v);
+    }
+
     let mut out = Vec::new();
     let top_groups = v
         .get("groups")
@@ -11850,6 +12042,236 @@ fn build_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
         }
     }
 
+    out
+}
+
+fn is_investigate_analysis_json(v: &serde_json::Value) -> bool {
+    v.get("steps").and_then(|x| x.as_array()).is_some()
+}
+
+fn investigate_scope_to_text(scope: &serde_json::Value) -> String {
+    let Some(items) = scope.as_array() else {
+        return "global".to_string();
+    };
+    let mut parts = Vec::<String>::new();
+    for item in items {
+        let Some(pair) = item.as_array() else {
+            continue;
+        };
+        if pair.len() < 2 {
+            continue;
+        }
+        let Some(k) = pair.first().and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(v) = pair.get(1).and_then(|x| x.as_str()) else {
+            continue;
+        };
+        parts.push(format!("{}={}", k, v));
+    }
+    if parts.is_empty() {
+        "global".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn build_investigate_analysis_evidence(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("unknown");
+    let question = v
+        .get("question")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown");
+    out.push(format!(
+        "investigate mode='{}' question='{}'",
+        mode, question
+    ));
+
+    let steps = v
+        .get("steps")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(step0) = steps.first() {
+        let dimension = step0
+            .get("dimension")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(unknown)");
+        let metric = step0
+            .get("primary_metric")
+            .and_then(|x| x.as_str())
+            .unwrap_or("primary_metric");
+        let segment_count = step0
+            .get("segment_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let top1_base = step0
+            .get("top1_concentration_base_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let top1_new = step0
+            .get("top1_concentration_new_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let top1_delta = step0
+            .get("top1_concentration_delta_pp")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let top5_base = step0
+            .get("top5_concentration_base_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let top5_new = step0
+            .get("top5_concentration_new_pct")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let top5_delta = step0
+            .get("top5_concentration_delta_pp")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+
+        let movers = step0
+            .get("movers")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let base_total = movers
+            .iter()
+            .map(|m| {
+                m.get("base_primary_metric_value")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0)
+            })
+            .sum::<f64>();
+        let new_total = movers
+            .iter()
+            .map(|m| {
+                m.get("new_primary_metric_value")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0)
+            })
+            .sum::<f64>();
+        out.push(format!(
+            "top_level grouped_by='{}' segments={} {} base_total={} new_total={} delta={} top1_base_pct={:.2} top1_new_pct={:.2} top1_delta_pp={:+.2} top5_base_pct={:.2} top5_new_pct={:.2} top5_delta_pp={:+.2}",
+            dimension,
+            segment_count,
+            metric,
+            fmt_num(base_total, 2),
+            fmt_num(new_total, 2),
+            signed_fmt_num(new_total - base_total, 2),
+            top1_base,
+            top1_new,
+            top1_delta,
+            top5_base,
+            top5_new,
+            top5_delta
+        ));
+
+        if let Some(top) = movers.first() {
+            let segment = top
+                .get("segment")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(unknown)");
+            let delta_metric = top
+                .get("delta_primary_metric_value")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let delta_share = top
+                .get("delta_share_pp")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            out.push(format!(
+                "top_level_strongest segment='{}' delta_{}={} delta_share_pp={:+.2}",
+                segment,
+                metric,
+                fmt_num(delta_metric, 2),
+                delta_share
+            ));
+        }
+    }
+
+    if let Some(changes) = v.get("major_global_changes").and_then(|x| x.as_array()) {
+        for change in changes.iter().take(3) {
+            let dim = change
+                .get("dimension")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(unknown)");
+            let seg = change
+                .get("segment")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(unknown)");
+            let metric = change
+                .get("primary_metric")
+                .and_then(|x| x.as_str())
+                .unwrap_or("primary_metric");
+            let delta_metric = change
+                .get("delta_primary_metric_value")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let delta_share = change
+                .get("delta_share_pp")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            out.push(format!(
+                "major_change dimension='{}' segment='{}' delta_{}={} delta_share_pp={:+.2}",
+                dim,
+                seg,
+                metric,
+                fmt_num(delta_metric, 2),
+                delta_share
+            ));
+        }
+    }
+
+    for step in steps.iter().skip(1).take(4) {
+        let depth = step.get("depth").and_then(|x| x.as_u64()).unwrap_or(0);
+        let dimension = step
+            .get("dimension")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(unknown)");
+        let metric = step
+            .get("primary_metric")
+            .and_then(|x| x.as_str())
+            .unwrap_or("primary_metric");
+        let scope =
+            investigate_scope_to_text(step.get("scope").unwrap_or(&serde_json::Value::Null));
+        let mover = step
+            .get("movers")
+            .and_then(|x| x.as_array())
+            .and_then(|xs| xs.first());
+        if let Some(top) = mover {
+            let segment = top
+                .get("segment")
+                .and_then(|x| x.as_str())
+                .unwrap_or("(unknown)");
+            let delta_metric = top
+                .get("delta_primary_metric_value")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let delta_share = top
+                .get("delta_share_pp")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            out.push(format!(
+                "follow_up depth={} scope='{}' grouped_by='{}' strongest='{}' delta_{}={} delta_share_pp={:+.2}",
+                depth,
+                scope,
+                dimension,
+                segment,
+                metric,
+                fmt_num(delta_metric, 2),
+                delta_share
+            ));
+        }
+    }
+
+    if let Some(stop) = v.get("stopping_reason").and_then(|x| x.as_str()) {
+        out.push(format!("stop_reason='{}'", stop));
+    }
+    if let Some(next_q) = v.get("recommended_next_question").and_then(|x| x.as_str()) {
+        out.push(format!("recommended_next='{}'", next_q));
+    }
     out
 }
 
