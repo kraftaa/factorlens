@@ -4708,7 +4708,10 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
                 args.max_branches,
             );
             if candidates.is_empty() {
-                if args.min_delta_abs > 0.0 && had_base_candidates {
+                if mode != InvestigationMode::ConcentrationDrivers
+                    && args.min_delta_abs > 0.0
+                    && had_base_candidates
+                {
                     saw_low_delta_abs = true;
                 }
                 continue;
@@ -4763,7 +4766,10 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
                 let Some((next_dimension, child_step, _, _, child_delta_abs)) = best_next else {
                     continue;
                 };
-                if args.min_delta_abs > 0.0 && child_delta_abs + f64::EPSILON < args.min_delta_abs {
+                if mode != InvestigationMode::ConcentrationDrivers
+                    && args.min_delta_abs > 0.0
+                    && child_delta_abs + f64::EPSILON < args.min_delta_abs
+                {
                     saw_low_delta_abs = true;
                     continue;
                 }
@@ -5092,7 +5098,7 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
             } => {
                 let step =
                     investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
-                if args.min_delta_abs > 0.0 {
+                if mode != InvestigationMode::ConcentrationDrivers && args.min_delta_abs > 0.0 {
                     let current_delta_abs = top_step_delta_abs(&step);
                     if current_delta_abs + f64::EPSILON < args.min_delta_abs {
                         stop_reason = Some(format!(
@@ -5163,7 +5169,7 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
             } => {
                 let step =
                     investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
-                if args.min_delta_abs > 0.0 {
+                if mode != InvestigationMode::ConcentrationDrivers && args.min_delta_abs > 0.0 {
                     let current_delta_abs = top_step_delta_abs(&step);
                     if current_delta_abs + f64::EPSILON < args.min_delta_abs {
                         stop_reason = Some(format!(
@@ -7148,7 +7154,8 @@ fn select_drill_candidates(
         .iter()
         .filter(|m| {
             drill_candidate_matches_base_thresholds(m, mode, min_contribution, min_slice_rows)
-                && m.delta_primary_metric_value.abs() + f64::EPSILON >= min_delta_abs
+                && (mode == InvestigationMode::ConcentrationDrivers
+                    || m.delta_primary_metric_value.abs() + f64::EPSILON >= min_delta_abs)
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| {
@@ -7585,12 +7592,19 @@ fn build_branch_summary_rows(
         return Vec::new();
     }
 
-    let Some(root_step) = steps.first() else {
+    let Some(_root_step) = steps.first() else {
         return Vec::new();
     };
-    let mut root_score_by_segment = HashMap::<String, f64>::new();
-    for mover in &root_step.movers {
-        root_score_by_segment.insert(mover.segment.clone(), mover_score(mover, mode));
+    let mut root_score_by_dim_segment = HashMap::<(String, String), f64>::new();
+    for step in steps.iter().filter(|s| s.scope.is_empty()) {
+        for mover in &step.movers {
+            let key = (step.dimension.clone(), mover.segment.clone());
+            let score = mover_score(mover, mode);
+            let entry = root_score_by_dim_segment.entry(key).or_insert(score);
+            if score > *entry {
+                *entry = score;
+            }
+        }
     }
 
     let mut rows = HashMap::<String, InvestigationBranchSummaryRow>::new();
@@ -7605,10 +7619,10 @@ fn build_branch_summary_rows(
             .unwrap_or_else(|| "(none)".to_string());
         let step_delta = top.map(|m| m.delta_primary_metric_value).unwrap_or(0.0);
         let key = format!("{}={}", first_dim, first_segment);
-        let root_score = root_score_by_segment
-            .get(first_segment)
+        let root_score = root_score_by_dim_segment
+            .get(&(first_dim.clone(), first_segment.clone()))
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or(step_score);
 
         let candidate = InvestigationBranchSummaryRow {
             root_dimension: first_dim.clone(),
@@ -11401,6 +11415,136 @@ drill_fields = ["channel", "channel", "product_line", "CHANNEL"]
             blocked_by_delta.is_empty(),
             "expected min_delta_abs threshold to block selection"
         );
+
+        let concentration_ignores_delta_abs = select_drill_candidates(
+            &step,
+            InvestigationMode::ConcentrationDrivers,
+            1.0,
+            100.0,
+            10,
+            2,
+        );
+        assert_eq!(
+            concentration_ignores_delta_abs.len(),
+            1,
+            "concentration mode should not filter by min_delta_abs"
+        );
+    }
+
+    #[test]
+    fn build_branch_summary_rows_uses_dimension_scoped_root_scores() {
+        let steps = vec![
+            InvestigationStep {
+                depth: 0,
+                dimension: "region".to_string(),
+                scope: vec![],
+                primary_metric: "revenue_usd".to_string(),
+                base_records: 100,
+                new_records: 100,
+                segment_count: 2,
+                top5_concentration_base_pct: 100.0,
+                top5_concentration_new_pct: 100.0,
+                top5_concentration_delta_pp: 0.0,
+                top1_concentration_base_pct: 60.0,
+                top1_concentration_new_pct: 62.0,
+                top1_concentration_delta_pp: 2.0,
+                movers: vec![
+                    InvestigationMover {
+                        segment: "US".to_string(),
+                        base_records: 60,
+                        new_records: 62,
+                        base_share_pct: 60.0,
+                        new_share_pct: 62.0,
+                        delta_share_pp: 2.0,
+                        base_primary_metric_value: 1_000.0,
+                        new_primary_metric_value: 1_200.0,
+                        delta_primary_metric_value: 200.0,
+                    },
+                    InvestigationMover {
+                        segment: "EU".to_string(),
+                        base_records: 40,
+                        new_records: 38,
+                        base_share_pct: 40.0,
+                        new_share_pct: 38.0,
+                        delta_share_pp: -2.0,
+                        base_primary_metric_value: 900.0,
+                        new_primary_metric_value: 850.0,
+                        delta_primary_metric_value: -50.0,
+                    },
+                ],
+            },
+            InvestigationStep {
+                depth: 1,
+                dimension: "discipline".to_string(),
+                scope: vec![],
+                primary_metric: "revenue_usd".to_string(),
+                base_records: 100,
+                new_records: 100,
+                segment_count: 2,
+                top5_concentration_base_pct: 100.0,
+                top5_concentration_new_pct: 100.0,
+                top5_concentration_delta_pp: 0.0,
+                top1_concentration_base_pct: 55.0,
+                top1_concentration_new_pct: 58.0,
+                top1_concentration_delta_pp: 3.0,
+                movers: vec![
+                    InvestigationMover {
+                        segment: "Medical".to_string(),
+                        base_records: 55,
+                        new_records: 58,
+                        base_share_pct: 55.0,
+                        new_share_pct: 58.0,
+                        delta_share_pp: 3.0,
+                        base_primary_metric_value: 1_100.0,
+                        new_primary_metric_value: 1_300.0,
+                        delta_primary_metric_value: 200.0,
+                    },
+                    InvestigationMover {
+                        segment: "Bio".to_string(),
+                        base_records: 45,
+                        new_records: 42,
+                        base_share_pct: 45.0,
+                        new_share_pct: 42.0,
+                        delta_share_pp: -3.0,
+                        base_primary_metric_value: 800.0,
+                        new_primary_metric_value: 700.0,
+                        delta_primary_metric_value: -100.0,
+                    },
+                ],
+            },
+            InvestigationStep {
+                depth: 2,
+                dimension: "category".to_string(),
+                scope: vec![("discipline".to_string(), "Medical".to_string())],
+                primary_metric: "revenue_usd".to_string(),
+                base_records: 58,
+                new_records: 58,
+                segment_count: 2,
+                top5_concentration_base_pct: 100.0,
+                top5_concentration_new_pct: 100.0,
+                top5_concentration_delta_pp: 0.0,
+                top1_concentration_base_pct: 70.0,
+                top1_concentration_new_pct: 72.0,
+                top1_concentration_delta_pp: 2.0,
+                movers: vec![InvestigationMover {
+                    segment: "Oncology".to_string(),
+                    base_records: 40,
+                    new_records: 42,
+                    base_share_pct: 70.0,
+                    new_share_pct: 72.0,
+                    delta_share_pp: 2.0,
+                    base_primary_metric_value: 700.0,
+                    new_primary_metric_value: 880.0,
+                    delta_primary_metric_value: 180.0,
+                }],
+            },
+        ];
+
+        let rows = build_branch_summary_rows(&steps, InvestigationMode::ChangeDrivers, 3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root_dimension, "discipline");
+        assert_eq!(rows[0].root_segment, "Medical");
+        assert_eq!(rows[0].root_score, 200.0);
     }
 
     #[test]
