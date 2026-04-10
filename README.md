@@ -126,22 +126,34 @@ Practical rule:
 ## How `investigate` Works
 
 At a high level, `investigate`:
-1. Runs a top-level compare and ranks movers.
-2. Drills into strongest candidates.
-3. Stops by guardrails (`max_depth`, `min_contribution`, `min_score_improvement`, `min_slice_rows`).
-4. Writes report + JSON trace.
+1. Builds two comparable slices (base/new files, JSON artifacts, or period windows from query).
+2. Routes mode from question (unless `--mode` is explicit), then runs top-level compare.
+3. Ranks strongest movers and keeps branch candidates (`max_branches`, `top_movers`).
+4. Drills down branch-by-branch (deterministic planner, or LLM planner with validation + fallback).
+5. Stops each branch with guardrails (`max_depth`, `min_contribution`, `min_delta_abs`, `min_score_improvement`, `min_slice_rows`, no next dimension).
+6. Writes Markdown + JSON with top-level tables, follow-up table, major global changes, coverage, branch graph, and decision trace.
 
 ```mermaid
 flowchart TD
-    A["Top-level compare"] --> B["Rank movers (top_movers)"]
-    B --> C{"candidate score >= min_contribution?"}
-    C -- no --> S1["Stop branch"]
-    C -- yes --> D["Drill on next dimension"]
-    D --> E{"improvement >= min_score_improvement?"}
-    E -- no --> S2["Stop branch"]
-    E -- yes --> F{"depth < max_depth and rows >= min_slice_rows?"}
-    F -- no --> S3["Stop branch"]
-    F -- yes --> B
+    A["Build comparable inputs (base/new or query windows)"] --> B["Select mode (question router or --mode)"]
+    B --> C["Run top-level compare on first dimension"]
+    C --> D["Rank movers and seed branch candidates"]
+    D --> E{"Any candidate passes min_contribution?"}
+    E -- "No" --> Z["Stop: no viable branch"]
+    E -- "Yes" --> F["Pick branch candidate(s) up to max_branches"]
+    F --> G{"Planner"}
+    G -- "deterministic" --> H["Choose next dimension from drill_fields"]
+    G -- "llm" --> I["LLM proposes action -> validate -> fallback if invalid"]
+    H --> J["Run scoped compare (drill step)"]
+    I --> J
+    J --> K{"Stop checks"}
+    K -- "depth >= max_depth" --> Z2["Stop branch"]
+    K -- "rows < min_slice_rows" --> Z2
+    K -- "score improvement < min_score_improvement" --> Z2
+    K -- "no remaining dimension" --> Z2
+    K -- "continue" --> F
+    Z --> O["Finalize report + JSON"]
+    Z2 --> O
 ```
 
 ## Design Principles

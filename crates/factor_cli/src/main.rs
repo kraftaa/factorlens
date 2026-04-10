@@ -265,10 +265,12 @@ struct InvestigateWorkflowArgs {
     drill_fields: Vec<String>,
     #[arg(long, default_value_t = 2)]
     max_depth: usize,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 3)]
     max_branches: usize,
     #[arg(long, default_value_t = 5.0)]
     min_contribution: f64,
+    #[arg(long, default_value_t = 0.0)]
+    min_delta_abs: f64,
     #[arg(long, default_value_t = 0.0)]
     min_score_improvement: f64,
     #[arg(long, default_value_t = 5)]
@@ -4576,6 +4578,9 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
     if args.top_movers < 1 {
         return Err(anyhow!("--top-movers must be >= 1"));
     }
+    if args.min_delta_abs < 0.0 {
+        return Err(anyhow!("--min-delta-abs must be >= 0"));
+    }
     if args.min_score_improvement < 0.0 {
         return Err(anyhow!("--min-score-improvement must be >= 0"));
     }
@@ -4675,6 +4680,7 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
         let mut saw_next_dimension = false;
         let mut saw_eligible_candidate = false;
         let mut saw_composite_segment = false;
+        let mut saw_low_delta_abs = false;
         let mut saw_low_improvement = false;
 
         for parent_step in &frontier {
@@ -4685,14 +4691,26 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
             }
             saw_next_dimension = true;
 
+            let had_base_candidates = parent_step.movers.iter().any(|m| {
+                drill_candidate_matches_base_thresholds(
+                    m,
+                    mode,
+                    args.min_contribution,
+                    args.min_slice_rows,
+                )
+            });
             let candidates = select_drill_candidates(
                 parent_step,
                 mode,
                 args.min_contribution,
+                args.min_delta_abs,
                 args.min_slice_rows,
                 args.max_branches,
             );
             if candidates.is_empty() {
+                if args.min_delta_abs > 0.0 && had_base_candidates {
+                    saw_low_delta_abs = true;
+                }
                 continue;
             }
             saw_eligible_candidate = true;
@@ -4705,7 +4723,8 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
 
                 let mut child_scope = parent_step.scope.clone();
                 child_scope.push((parent_step.dimension.clone(), mover.segment.clone()));
-                let mut best_next: Option<(String, InvestigationStep, f64)> = None;
+                let parent_score = mover_score(mover, mode);
+                let mut best_next: Option<(String, InvestigationStep, f64, f64, f64)> = None;
                 for next_dimension in &remaining_dimensions {
                     let step = investigation_step_from_inputs(
                         &args,
@@ -4719,22 +4738,35 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
                         .first()
                         .map(|m| mover_score(m, mode))
                         .unwrap_or(0.0);
+                    let delta_abs = top_step_delta_abs(&step);
+                    let gain = score - parent_score;
                     let replace = match &best_next {
                         None => true,
-                        Some((best_dim, _, best_score)) => {
-                            score > *best_score
-                                || ((score - *best_score).abs() <= f64::EPSILON
+                        Some((best_dim, _, best_score, best_gain, best_delta_abs)) => {
+                            gain > *best_gain + f64::EPSILON
+                                || ((gain - *best_gain).abs() <= f64::EPSILON
+                                    && (delta_abs > *best_delta_abs + f64::EPSILON
+                                        || ((delta_abs - *best_delta_abs).abs() <= f64::EPSILON
+                                            && (score > *best_score + f64::EPSILON
+                                                || ((score - *best_score).abs() <= f64::EPSILON
+                                                    && next_dimension < best_dim)))))
+                                || ((gain - *best_gain).abs() <= f64::EPSILON
+                                    && (delta_abs - *best_delta_abs).abs() <= f64::EPSILON
+                                    && (score - *best_score).abs() <= f64::EPSILON
                                     && next_dimension < best_dim)
                         }
                     };
                     if replace {
-                        best_next = Some((next_dimension.clone(), step, score));
+                        best_next = Some((next_dimension.clone(), step, score, gain, delta_abs));
                     }
                 }
-                let Some((next_dimension, child_step, _)) = best_next else {
+                let Some((next_dimension, child_step, _, _, child_delta_abs)) = best_next else {
                     continue;
                 };
-                let parent_score = mover_score(mover, mode);
+                if args.min_delta_abs > 0.0 && child_delta_abs + f64::EPSILON < args.min_delta_abs {
+                    saw_low_delta_abs = true;
+                    continue;
+                }
                 let child_score = top_step_score(&child_step, mode);
                 if args.min_score_improvement > 0.0
                     && child_score + f64::EPSILON < parent_score + args.min_score_improvement
@@ -4776,6 +4808,11 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
         if !expanded {
             if !saw_next_dimension {
                 stop_reason = Some("no remaining drill dimension was available".to_string());
+            } else if saw_low_delta_abs {
+                stop_reason = Some(format!(
+                    "no drill candidate met absolute-delta threshold (min_delta_abs={})",
+                    fmt_num(args.min_delta_abs, 2)
+                ));
             } else if saw_low_improvement {
                 stop_reason = Some(format!(
                     "no drill candidate met score-improvement threshold (min_score_improvement={})",
@@ -4845,6 +4882,7 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
             "max_depth": args.max_depth,
             "max_branches": args.max_branches,
             "min_contribution": args.min_contribution,
+            "min_delta_abs": args.min_delta_abs,
             "min_score_improvement": args.min_score_improvement,
             "min_slice_rows": args.min_slice_rows,
             "top_movers": args.top_movers,
@@ -4902,6 +4940,9 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
     }
     if args.top_movers < 1 {
         return Err(anyhow!("--top-movers must be >= 1"));
+    }
+    if args.min_delta_abs < 0.0 {
+        return Err(anyhow!("--min-delta-abs must be >= 0"));
     }
     if args.min_score_improvement < 0.0 {
         return Err(anyhow!("--min-score-improvement must be >= 0"));
@@ -5051,6 +5092,27 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
             } => {
                 let step =
                     investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
+                if args.min_delta_abs > 0.0 {
+                    let current_delta_abs = top_step_delta_abs(&step);
+                    if current_delta_abs + f64::EPSILON < args.min_delta_abs {
+                        stop_reason = Some(format!(
+                            "no planned step met absolute-delta threshold (min_delta_abs={})",
+                            fmt_num(args.min_delta_abs, 2)
+                        ));
+                        trace.push(InvestigationTraceStep {
+                            depth,
+                            action: "stop".to_string(),
+                            decision: format!(
+                                "planned analyze_compare did not meet absolute delta threshold (current_abs={}, required={})",
+                                fmt_num(current_delta_abs, 2),
+                                fmt_num(args.min_delta_abs, 2)
+                            ),
+                            scope,
+                            stopping_reason: stop_reason.clone(),
+                        });
+                        break;
+                    }
+                }
                 if args.min_score_improvement > 0.0 {
                     if let Some(prev_step) = steps.last() {
                         let prev_score = top_step_score(prev_step, mode);
@@ -5101,6 +5163,27 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
             } => {
                 let step =
                     investigation_step_from_inputs(&args, &input_refs, &group_by, &scope, mode)?;
+                if args.min_delta_abs > 0.0 {
+                    let current_delta_abs = top_step_delta_abs(&step);
+                    if current_delta_abs + f64::EPSILON < args.min_delta_abs {
+                        stop_reason = Some(format!(
+                            "no planned step met absolute-delta threshold (min_delta_abs={})",
+                            fmt_num(args.min_delta_abs, 2)
+                        ));
+                        trace.push(InvestigationTraceStep {
+                            depth,
+                            action: "stop".to_string(),
+                            decision: format!(
+                                "planned drill_down did not meet absolute delta threshold (current_abs={}, required={})",
+                                fmt_num(current_delta_abs, 2),
+                                fmt_num(args.min_delta_abs, 2)
+                            ),
+                            scope,
+                            stopping_reason: stop_reason.clone(),
+                        });
+                        break;
+                    }
+                }
                 if args.min_score_improvement > 0.0 {
                     if let Some(prev_step) = steps.last() {
                         let prev_score = top_step_score(prev_step, mode);
@@ -5214,6 +5297,7 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
             "max_depth": args.max_depth,
             "max_branches": args.max_branches,
             "min_contribution": args.min_contribution,
+            "min_delta_abs": args.min_delta_abs,
             "min_score_improvement": args.min_score_improvement,
             "min_slice_rows": args.min_slice_rows,
             "top_movers": args.top_movers,
@@ -5351,6 +5435,7 @@ fn llm_plan_next_action(
             "max_depth": args.max_depth,
             "input_kind": investigate_input_kind_label(input_kind),
             "min_contribution": args.min_contribution,
+            "min_delta_abs": args.min_delta_abs,
             "min_score_improvement": args.min_score_improvement,
             "min_slice_rows": args.min_slice_rows,
             "required_metric": args.metric
@@ -5945,10 +6030,16 @@ fn deterministic_fallback_action(
             };
         }
     };
-    let candidate =
-        select_drill_candidates(last, mode, args.min_contribution, args.min_slice_rows, 1)
-            .into_iter()
-            .find(|m| !m.segment.contains(" | ") && m.segment != "(blank)");
+    let candidate = select_drill_candidates(
+        last,
+        mode,
+        args.min_contribution,
+        args.min_delta_abs,
+        args.min_slice_rows,
+        1,
+    )
+    .into_iter()
+    .find(|m| !m.segment.contains(" | ") && m.segment != "(blank)");
     let Some(mover) = candidate else {
         return InvestigationExecAction::Stop {
             reason: "fallback stop: no eligible drill candidate".to_string(),
@@ -7048,6 +7139,7 @@ fn select_drill_candidates(
     step: &InvestigationStep,
     mode: InvestigationMode,
     min_contribution: f64,
+    min_delta_abs: f64,
     min_slice_rows: u64,
     branch_limit: usize,
 ) -> Vec<&InvestigationMover> {
@@ -7055,11 +7147,8 @@ fn select_drill_candidates(
         .movers
         .iter()
         .filter(|m| {
-            !m.segment.trim().is_empty()
-                && m.segment != "(blank)"
-                && m.segment != "(unknown)"
-                && m.base_records.max(m.new_records) >= min_slice_rows
-                && mover_score(m, mode) >= min_contribution
+            drill_candidate_matches_base_thresholds(m, mode, min_contribution, min_slice_rows)
+                && m.delta_primary_metric_value.abs() + f64::EPSILON >= min_delta_abs
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| {
@@ -7094,10 +7183,30 @@ fn mover_score(mover: &InvestigationMover, mode: InvestigationMode) -> f64 {
     }
 }
 
+fn drill_candidate_matches_base_thresholds(
+    mover: &InvestigationMover,
+    mode: InvestigationMode,
+    min_contribution: f64,
+    min_slice_rows: u64,
+) -> bool {
+    !mover.segment.trim().is_empty()
+        && mover.segment != "(blank)"
+        && mover.segment != "(unknown)"
+        && mover.base_records.max(mover.new_records) >= min_slice_rows
+        && mover_score(mover, mode) >= min_contribution
+}
+
 fn top_step_score(step: &InvestigationStep, mode: InvestigationMode) -> f64 {
     step.movers
         .first()
         .map(|m| mover_score(m, mode))
+        .unwrap_or(0.0)
+}
+
+fn top_step_delta_abs(step: &InvestigationStep) -> f64 {
+    step.movers
+        .first()
+        .map(|m| m.delta_primary_metric_value.abs())
         .unwrap_or(0.0)
 }
 
@@ -7455,6 +7564,94 @@ struct InvestigationInputLabels<'a> {
     new: &'a str,
 }
 
+#[derive(Debug, Clone)]
+struct InvestigationBranchSummaryRow {
+    root_dimension: String,
+    root_segment: String,
+    root_score: f64,
+    deepest_depth: usize,
+    deepest_dimension: String,
+    deepest_segment: String,
+    deepest_delta_primary_metric_value: f64,
+    deepest_score: f64,
+}
+
+fn build_branch_summary_rows(
+    steps: &[InvestigationStep],
+    mode: InvestigationMode,
+    limit: usize,
+) -> Vec<InvestigationBranchSummaryRow> {
+    if steps.len() <= 1 || limit == 0 {
+        return Vec::new();
+    }
+
+    let Some(root_step) = steps.first() else {
+        return Vec::new();
+    };
+    let mut root_score_by_segment = HashMap::<String, f64>::new();
+    for mover in &root_step.movers {
+        root_score_by_segment.insert(mover.segment.clone(), mover_score(mover, mode));
+    }
+
+    let mut rows = HashMap::<String, InvestigationBranchSummaryRow>::new();
+    for step in steps.iter().skip(1) {
+        let Some((first_dim, first_segment)) = step.scope.first() else {
+            continue;
+        };
+        let top = step.movers.first();
+        let step_score = top.map(|m| mover_score(m, mode)).unwrap_or(0.0);
+        let step_segment = top
+            .map(|m| m.segment.clone())
+            .unwrap_or_else(|| "(none)".to_string());
+        let step_delta = top.map(|m| m.delta_primary_metric_value).unwrap_or(0.0);
+        let key = format!("{}={}", first_dim, first_segment);
+        let root_score = root_score_by_segment
+            .get(first_segment)
+            .copied()
+            .unwrap_or(0.0);
+
+        let candidate = InvestigationBranchSummaryRow {
+            root_dimension: first_dim.clone(),
+            root_segment: first_segment.clone(),
+            root_score,
+            deepest_depth: step.depth,
+            deepest_dimension: step.dimension.clone(),
+            deepest_segment: step_segment,
+            deepest_delta_primary_metric_value: step_delta,
+            deepest_score: step_score,
+        };
+
+        match rows.get(&key) {
+            None => {
+                rows.insert(key, candidate);
+            }
+            Some(existing) => {
+                let should_replace = candidate.deepest_depth > existing.deepest_depth
+                    || (candidate.deepest_depth == existing.deepest_depth
+                        && candidate.deepest_score > existing.deepest_score + f64::EPSILON);
+                if should_replace {
+                    rows.insert(key, candidate);
+                }
+            }
+        }
+    }
+
+    let mut out = rows.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        b.root_score
+            .partial_cmp(&a.root_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.deepest_score
+                    .partial_cmp(&a.deepest_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.root_segment.cmp(&b.root_segment))
+    });
+    out.truncate(limit);
+    out
+}
+
 struct InvestigationRenderData<'a> {
     major_global_changes: &'a [InvestigationMajorChange],
     coverage: &'a InvestigationCoverage,
@@ -7785,6 +7982,27 @@ fn render_investigation_workflow_markdown(
         }
     }
     md.push('\n');
+
+    let branch_summary = build_branch_summary_rows(data.steps, mode, 3);
+    if !branch_summary.is_empty() {
+        md.push_str("### Top branches (side-by-side)\n\n");
+        md.push_str("| Branch | Root scope | Root score | Deepest step | Deepest strongest mover | Deepest delta metric |\n");
+        md.push_str("|---:|---|---:|---|---|---:|\n");
+        for (idx, row) in branch_summary.iter().enumerate() {
+            md.push_str(&format!(
+                "| {} | {}={} | {} | depth {} / {} | {} | {} |\n",
+                idx + 1,
+                md_cell(&row.root_dimension),
+                md_cell(&row.root_segment),
+                fmt_num(row.root_score, 2),
+                row.deepest_depth,
+                md_cell(&row.deepest_dimension),
+                md_cell(&row.deepest_segment),
+                signed_fmt_num(row.deepest_delta_primary_metric_value, 2)
+            ));
+        }
+        md.push('\n');
+    }
 
     md.push_str("## Coverage\n\n");
     md.push_str(&format!(
@@ -8469,7 +8687,7 @@ fn apply_investigate_config(mut args: InvestigateWorkflowArgs) -> Result<Investi
                 args.max_depth = v;
             }
         }
-        if args.max_branches == 1 {
+        if args.max_branches == 3 {
             if let Some(v) = cfg.max_branches {
                 args.max_branches = v;
             }
@@ -8477,6 +8695,11 @@ fn apply_investigate_config(mut args: InvestigateWorkflowArgs) -> Result<Investi
         if (args.min_contribution - 5.0).abs() <= f64::EPSILON {
             if let Some(v) = cfg.min_contribution {
                 args.min_contribution = v;
+            }
+        }
+        if args.min_delta_abs.abs() <= f64::EPSILON {
+            if let Some(v) = cfg.min_delta_abs {
+                args.min_delta_abs = v;
             }
         }
         if args.min_score_improvement.abs() <= f64::EPSILON {
@@ -9167,6 +9390,7 @@ struct InvestigateConfigEntry {
     max_depth: Option<usize>,
     max_branches: Option<usize>,
     min_contribution: Option<f64>,
+    min_delta_abs: Option<f64>,
     min_score_improvement: Option<f64>,
     min_slice_rows: Option<u64>,
     top_movers: Option<usize>,
@@ -10471,6 +10695,7 @@ mod tests {
             max_depth: 2,
             max_branches: 2,
             min_contribution: 5.0,
+            min_delta_abs: 0.0,
             min_score_improvement: 0.0,
             min_slice_rows: 5,
             top_movers: 2,
@@ -11161,12 +11386,21 @@ drill_fields = ["channel", "channel", "product_line", "CHANNEL"]
             ],
         };
 
-        let picked = select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 50.0, 10, 2);
+        let picked =
+            select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 50.0, 0.0, 10, 2);
         assert_eq!(picked.len(), 1, "expected one eligible mover");
         assert_eq!(picked[0].segment, "West");
 
-        let none = select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 120.0, 10, 2);
+        let none =
+            select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 120.0, 0.0, 10, 2);
         assert!(none.is_empty(), "expected threshold to block selection");
+
+        let blocked_by_delta =
+            select_drill_candidates(&step, InvestigationMode::ChangeDrivers, 50.0, 100.0, 10, 2);
+        assert!(
+            blocked_by_delta.is_empty(),
+            "expected min_delta_abs threshold to block selection"
+        );
     }
 
     #[test]

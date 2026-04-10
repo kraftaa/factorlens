@@ -25,8 +25,9 @@ drill_fields = [
 ]
 
 max_depth = 5
-max_branches = 1
+max_branches = 3
 min_contribution = 1.5
+min_delta_abs = 0.0
 min_score_improvement = 0.0
 min_slice_rows = 10
 top_movers = 12

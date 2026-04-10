@@ -797,8 +797,9 @@ def investigate(
     dimensions_csv: str | None = None,
     drill_fields_csv: str | None = None,
     max_depth: int = 2,
-    max_branches: int = 1,
+    max_branches: int = 3,
     min_contribution: float = 5.0,
+    min_delta_abs: float = 0.0,
     min_score_improvement: float = 0.0,
     min_slice_rows: int = 5,
     top_movers: int = 12,
@@ -829,6 +830,8 @@ def investigate(
         raise ValueError("max_depth must be >= 1")
     if max_branches < 1:
         raise ValueError("max_branches must be >= 1")
+    if min_delta_abs < 0.0:
+        raise ValueError("min_delta_abs must be >= 0")
     if min_score_improvement < 0.0:
         raise ValueError("min_score_improvement must be >= 0")
     if min_slice_rows < 1:
@@ -897,6 +900,8 @@ def investigate(
         str(max_branches),
         "--min-contribution",
         str(min_contribution),
+        "--min-delta-abs",
+        str(min_delta_abs),
         "--min-score-improvement",
         str(min_score_improvement),
         "--min-slice-rows",

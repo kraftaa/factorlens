@@ -140,6 +140,7 @@ class InvestigateToolTests(unittest.TestCase):
                 max_depth=2,
                 max_branches=2,
                 min_contribution=7.5,
+                min_delta_abs=50000.0,
                 min_score_improvement=1.25,
                 min_slice_rows=10,
                 top_movers=15,
@@ -169,6 +170,8 @@ class InvestigateToolTests(unittest.TestCase):
                     "2",
                     "--min-contribution",
                     "7.5",
+                    "--min-delta-abs",
+                    "50000.0",
                     "--min-score-improvement",
                     "1.25",
                     "--min-slice-rows",
@@ -253,9 +256,11 @@ class InvestigateToolTests(unittest.TestCase):
                     "--max-depth",
                     "2",
                     "--max-branches",
-                    "1",
+                    "3",
                     "--min-contribution",
                     "5.0",
+                    "--min-delta-abs",
+                    "0.0",
                     "--min-score-improvement",
                     "0.0",
                     "--min-slice-rows",
@@ -335,6 +340,16 @@ class InvestigateToolTests(unittest.TestCase):
                 base="artifacts/base.json",
                 new="artifacts/new.json",
                 min_score_improvement=-0.1,
+            )
+
+    def test_investigate_rejects_negative_min_delta_abs(self):
+        with self.assertRaisesRegex(ValueError, "min_delta_abs must be >= 0"):
+            self.mod.investigate(
+                question="q",
+                out="artifacts/investigate.md",
+                base="artifacts/base.json",
+                new="artifacts/new.json",
+                min_delta_abs=-1.0,
             )
 
     def test_investigate_rejects_mixed_input_modes(self):

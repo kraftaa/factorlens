@@ -119,7 +119,9 @@ Investigate with config defaults:
   "out": "/path/to/artifacts/investigate.md",
   "profile": "default",
   "profile_config": "/path/to/profiles/investigate.example.toml",
-  "mode": "change_drivers"
+  "mode": "change_drivers",
+  "max_branches": 3,
+  "min_delta_abs": 50000
 }
 ```
 
