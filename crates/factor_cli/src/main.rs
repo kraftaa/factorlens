@@ -4273,6 +4273,56 @@ struct InvestigationMajorChange {
     score: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationCoverageStep {
+    step_index: usize,
+    depth: usize,
+    scope: Vec<(String, String)>,
+    dimension: String,
+    strongest_segment: String,
+    strongest_delta_primary_metric_value: f64,
+    strongest_delta_share_pp: f64,
+    strongest_explained_pct_of_total_delta: f64,
+    residual_delta_abs_after_step: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationCoverage {
+    total_delta_abs: f64,
+    top_level_total_delta: f64,
+    top_level_strongest_segment: Option<String>,
+    top_level_strongest_delta_abs: f64,
+    top_level_strongest_explained_pct: f64,
+    step_coverage: Vec<InvestigationCoverageStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationBranchNode {
+    id: String,
+    step_index: usize,
+    depth: usize,
+    scope: Vec<(String, String)>,
+    dimension: String,
+    primary_metric: String,
+    strongest_segment: Option<String>,
+    strongest_delta_primary_metric_value: f64,
+    strongest_delta_share_pp: f64,
+    score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationBranchEdge {
+    parent_id: String,
+    child_id: String,
+    score_improvement: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InvestigationBranchGraph {
+    nodes: Vec<InvestigationBranchNode>,
+    edges: Vec<InvestigationBranchEdge>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LlmPlannerAction {
     action: String,
@@ -4761,6 +4811,8 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
     }
 
     let recommended_next_question = recommended_next_question(mode, steps.last());
+    let coverage = build_investigation_coverage(&steps);
+    let branch_graph = build_investigation_branch_graph(&steps, mode);
     let input_labels = InvestigationInputLabels {
         base: &resolved_inputs.base_label,
         new: &resolved_inputs.new_label,
@@ -4771,6 +4823,8 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
         mode,
         &InvestigationRenderData {
             major_global_changes: &major_global_changes,
+            coverage: &coverage,
+            branch_graph: &branch_graph,
             steps: &steps,
             trace: &trace,
             stop_reason: stop_reason.as_deref().unwrap_or("stopped"),
@@ -4798,6 +4852,8 @@ fn run_investigate_workflow(args: InvestigateWorkflowArgs) -> Result<()> {
         },
         "steps": steps,
         "major_global_changes": major_global_changes,
+        "coverage": coverage,
+        "branch_graph": branch_graph,
         "trace": trace,
         "stopping_reason": stop_reason,
         "recommended_next_question": recommended_next_question
@@ -5099,6 +5155,8 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
     }
 
     let recommended_next_question = recommended_next_question(mode, steps.last());
+    let coverage = build_investigation_coverage(&steps);
+    let branch_graph = build_investigation_branch_graph(&steps, mode);
     let llm_summary = llm_finalize_summary_with_fallback(
         planner.as_ref(),
         local_fallback_planner.as_deref(),
@@ -5124,6 +5182,8 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
         mode,
         &InvestigationRenderData {
             major_global_changes: &major_global_changes,
+            coverage: &coverage,
+            branch_graph: &branch_graph,
             steps: &steps,
             trace: &trace,
             stop_reason: stop_reason.as_deref().unwrap_or("stopped"),
@@ -5161,6 +5221,8 @@ fn run_investigate_workflow_llm(args: InvestigateWorkflowArgs) -> Result<()> {
         },
         "steps": steps,
         "major_global_changes": major_global_changes,
+        "coverage": coverage,
+        "branch_graph": branch_graph,
         "trace": trace,
         "stopping_reason": stop_reason,
         "recommended_next_question": recommended_next_question,
@@ -7039,6 +7101,202 @@ fn top_step_score(step: &InvestigationStep, mode: InvestigationMode) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn step_total_delta(step: &InvestigationStep) -> f64 {
+    let base_total = step
+        .movers
+        .iter()
+        .map(|m| m.base_primary_metric_value)
+        .sum::<f64>();
+    let new_total = step
+        .movers
+        .iter()
+        .map(|m| m.new_primary_metric_value)
+        .sum::<f64>();
+    new_total - base_total
+}
+
+fn build_investigation_coverage(steps: &[InvestigationStep]) -> InvestigationCoverage {
+    let top_level_total_delta = steps.first().map(step_total_delta).unwrap_or(0.0);
+    let total_delta_abs = top_level_total_delta.abs();
+    let top_mover = steps
+        .first()
+        .and_then(|s| s.movers.first())
+        .map(|m| (m.segment.clone(), m.delta_primary_metric_value.abs()))
+        .unwrap_or_else(|| ("".to_string(), 0.0));
+    let top_level_strongest_explained_pct = if total_delta_abs <= f64::EPSILON {
+        0.0
+    } else {
+        (top_mover.1 / total_delta_abs) * 100.0
+    };
+
+    let mut step_coverage = Vec::<InvestigationCoverageStep>::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let Some(top) = step.movers.first() else {
+            continue;
+        };
+        let strongest_abs = top.delta_primary_metric_value.abs();
+        let strongest_explained_pct_of_total_delta = if total_delta_abs <= f64::EPSILON {
+            0.0
+        } else {
+            (strongest_abs / total_delta_abs) * 100.0
+        };
+        let residual_delta_abs_after_step = if total_delta_abs <= strongest_abs {
+            0.0
+        } else {
+            total_delta_abs - strongest_abs
+        };
+        step_coverage.push(InvestigationCoverageStep {
+            step_index: idx,
+            depth: step.depth,
+            scope: step.scope.clone(),
+            dimension: step.dimension.clone(),
+            strongest_segment: top.segment.clone(),
+            strongest_delta_primary_metric_value: top.delta_primary_metric_value,
+            strongest_delta_share_pp: top.delta_share_pp,
+            strongest_explained_pct_of_total_delta,
+            residual_delta_abs_after_step,
+        });
+    }
+
+    InvestigationCoverage {
+        total_delta_abs,
+        top_level_total_delta,
+        top_level_strongest_segment: if top_mover.0.is_empty() {
+            None
+        } else {
+            Some(top_mover.0)
+        },
+        top_level_strongest_delta_abs: top_mover.1,
+        top_level_strongest_explained_pct,
+        step_coverage,
+    }
+}
+
+fn scope_starts_with(scope: &[(String, String)], prefix: &[(String, String)]) -> bool {
+    if prefix.len() > scope.len() {
+        return false;
+    }
+    scope
+        .iter()
+        .zip(prefix.iter())
+        .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+}
+
+fn investigation_scope_key(scope: &[(String, String)]) -> String {
+    if scope.is_empty() {
+        "global".to_string()
+    } else {
+        scope
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn build_investigation_branch_graph(
+    steps: &[InvestigationStep],
+    mode: InvestigationMode,
+) -> InvestigationBranchGraph {
+    let mut nodes = Vec::<InvestigationBranchNode>::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let top = step.movers.first();
+        let strongest_segment = top.map(|m| m.segment.clone());
+        let strongest_delta_primary_metric_value =
+            top.map(|m| m.delta_primary_metric_value).unwrap_or(0.0);
+        let strongest_delta_share_pp = top.map(|m| m.delta_share_pp).unwrap_or(0.0);
+        let score = top.map(|m| mover_score(m, mode)).unwrap_or(0.0);
+        let id = format!(
+            "d{}:{}:{}",
+            step.depth,
+            step.dimension,
+            investigation_scope_key(&step.scope)
+        );
+        nodes.push(InvestigationBranchNode {
+            id,
+            step_index: idx,
+            depth: step.depth,
+            scope: step.scope.clone(),
+            dimension: step.dimension.clone(),
+            primary_metric: step.primary_metric.clone(),
+            strongest_segment,
+            strongest_delta_primary_metric_value,
+            strongest_delta_share_pp,
+            score,
+        });
+    }
+
+    let mut edges = Vec::<InvestigationBranchEdge>::new();
+    for child in &nodes {
+        if child.depth == 0 || child.scope.is_empty() {
+            continue;
+        }
+        let parent = nodes.iter().find(|candidate| {
+            candidate.depth + 1 == child.depth
+                && candidate.scope.len() + 1 == child.scope.len()
+                && scope_starts_with(&child.scope, &candidate.scope)
+                && child.scope[candidate.scope.len()].0 == candidate.dimension
+        });
+        if let Some(parent_node) = parent {
+            edges.push(InvestigationBranchEdge {
+                parent_id: parent_node.id.clone(),
+                child_id: child.id.clone(),
+                score_improvement: child.score - parent_node.score,
+            });
+        }
+    }
+
+    InvestigationBranchGraph { nodes, edges }
+}
+
+fn render_branch_graph_mermaid(branch_graph: &InvestigationBranchGraph) -> String {
+    let mut out = String::new();
+    out.push_str("```mermaid\n");
+    out.push_str("graph TD\n");
+    for node in &branch_graph.nodes {
+        let scope_txt = if node.scope.is_empty() {
+            "global".to_string()
+        } else {
+            node.scope
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let strongest = node
+            .strongest_segment
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| "(none)".to_string());
+        let label = format!(
+            "d{} | {} | scope: {} | strongest: {}",
+            node.depth, node.dimension, scope_txt, strongest
+        )
+        .replace('"', "'");
+        out.push_str(&format!("  N{}[\"{}\"]\n", node.step_index, label));
+    }
+    for edge in &branch_graph.edges {
+        let parent_idx = branch_graph
+            .nodes
+            .iter()
+            .find(|n| n.id == edge.parent_id)
+            .map(|n| n.step_index);
+        let child_idx = branch_graph
+            .nodes
+            .iter()
+            .find(|n| n.id == edge.child_id)
+            .map(|n| n.step_index);
+        if let (Some(p), Some(c)) = (parent_idx, child_idx) {
+            out.push_str(&format!(
+                "  N{} -->|{:+.2}| N{}\n",
+                p, edge.score_improvement, c
+            ));
+        }
+    }
+    out.push_str("```\n");
+    out
+}
+
 fn deterministic_drill_decision(
     parent_step: &InvestigationStep,
     mover: &InvestigationMover,
@@ -7199,6 +7457,8 @@ struct InvestigationInputLabels<'a> {
 
 struct InvestigationRenderData<'a> {
     major_global_changes: &'a [InvestigationMajorChange],
+    coverage: &'a InvestigationCoverage,
+    branch_graph: &'a InvestigationBranchGraph,
     steps: &'a [InvestigationStep],
     trace: &'a [InvestigationTraceStep],
     stop_reason: &'a str,
@@ -7525,6 +7785,47 @@ fn render_investigation_workflow_markdown(
         }
     }
     md.push('\n');
+
+    md.push_str("## Coverage\n\n");
+    md.push_str(&format!(
+        "- Total delta (`{}`) = {} (abs {}).\n",
+        data.steps
+            .first()
+            .map(|s| s.primary_metric.as_str())
+            .unwrap_or("primary_metric"),
+        signed_fmt_num(data.coverage.top_level_total_delta, 2),
+        fmt_num(data.coverage.total_delta_abs, 2)
+    ));
+    if let Some(segment) = &data.coverage.top_level_strongest_segment {
+        md.push_str(&format!(
+            "- Top-level strongest segment `{}` explains {:.2}% of total delta.\n",
+            segment, data.coverage.top_level_strongest_explained_pct
+        ));
+    }
+    if !data.coverage.step_coverage.is_empty() {
+        md.push_str("\n### Step coverage table\n\n");
+        md.push_str("| Step | Depth | Dimension | Strongest segment | Delta metric | Explained % of total | Residual abs after step |\n");
+        md.push_str("|---:|---:|---|---|---:|---:|---:|\n");
+        for c in &data.coverage.step_coverage {
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {:.2}% | {} |\n",
+                c.step_index,
+                c.depth,
+                md_cell(&c.dimension),
+                md_cell(&c.strongest_segment),
+                signed_fmt_num(c.strongest_delta_primary_metric_value, 2),
+                c.strongest_explained_pct_of_total_delta,
+                fmt_num(c.residual_delta_abs_after_step, 2)
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !data.branch_graph.nodes.is_empty() {
+        md.push_str("## Drill-down graph\n\n");
+        md.push_str(&render_branch_graph_mermaid(data.branch_graph));
+        md.push('\n');
+    }
 
     md.push_str("## Why it stopped\n\n");
     md.push_str(&format!("- {}\n\n", data.stop_reason));

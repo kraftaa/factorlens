@@ -618,6 +618,34 @@ class ReadArtifactToolTests(unittest.TestCase):
             self.mod.read_artifact("artifacts/report.md", max_chars=0)
 
 
+class ListArtifactsToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_list_artifacts_returns_recent_files(self):
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "artifacts"
+                root.mkdir(parents=True, exist_ok=True)
+                (root / "a.json").write_text("{}", encoding="utf-8")
+                (root / "b.md").write_text("# report", encoding="utf-8")
+                mod._validate_read_path = lambda _p, _label: root
+                raw = mod.list_artifacts("artifacts", suffix=".json", limit=10)
+                payload = json.loads(raw)
+                self.assertEqual(payload["ok"], True)
+                self.assertEqual(payload["count"], 1)
+                self.assertEqual(payload["files"][0]["name"], "a.json")
+        finally:
+            mod._validate_read_path = old_validate_read
+
+    def test_list_artifacts_rejects_invalid_limit(self):
+        with self.assertRaisesRegex(ValueError, "limit must be between 1 and 5000"):
+            self.mod.list_artifacts("artifacts", limit=0)
+
+
 class ServerInfoToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -773,6 +801,7 @@ class ToolGuideTests(unittest.TestCase):
         self.assertIn("investigate", methods)
         self.assertIn("analyze_investigate_legacy", methods)
         self.assertIn("summarize_investigate", methods)
+        self.assertIn("list_artifacts", methods)
         self.assertIn("read_artifact", methods)
         self.assertIn("legacy_mapping", payload)
         self.assertIn("analyze-investigate (legacy CLI)", payload["legacy_mapping"])

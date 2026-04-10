@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
@@ -1028,7 +1029,7 @@ def tool_guide() -> str:
         "how_it_works": [
             "1) Use investigate for why-change questions.",
             "2) Read summarize_investigate for strict JSON output (UI-safe).",
-            "3) Use read_artifact to fetch full markdown/json artifact content.",
+            "3) Use list_artifacts/read_artifact to fetch full markdown/json artifact content.",
             "4) Use analyze_* for single-pass grouped analysis, not drill workflows.",
         ],
         "methods": {
@@ -1046,6 +1047,10 @@ def tool_guide() -> str:
                 "purpose": "Read report/json files from allowed paths.",
                 "when_to_use": "Need exact file content, no summarization.",
                 "required_args": ["path"],
+            },
+            "list_artifacts": {
+                "purpose": "List artifact files with size/time metadata.",
+                "when_to_use": "Discover latest outputs before read_artifact.",
             },
             "analyze_csv": {
                 "purpose": "Single-pass grouped analysis from CSV.",
@@ -1088,9 +1093,14 @@ def tool_guide() -> str:
             },
         },
         "recommended_route": {
-            "why_change_flow": ["investigate", "summarize_investigate", "read_artifact"],
-            "single_pass_flow_csv": ["analyze_csv", "read_artifact", "explain_analyze"],
-            "single_pass_flow_query": ["analyze_query", "read_artifact", "explain_analyze"],
+            "why_change_flow": [
+                "investigate",
+                "summarize_investigate",
+                "list_artifacts",
+                "read_artifact",
+            ],
+            "single_pass_flow_csv": ["analyze_csv", "list_artifacts", "read_artifact", "explain_analyze"],
+            "single_pass_flow_query": ["analyze_query", "list_artifacts", "read_artifact", "explain_analyze"],
         },
     }
     return json.dumps(payload, ensure_ascii=True)
@@ -1230,6 +1240,62 @@ def read_artifact(path: str, max_chars: int = 200000) -> str:
             "truncated": truncated,
             "max_chars": max_chars,
             "content": content,
+        },
+        ensure_ascii=True,
+    )
+
+
+@mcp.tool()
+def list_artifacts(
+    directory: str = "artifacts",
+    suffix: str | None = None,
+    limit: int = 200,
+) -> str:
+    """List artifact files from an allowed read directory.
+
+    Useful before `read_artifact` so clients can discover available outputs.
+    """
+    if limit < 1 or limit > 5000:
+        raise ValueError("limit must be between 1 and 5000")
+
+    root = _validate_read_path(directory, "directory")
+    if not root.exists():
+        raise ValueError(f"directory does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"directory must be a folder: {root}")
+
+    files: list[dict[str, Any]] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if suffix and not path.name.endswith(suffix):
+            continue
+        stat = path.stat()
+        kind = path.suffix.lstrip(".").lower() if path.suffix else "unknown"
+        files.append(
+            {
+                "path": str(path),
+                "name": path.name,
+                "kind": kind,
+                "size_bytes": int(stat.st_size),
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
+            }
+        )
+
+    files.sort(key=lambda item: item["modified_at"], reverse=True)
+    truncated = len(files) > limit
+    files = files[:limit]
+    return json.dumps(
+        {
+            "ok": True,
+            "directory": str(root),
+            "suffix": suffix,
+            "limit": limit,
+            "truncated": truncated,
+            "count": len(files),
+            "files": files,
         },
         ensure_ascii=True,
     )

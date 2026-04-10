@@ -17,6 +17,7 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 - `server_info`: report MCP SDK version + factorlens CLI version
 - `tool_guide`: quick "which tool to use when" routing guide for clients/agents
 - `summarize_investigate`: deterministic JSON-only summary from investigate output JSON
+- `list_artifacts`: list artifact files (name/path/size/modified) from allowed dirs
 - `read_artifact`: read generated `.md`/`.json` outputs from allowed paths
 - `healthcheck`: quick CLI availability check
 
@@ -159,6 +160,16 @@ Read investigate/analyze artifacts:
 {
   "path": "/path/to/artifacts/investigate_report.md",
   "max_chars": 120000
+}
+```
+
+List available artifacts first:
+
+```json
+{
+  "directory": "/path/to/artifacts",
+  "suffix": ".json",
+  "limit": 100
 }
 ```
 

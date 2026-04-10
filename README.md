@@ -123,6 +123,27 @@ Practical rule:
 - Use `analyze-investigate` when you have a curated dataset with a few meaningful numeric drivers.
 - Use `analyze-drivers` when the metric likely has a formula such as `revenue ≈ orders * avg_price`.
 
+## How `investigate` Works
+
+At a high level, `investigate`:
+1. Runs a top-level compare and ranks movers.
+2. Drills into strongest candidates.
+3. Stops by guardrails (`max_depth`, `min_contribution`, `min_score_improvement`, `min_slice_rows`).
+4. Writes report + JSON trace.
+
+```mermaid
+flowchart TD
+    A["Top-level compare"] --> B["Rank movers (top_movers)"]
+    B --> C{"candidate score >= min_contribution?"}
+    C -- no --> S1["Stop branch"]
+    C -- yes --> D["Drill on next dimension"]
+    D --> E{"improvement >= min_score_improvement?"}
+    E -- no --> S2["Stop branch"]
+    E -- yes --> F{"depth < max_depth and rows >= min_slice_rows?"}
+    F -- no --> S3["Stop branch"]
+    F -- yes --> B
+```
+
 ## Design Principles
 
 FactorLens follows a few simple design rules:
