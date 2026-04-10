@@ -52,6 +52,9 @@ mcp = FastMCP(
 VALID_OUTPUT_FORMATS = {"md", "json", "both", "html"}
 VALID_COMPARE_OUTPUT_FORMATS = {"md", "html", "json", "both"}
 VALID_INVESTIGATE_OUTPUT_FORMATS = {"md", "json", "both"}
+VALID_LEGACY_DRIVER_PRESETS = {"id", "amount", "category", "mixed"}
+VALID_LEGACY_AUTO_DRIVERS = {"deterministic", "numeric-corr"}
+VALID_LEGACY_DRIVER_CONTRIB = {"percent", "amount", "both"}
 VALID_INVESTIGATE_PLANNERS = {"deterministic", "llm"}
 VALID_INVESTIGATE_MODES = {
     "change_drivers",
@@ -255,6 +258,11 @@ def analyze_csv(
     output_format: str = "both",
     timeout_sec: int | None = None,
 ) -> str:
+    """Run `factorlens analyze` on a CSV file.
+
+    Best for one-pass grouped analysis (not multi-step drill-down).
+    Writes markdown/json/html artifacts to `out`.
+    """
     if output_format not in VALID_OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {sorted(VALID_OUTPUT_FORMATS)}")
     if agg not in {"sum", "mean", "median"}:
@@ -346,6 +354,11 @@ def analyze_query(
     output_format: str = "both",
     timeout_sec: int | None = None,
 ) -> str:
+    """Run `factorlens analyze` on Postgres query results.
+
+    Best for one-pass grouped analysis over SQL results.
+    Use period/date flags for windowed comparisons inside `analyze`.
+    """
     if output_format not in VALID_OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {sorted(VALID_OUTPUT_FORMATS)}")
     if agg not in {"sum", "mean", "median"}:
@@ -451,6 +464,10 @@ def analyze_validate_csv(
     alert_rule_csv: str | None = None,
     timeout_sec: int | None = None,
 ) -> str:
+    """Dry-run validation for `analyze` args against a CSV input.
+
+    Validates dimensions/metrics/where clauses and returns CLI result JSON.
+    """
     if agg not in {"sum", "mean", "median"}:
         raise ValueError("agg must be one of: sum, mean, median")
     if min_records < 1:
@@ -535,6 +552,10 @@ def analyze_validate_query(
     alert_rule_csv: str | None = None,
     timeout_sec: int | None = None,
 ) -> str:
+    """Dry-run validation for `analyze` args against a Postgres query input.
+
+    Validates dimensions/metrics/where clauses and returns CLI result JSON.
+    """
     if agg not in {"sum", "mean", "median"}:
         raise ValueError("agg must be one of: sum, mean, median")
     if min_records < 1:
@@ -616,6 +637,10 @@ def analyze_compare(
     top_movers: int = 10,
     timeout_sec: int | None = None,
 ) -> str:
+    """Compare two analysis JSON artifacts (`base_json` vs `new_json`).
+
+    Produces a movers/delta report in markdown/html/json.
+    """
     if output_format not in VALID_COMPARE_OUTPUT_FORMATS:
         raise ValueError(
             f"output_format must be one of {sorted(VALID_COMPARE_OUTPUT_FORMATS)}"
@@ -640,6 +665,106 @@ def analyze_compare(
         "--top-movers",
         str(top_movers),
     ]
+
+    return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
+
+
+@mcp.tool()
+def analyze_investigate_legacy(
+    input_csv: str,
+    metric: str,
+    out: str,
+    drivers_csv: str | None = None,
+    driver_include_csv: str | None = None,
+    driver_exclude_csv: str | None = None,
+    driver_preset: str | None = None,
+    auto_drivers: str = "deterministic",
+    dedup_drivers: bool = True,
+    driver_contrib: str = "percent",
+    top_drivers: int = 3,
+    output_format: str = "both",
+    max_id_drivers: int = 3,
+    max_cat_drivers: int = 2,
+    max_num_drivers: int = 2,
+    date_column: str | None = None,
+    time_grain: str | None = None,
+    period: str | None = None,
+    anchor_date: str | None = None,
+    current_start: str | None = None,
+    current_end: str | None = None,
+    previous_start: str | None = None,
+    previous_end: str | None = None,
+    timeout_sec: int | None = None,
+) -> str:
+    """Run legacy `factorlens analyze-investigate` on CSV input.
+
+    This is the legacy numeric-driver decomposition flow.
+    Prefer `investigate` + `summarize_investigate` for new workflows.
+    """
+    if output_format not in VALID_INVESTIGATE_OUTPUT_FORMATS:
+        raise ValueError(
+            f"output_format must be one of {sorted(VALID_INVESTIGATE_OUTPUT_FORMATS)}"
+        )
+    if top_drivers < 1:
+        raise ValueError("top_drivers must be >= 1")
+    if max_id_drivers < 0 or max_cat_drivers < 0 or max_num_drivers < 0:
+        raise ValueError("max_*_drivers must be >= 0")
+    if auto_drivers not in VALID_LEGACY_AUTO_DRIVERS:
+        raise ValueError(
+            f"auto_drivers must be one of {sorted(VALID_LEGACY_AUTO_DRIVERS)}"
+        )
+    if driver_contrib not in VALID_LEGACY_DRIVER_CONTRIB:
+        raise ValueError(
+            f"driver_contrib must be one of {sorted(VALID_LEGACY_DRIVER_CONTRIB)}"
+        )
+    if driver_preset is not None and driver_preset not in VALID_LEGACY_DRIVER_PRESETS:
+        raise ValueError(
+            f"driver_preset must be one of {sorted(VALID_LEGACY_DRIVER_PRESETS)}"
+        )
+
+    in_path = _validate_read_path(input_csv, "input_csv")
+    out_path = _validate_write_path(out, "out")
+
+    cmd = [
+        "analyze-investigate",
+        "--input",
+        str(in_path),
+        "--metric",
+        metric,
+        "--out",
+        str(out_path),
+        "--output-format",
+        output_format,
+        "--auto-drivers",
+        auto_drivers,
+        "--dedup-drivers",
+        "true" if dedup_drivers else "false",
+        "--driver-contrib",
+        driver_contrib,
+        "--top-drivers",
+        str(top_drivers),
+        "--max-id-drivers",
+        str(max_id_drivers),
+        "--max-cat-drivers",
+        str(max_cat_drivers),
+        "--max-num-drivers",
+        str(max_num_drivers),
+    ]
+    _append_optional(cmd, "--drivers", drivers_csv)
+    _append_optional(cmd, "--driver-include", driver_include_csv)
+    _append_optional(cmd, "--driver-exclude", driver_exclude_csv)
+    _append_optional(cmd, "--driver-preset", driver_preset)
+    _append_period_flags(
+        cmd,
+        date_column=date_column,
+        time_grain=time_grain,
+        period=period,
+        anchor_date=anchor_date,
+        current_start=current_start,
+        current_end=current_end,
+        previous_start=previous_start,
+        previous_end=previous_end,
+    )
 
     return json.dumps(_run(cmd, timeout_sec), ensure_ascii=True)
 
@@ -684,6 +809,13 @@ def investigate(
     output_format: str = "both",
     timeout_sec: int | None = None,
 ) -> str:
+    """Run multi-step investigation for a business question.
+
+    Supports:
+    - base/new files (CSV or analyze JSON artifacts), or
+    - query/query_file (+ optional postgres_url) with period windows.
+    Produces drill-down report + JSON trace.
+    """
     if not question.strip():
         raise ValueError("question must not be empty")
     if output_format not in VALID_INVESTIGATE_OUTPUT_FORMATS:
@@ -827,6 +959,10 @@ def explain_analyze(
     max_bullets: int = 5,
     timeout_sec: int | None = None,
 ) -> str:
+    """Generate an LLM narrative from analysis JSON.
+
+    Use `summarize_investigate` when you need strict deterministic JSON output.
+    """
     if backend not in VALID_BACKENDS:
         raise ValueError(f"backend must be one of {sorted(VALID_BACKENDS)}")
     if not question.strip():
@@ -859,6 +995,7 @@ def explain_analyze(
 
 @mcp.tool()
 def server_info(timeout_sec: int | None = 20) -> str:
+    """Return MCP/runtime metadata and factorlens binary version info."""
     timeout = _timeout_sec(timeout_sec)
     try:
         version_probe = _run(["--version"], timeout)
@@ -883,11 +1020,92 @@ def server_info(timeout_sec: int | None = 20) -> str:
 
 
 @mcp.tool()
+def tool_guide() -> str:
+    """Return concise guidance for choosing and sequencing FactorLens MCP tools."""
+    payload = {
+        "ok": True,
+        "server": "factorlens",
+        "how_it_works": [
+            "1) Use investigate for why-change questions.",
+            "2) Read summarize_investigate for strict JSON output (UI-safe).",
+            "3) Use read_artifact to fetch full markdown/json artifact content.",
+            "4) Use analyze_* for single-pass grouped analysis, not drill workflows.",
+        ],
+        "methods": {
+            "investigate": {
+                "purpose": "Deterministic/LLM drill-down across periods to find main drivers.",
+                "when_to_use": "Why did metric change? Why did concentration change?",
+                "next_step": "Call summarize_investigate on generated JSON artifact.",
+            },
+            "summarize_investigate": {
+                "purpose": "Strict JSON summary from investigate output.",
+                "when_to_use": "Chat/UI integrations that must avoid markdown formatting issues.",
+                "required_args": ["analysis_json"],
+            },
+            "read_artifact": {
+                "purpose": "Read report/json files from allowed paths.",
+                "when_to_use": "Need exact file content, no summarization.",
+                "required_args": ["path"],
+            },
+            "analyze_csv": {
+                "purpose": "Single-pass grouped analysis from CSV.",
+                "when_to_use": "Top segments, concentration, summary without drill-down.",
+            },
+            "analyze_query": {
+                "purpose": "Single-pass grouped analysis from SQL query results.",
+                "when_to_use": "Same as analyze_csv, but data comes from Postgres query.",
+            },
+            "analyze_compare": {
+                "purpose": "Compare two analysis artifacts.",
+                "when_to_use": "You already have base/new analysis JSON files.",
+            },
+            "analyze_investigate_legacy": {
+                "purpose": "Legacy numeric-driver decomposition (analyze-investigate wrapper).",
+                "when_to_use": "Backwards-compatible driver accounting from curated numeric drivers.",
+            },
+            "explain_analyze": {
+                "purpose": "LLM narrative over analysis JSON.",
+                "when_to_use": "Executive narrative; may include model formatting variance.",
+            },
+            "server_info": {
+                "purpose": "Show MCP SDK version and factorlens CLI version.",
+                "when_to_use": "Debug environment/version confusion.",
+            },
+            "healthcheck": {
+                "purpose": "Quick server/binary availability check.",
+                "when_to_use": "Connectivity smoke test.",
+            },
+        },
+        "legacy_mapping": {
+            "analyze-investigate (legacy CLI)": {
+                "status": "Supported in MCP",
+                "mcp_tool": "analyze_investigate_legacy",
+                "alternative_modern_flow": ["investigate", "summarize_investigate"],
+            },
+            "analyze-compare (CLI)": {
+                "status": "Supported in MCP",
+                "mcp_tool": "analyze_compare",
+            },
+        },
+        "recommended_route": {
+            "why_change_flow": ["investigate", "summarize_investigate", "read_artifact"],
+            "single_pass_flow_csv": ["analyze_csv", "read_artifact", "explain_analyze"],
+            "single_pass_flow_query": ["analyze_query", "read_artifact", "explain_analyze"],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+@mcp.tool()
 def summarize_investigate(
     analysis_json: str,
     top_major_changes: int = 3,
     top_follow_up_steps: int = 5,
 ) -> str:
+    """Return strict deterministic JSON summary from investigate artifact JSON.
+
+    Avoids markdown/explain formatting issues in chat UIs.
+    """
     if top_major_changes < 1:
         raise ValueError("top_major_changes must be >= 1")
     if top_follow_up_steps < 1:
@@ -984,6 +1202,10 @@ def summarize_investigate(
 
 @mcp.tool()
 def read_artifact(path: str, max_chars: int = 200000) -> str:
+    """Read artifact file content from an allowed read path.
+
+    Returns full text in `content` (optionally truncated by `max_chars`).
+    """
     if max_chars < 1 or max_chars > MAX_READ_ARTIFACT_CHARS:
         raise ValueError(
             f"max_chars must be between 1 and {MAX_READ_ARTIFACT_CHARS}"
@@ -1015,6 +1237,7 @@ def read_artifact(path: str, max_chars: int = 200000) -> str:
 
 @mcp.tool()
 def healthcheck(timeout_sec: int | None = 20) -> str:
+    """Check factorlens CLI availability by running `factorlens --help`."""
     return json.dumps(_run(["--help"], timeout_sec), ensure_ascii=True)
 
 

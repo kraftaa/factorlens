@@ -11,9 +11,11 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 - `analyze_csv`: run `factorlens analyze` on CSV input
 - `analyze_query`: run `factorlens analyze` on Postgres query input
 - `analyze_compare`: compare two `analysis.json` snapshots (`md`, `html`, `json`, or `both`)
+- `analyze_investigate_legacy`: legacy-compatible numeric-driver decomposition (`analyze-investigate`)
 - `investigate`: guided drill-down across base/new snapshots (deterministic or LLM planner)
 - `explain_analyze`: run `factorlens explain-analyze` (Bedrock or local)
 - `server_info`: report MCP SDK version + factorlens CLI version
+- `tool_guide`: quick "which tool to use when" routing guide for clients/agents
 - `summarize_investigate`: deterministic JSON-only summary from investigate output JSON
 - `read_artifact`: read generated `.md`/`.json` outputs from allowed paths
 - `healthcheck`: quick CLI availability check
@@ -120,6 +122,19 @@ Investigate with config defaults:
 }
 ```
 
+Legacy numeric-driver decomposition:
+
+```json
+{
+  "input_csv": "/path/to/snapshot.csv",
+  "metric": "revenue_usd",
+  "drivers_csv": "net_gmv,avg_order_value",
+  "driver_contrib": "both",
+  "out": "/path/to/artifacts/investigate_legacy.md",
+  "output_format": "both"
+}
+```
+
 Investigate from Postgres query with period windows:
 
 ```json
@@ -154,6 +169,15 @@ Report server/runtime versions:
   "timeout_sec": 20
 }
 ```
+
+Get method guidance for clients/agents:
+
+```json
+{}
+```
+
+`tool_guide` also returns a `legacy_mapping` section so clients can route
+legacy CLI workflows (for example `analyze-investigate`) to MCP-safe flows.
 
 Summarize investigate JSON (no markdown rendering issues):
 

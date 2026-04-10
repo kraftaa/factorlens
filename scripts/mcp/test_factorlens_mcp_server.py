@@ -438,6 +438,106 @@ class InvestigateToolTests(unittest.TestCase):
             )
 
 
+class AnalyzeInvestigateLegacyToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_analyze_investigate_legacy_builds_expected_command(self):
+        calls: dict[str, object] = {}
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        old_validate_write = mod._validate_write_path
+        old_run = mod._run
+        try:
+            mod._validate_read_path = lambda p, _label: Path(f"/safe/read/{Path(p).name}")
+            mod._validate_write_path = lambda p, _label: Path(
+                f"/safe/write/{Path(p).name}"
+            )
+
+            def _fake_run(cmd: list[str], timeout_sec: int | None):
+                calls["cmd"] = cmd
+                calls["timeout_sec"] = timeout_sec
+                return {"ok": True}
+
+            mod._run = _fake_run
+            raw = mod.analyze_investigate_legacy(
+                input_csv="data/snapshot.csv",
+                metric="revenue_usd",
+                out="artifacts/legacy.md",
+                drivers_csv="net_gmv,avg_order_value",
+                driver_preset="mixed",
+                auto_drivers="numeric-corr",
+                dedup_drivers=False,
+                driver_contrib="both",
+                top_drivers=5,
+                output_format="both",
+                max_id_drivers=4,
+                max_cat_drivers=3,
+                max_num_drivers=2,
+                date_column="order_date",
+                time_grain="month",
+                period="last",
+                anchor_date="2026-04-15",
+                timeout_sec=60,
+            )
+            self.assertEqual(json.loads(raw), {"ok": True})
+            self.assertEqual(calls["timeout_sec"], 60)
+            self.assertEqual(
+                calls["cmd"],
+                [
+                    "analyze-investigate",
+                    "--input",
+                    "/safe/read/snapshot.csv",
+                    "--metric",
+                    "revenue_usd",
+                    "--out",
+                    "/safe/write/legacy.md",
+                    "--output-format",
+                    "both",
+                    "--auto-drivers",
+                    "numeric-corr",
+                    "--dedup-drivers",
+                    "false",
+                    "--driver-contrib",
+                    "both",
+                    "--top-drivers",
+                    "5",
+                    "--max-id-drivers",
+                    "4",
+                    "--max-cat-drivers",
+                    "3",
+                    "--max-num-drivers",
+                    "2",
+                    "--drivers",
+                    "net_gmv,avg_order_value",
+                    "--driver-preset",
+                    "mixed",
+                    "--date-column",
+                    "order_date",
+                    "--time-grain",
+                    "month",
+                    "--period",
+                    "last",
+                    "--anchor-date",
+                    "2026-04-15",
+                ],
+            )
+        finally:
+            mod._validate_read_path = old_validate_read
+            mod._validate_write_path = old_validate_write
+            mod._run = old_run
+
+    def test_analyze_investigate_legacy_rejects_invalid_preset(self):
+        with self.assertRaisesRegex(ValueError, "driver_preset must be one of"):
+            self.mod.analyze_investigate_legacy(
+                input_csv="data/snapshot.csv",
+                metric="revenue_usd",
+                out="artifacts/legacy.md",
+                driver_preset="random",
+            )
+
+
 class ExplainAnalyzeToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -659,6 +759,25 @@ class SummarizeInvestigateToolTests(unittest.TestCase):
                     mod.summarize_investigate("artifacts/analysis.json")
         finally:
             mod._validate_read_path = old_validate_read
+
+
+class ToolGuideTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_tool_guide_contains_core_methods(self):
+        payload = json.loads(self.mod.tool_guide())
+        self.assertEqual(payload["ok"], True)
+        methods = payload["methods"]
+        self.assertIn("investigate", methods)
+        self.assertIn("analyze_investigate_legacy", methods)
+        self.assertIn("summarize_investigate", methods)
+        self.assertIn("read_artifact", methods)
+        self.assertIn("legacy_mapping", payload)
+        self.assertIn("analyze-investigate (legacy CLI)", payload["legacy_mapping"])
+        self.assertIn("single_pass_flow_csv", payload["recommended_route"])
+        self.assertIn("single_pass_flow_query", payload["recommended_route"])
 
 
 if __name__ == "__main__":
