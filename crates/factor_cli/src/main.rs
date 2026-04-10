@@ -7264,9 +7264,54 @@ fn render_investigation_workflow_markdown(
         } else {
             md.push_str("- No movers were available at top level.\n");
         }
+        let base_metric_total = step0
+            .movers
+            .iter()
+            .map(|m| m.base_primary_metric_value.max(0.0))
+            .sum::<f64>();
+        let new_metric_total = step0
+            .movers
+            .iter()
+            .map(|m| m.new_primary_metric_value.max(0.0))
+            .sum::<f64>();
+        let metric_share = |value: f64, total: f64| -> f64 {
+            if total <= 0.0 {
+                0.0
+            } else {
+                (value.max(0.0) / total) * 100.0
+            }
+        };
+        let mut metric_sorted = step0.movers.iter().collect::<Vec<_>>();
+        metric_sorted.sort_by(|a, b| {
+            b.new_primary_metric_value
+                .partial_cmp(&a.new_primary_metric_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.segment.cmp(&b.segment))
+        });
+        let base_top1_metric_pct = step0
+            .movers
+            .iter()
+            .map(|m| metric_share(m.base_primary_metric_value, base_metric_total))
+            .fold(0.0, f64::max);
+        let new_top1_metric_pct = step0
+            .movers
+            .iter()
+            .map(|m| metric_share(m.new_primary_metric_value, new_metric_total))
+            .fold(0.0, f64::max);
+        let base_top5_metric_pct = metric_sorted
+            .iter()
+            .take(5)
+            .map(|m| metric_share(m.base_primary_metric_value, base_metric_total))
+            .sum::<f64>();
+        let new_top5_metric_pct = metric_sorted
+            .iter()
+            .take(5)
+            .map(|m| metric_share(m.new_primary_metric_value, new_metric_total))
+            .sum::<f64>();
+
         if step0.segment_count <= 5 {
             md.push_str(&format!(
-                "- Top-5 concentration is saturated at 100.00% because only {} segments exist; top-1 concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
+                "- Top-5 record-share concentration is saturated at 100.00% because only {} segments exist; top-1 record-share concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
                 step0.segment_count,
                 step0.top1_concentration_base_pct,
                 step0.top1_concentration_new_pct,
@@ -7274,27 +7319,39 @@ fn render_investigation_workflow_markdown(
             ));
         } else {
             md.push_str(&format!(
-                "- Top-5 concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
-                step0.top5_concentration_base_pct,
-                step0.top5_concentration_new_pct,
-                step0.top5_concentration_delta_pp
+                "- Top-5 metric-share concentration moved from {:.2}% to {:.2}% ({:+.2} pp).\n",
+                base_top5_metric_pct,
+                new_top5_metric_pct,
+                new_top5_metric_pct - base_top5_metric_pct
             ));
         }
         md.push_str(
-            "- Concentration is record-share concentration for this grouping dimension (share of rows captured by largest segments).\n",
+            "- Concentration tables include both metric-share (`primary metric`) and record-share (`rows`) for this grouping dimension.\n",
         );
         md.push('\n');
-        md.push_str("### Concentration snapshot (record-share)\n\n");
+        md.push_str("### Concentration snapshot\n\n");
         md.push_str("| Measure | Base | New | Delta |\n");
         md.push_str("|---|---:|---:|---:|\n");
         md.push_str(&format!(
-            "| Top-1 concentration | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            "| Top-1 concentration (metric-share) | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            base_top1_metric_pct,
+            new_top1_metric_pct,
+            new_top1_metric_pct - base_top1_metric_pct
+        ));
+        md.push_str(&format!(
+            "| Top-5 concentration (metric-share) | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            base_top5_metric_pct,
+            new_top5_metric_pct,
+            new_top5_metric_pct - base_top5_metric_pct
+        ));
+        md.push_str(&format!(
+            "| Top-1 concentration (record-share) | {:.2}% | {:.2}% | {:+.2} pp |\n",
             step0.top1_concentration_base_pct,
             step0.top1_concentration_new_pct,
             step0.top1_concentration_delta_pp
         ));
         md.push_str(&format!(
-            "| Top-5 concentration | {:.2}% | {:.2}% | {:+.2} pp |\n",
+            "| Top-5 concentration (record-share) | {:.2}% | {:.2}% | {:+.2} pp |\n",
             step0.top5_concentration_base_pct,
             step0.top5_concentration_new_pct,
             step0.top5_concentration_delta_pp
@@ -7304,19 +7361,25 @@ fn render_investigation_workflow_markdown(
         if !step0.movers.is_empty() {
             let mut largest_segments = step0.movers.iter().collect::<Vec<_>>();
             largest_segments.sort_by(|a, b| {
-                b.new_share_pct
-                    .partial_cmp(&a.new_share_pct)
+                b.new_primary_metric_value
+                    .partial_cmp(&a.new_primary_metric_value)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.segment.cmp(&b.segment))
             });
             let top5_names = largest_segments
                 .iter()
                 .take(5)
-                .map(|m| format!("{} ({:.2}%)", m.segment, m.new_share_pct))
+                .map(|m| {
+                    format!(
+                        "{} ({:.2}% metric share)",
+                        m.segment,
+                        metric_share(m.new_primary_metric_value, new_metric_total)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             md.push_str(&format!(
-                "- Largest new-period segments by record share: {}.\n",
+                "- Largest new-period segments by metric share: {}.\n",
                 if top5_names.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -7325,17 +7388,19 @@ fn render_investigation_workflow_markdown(
             ));
             md.push('\n');
 
-            md.push_str("### Segments behind concentration (largest by record share)\n\n");
-            md.push_str("| # | Segment | Base share | New share | Delta share |\n");
-            md.push_str("|---:|---|---:|---:|---:|\n");
+            md.push_str("### Segments behind concentration (largest by metric share)\n\n");
+            md.push_str("| # | Segment | Base metric share | New metric share | Delta metric share | New record share |\n");
+            md.push_str("|---:|---|---:|---:|---:|---:|\n");
             for (idx, mover) in largest_segments.iter().take(5).enumerate() {
                 md.push_str(&format!(
-                    "| {} | {} | {:.2}% | {:.2}% | {:+.2} pp |\n",
+                    "| {} | {} | {:.2}% | {:.2}% | {:+.2} pp | {:.2}% |\n",
                     idx + 1,
                     md_cell(&mover.segment),
-                    mover.base_share_pct,
-                    mover.new_share_pct,
-                    mover.delta_share_pp
+                    metric_share(mover.base_primary_metric_value, base_metric_total),
+                    metric_share(mover.new_primary_metric_value, new_metric_total),
+                    metric_share(mover.new_primary_metric_value, new_metric_total)
+                        - metric_share(mover.base_primary_metric_value, base_metric_total),
+                    mover.new_share_pct
                 ));
             }
             if step0.segment_count > step0.movers.len() {

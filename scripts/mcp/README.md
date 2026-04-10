@@ -14,6 +14,7 @@ This folder provides a production-oriented MCP wrapper around the `factorlens` C
 - `investigate`: guided drill-down across base/new snapshots (deterministic or LLM planner)
 - `explain_analyze`: run `factorlens explain-analyze` (Bedrock or local)
 - `server_info`: report MCP SDK version + factorlens CLI version
+- `summarize_investigate`: deterministic JSON-only summary from investigate output JSON
 - `read_artifact`: read generated `.md`/`.json` outputs from allowed paths
 - `healthcheck`: quick CLI availability check
 
@@ -151,6 +152,16 @@ Report server/runtime versions:
 ```json
 {
   "timeout_sec": 20
+}
+```
+
+Summarize investigate JSON (no markdown rendering issues):
+
+```json
+{
+  "analysis_json": "/path/to/artifacts/investigate_mcp.json",
+  "top_major_changes": 3,
+  "top_follow_up_steps": 5
 }
 ```
 

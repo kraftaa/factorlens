@@ -569,5 +569,97 @@ class ServerInfoToolTests(unittest.TestCase):
             mod._package_version = old_pkg_ver
 
 
+class SummarizeInvestigateToolTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def test_summarize_investigate_returns_strict_json_summary(self):
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / "investigate.json"
+                artifact.write_text(
+                    json.dumps(
+                        {
+                            "question": "Why did revenue change?",
+                            "mode": "change_drivers",
+                            "steps": [
+                                {
+                                    "depth": 0,
+                                    "dimension": "region",
+                                    "primary_metric": "revenue_usd",
+                                    "top1_concentration_base_pct": 40.0,
+                                    "top1_concentration_new_pct": 45.0,
+                                    "top1_concentration_delta_pp": 5.0,
+                                    "top5_concentration_base_pct": 88.0,
+                                    "top5_concentration_new_pct": 90.0,
+                                    "top5_concentration_delta_pp": 2.0,
+                                    "movers": [
+                                        {
+                                            "segment": "US",
+                                            "base_primary_metric_value": 100.0,
+                                            "new_primary_metric_value": 140.0,
+                                            "delta_primary_metric_value": 40.0,
+                                            "delta_share_pp": 3.2,
+                                        }
+                                    ],
+                                },
+                                {
+                                    "depth": 1,
+                                    "dimension": "channel",
+                                    "scope": [["region", "US"]],
+                                    "movers": [
+                                        {
+                                            "segment": "Direct",
+                                            "delta_primary_metric_value": 25.0,
+                                            "delta_share_pp": 2.1,
+                                        }
+                                    ],
+                                },
+                            ],
+                            "major_global_changes": [
+                                {
+                                    "dimension": "organization_name",
+                                    "segment": "Acme",
+                                    "primary_metric": "revenue_usd",
+                                    "delta_primary_metric_value": 120.0,
+                                    "delta_share_pp": 1.1,
+                                    "score": 120.0,
+                                }
+                            ],
+                            "stopping_reason": "reached max depth 2",
+                            "recommended_next_question": "Drill into provider",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                mod._validate_read_path = lambda _p, _label: artifact
+                raw = mod.summarize_investigate("artifacts/investigate.json")
+                payload = json.loads(raw)
+                self.assertEqual(payload["ok"], True)
+                self.assertEqual(payload["schema"], "investigate")
+                self.assertEqual(payload["top_level"]["dimension"], "region")
+                self.assertEqual(payload["top_level"]["delta_total"], 40.0)
+                self.assertEqual(payload["major_global_changes"][0]["segment"], "Acme")
+                self.assertEqual(payload["follow_up"][0]["strongest_segment"], "Direct")
+        finally:
+            mod._validate_read_path = old_validate_read
+
+    def test_summarize_investigate_rejects_non_investigate_schema(self):
+        mod = self.mod
+        old_validate_read = mod._validate_read_path
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact = Path(tmp) / "analysis.json"
+                artifact.write_text(json.dumps({"records": 10}), encoding="utf-8")
+                mod._validate_read_path = lambda _p, _label: artifact
+                with self.assertRaisesRegex(ValueError, "does not look like investigate output"):
+                    mod.summarize_investigate("artifacts/analysis.json")
+        finally:
+            mod._validate_read_path = old_validate_read
+
+
 if __name__ == "__main__":
     unittest.main()

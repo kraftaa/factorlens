@@ -216,6 +216,17 @@ def _extract_version_line(result: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _load_json_file(path: Path, label: str) -> Any:
+    if not path.exists():
+        raise ValueError(f"{label} does not exist: {path}")
+    if not path.is_file():
+        raise ValueError(f"{label} must be a file: {path}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+
+
 @mcp.tool()
 def analyze_csv(
     input_csv: str,
@@ -869,6 +880,106 @@ def server_info(timeout_sec: int | None = 20) -> str:
         "factorlens_version_probe": version_probe,
     }
     return json.dumps(payload, ensure_ascii=True)
+
+
+@mcp.tool()
+def summarize_investigate(
+    analysis_json: str,
+    top_major_changes: int = 3,
+    top_follow_up_steps: int = 5,
+) -> str:
+    if top_major_changes < 1:
+        raise ValueError("top_major_changes must be >= 1")
+    if top_follow_up_steps < 1:
+        raise ValueError("top_follow_up_steps must be >= 1")
+
+    analysis_path = _validate_read_path(analysis_json, "analysis_json")
+    payload = _load_json_file(analysis_path, "analysis_json")
+    if not isinstance(payload, dict):
+        raise ValueError("analysis_json must contain a JSON object")
+
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("analysis_json does not look like investigate output (missing steps)")
+
+    step0 = steps[0] if isinstance(steps[0], dict) else {}
+    movers0 = step0.get("movers", [])
+    if not isinstance(movers0, list):
+        movers0 = []
+    base_total = sum(
+        float(item.get("base_primary_metric_value", 0.0))
+        for item in movers0
+        if isinstance(item, dict)
+    )
+    new_total = sum(
+        float(item.get("new_primary_metric_value", 0.0))
+        for item in movers0
+        if isinstance(item, dict)
+    )
+    top_mover = movers0[0] if movers0 and isinstance(movers0[0], dict) else {}
+
+    major_raw = payload.get("major_global_changes", [])
+    major_changes: list[dict[str, Any]] = []
+    if isinstance(major_raw, list):
+        for item in major_raw[:top_major_changes]:
+            if not isinstance(item, dict):
+                continue
+            major_changes.append(
+                {
+                    "dimension": item.get("dimension"),
+                    "segment": item.get("segment"),
+                    "primary_metric": item.get("primary_metric"),
+                    "delta_primary_metric_value": item.get("delta_primary_metric_value"),
+                    "delta_share_pp": item.get("delta_share_pp"),
+                    "score": item.get("score"),
+                }
+            )
+
+    follow_up: list[dict[str, Any]] = []
+    for step in steps[1 : 1 + top_follow_up_steps]:
+        if not isinstance(step, dict):
+            continue
+        movers = step.get("movers", [])
+        strongest = movers[0] if isinstance(movers, list) and movers and isinstance(movers[0], dict) else {}
+        follow_up.append(
+            {
+                "depth": step.get("depth"),
+                "dimension": step.get("dimension"),
+                "scope": step.get("scope", []),
+                "strongest_segment": strongest.get("segment"),
+                "delta_primary_metric_value": strongest.get("delta_primary_metric_value"),
+                "delta_share_pp": strongest.get("delta_share_pp"),
+            }
+        )
+
+    response = {
+        "ok": True,
+        "schema": "investigate",
+        "source_path": str(analysis_path),
+        "question": payload.get("question"),
+        "mode": payload.get("mode"),
+        "top_level": {
+            "dimension": step0.get("dimension"),
+            "primary_metric": step0.get("primary_metric"),
+            "base_total": base_total,
+            "new_total": new_total,
+            "delta_total": new_total - base_total,
+            "strongest_segment": top_mover.get("segment"),
+            "strongest_delta_primary_metric_value": top_mover.get("delta_primary_metric_value"),
+            "strongest_delta_share_pp": top_mover.get("delta_share_pp"),
+            "top1_concentration_base_pct": step0.get("top1_concentration_base_pct"),
+            "top1_concentration_new_pct": step0.get("top1_concentration_new_pct"),
+            "top1_concentration_delta_pp": step0.get("top1_concentration_delta_pp"),
+            "top5_concentration_base_pct": step0.get("top5_concentration_base_pct"),
+            "top5_concentration_new_pct": step0.get("top5_concentration_new_pct"),
+            "top5_concentration_delta_pp": step0.get("top5_concentration_delta_pp"),
+        },
+        "major_global_changes": major_changes,
+        "follow_up": follow_up,
+        "stopping_reason": payload.get("stopping_reason"),
+        "recommended_next_question": payload.get("recommended_next_question"),
+    }
+    return json.dumps(response, ensure_ascii=True)
 
 
 @mcp.tool()
